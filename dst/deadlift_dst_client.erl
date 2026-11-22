@@ -73,7 +73,7 @@ recover(Tab, N, CState, Mode) ->
                     ack_replicas -> replicas;
                     _ -> all
                 end,
-            {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, ack => Ack, report => Mode =/= no_report}),
+            {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, ack => Ack, report => Mode =/= no_report, confirm => Mode =/= no_confirm}),
             ok = eta_net:place(proxy_node(N), [Proxy]),
             true = ets:insert(Tab, {{node, proxy_node(N)}, true}),
             true = ets:insert(Tab, {{proxy, N}, Proxy, Epoch}),
@@ -94,10 +94,19 @@ recover(Tab, N, CState, Mode) ->
 %% writes. The transaction writes at least one key, and the value of each
 %% key is `{client, C}'.
 %%
+%% The client records every read version that it receives, also when the
+%% commit fails.
+%%
+%% One client in three waits between the read version and the commit, for
+%% 20 ms to 100 ms of the virtual clock. A recovery can end the epoch in
+%% that time. After the wait the client commits through the Proxy of the
+%% highest epoch that runs. These clients bring a read version of an ended
+%% epoch to the Resolver of a later epoch.
+%%
 %% The table of the run has a counter, `stamp'. The client takes a stamp
 %% before it asks for the read version, and with the answer to the commit.
 %% The harness compares the stamps of two clients in `read_version_order'.
-transaction(Tab, C, {Reader, ReaderEpoch}, {Proxy, Epoch}, R) ->
+transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
     Keys = keys(),
     Reads = [Key || {I, Key} <- lists:enumerate(0, Keys), (R bsr I) band 1 =:= 1],
     Writes0 = [Key || {I, Key} <- lists:enumerate(4, Keys), (R bsr I) band 1 =:= 1],
@@ -109,6 +118,15 @@ transaction(Tab, C, {Reader, ReaderEpoch}, {Proxy, Epoch}, R) ->
     Start = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
     case deadlift_proxy:read_version(Reader) of
         {ok, ReadVersion} ->
+            true = ets:insert(Tab, {{read, C}, #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start}}),
+            {Proxy, Epoch} =
+                case R rem 3 of
+                    0 ->
+                        ok = timer:sleep(20 * (R rem 5 + 1)),
+                        latest_proxy(Tab, Chosen);
+                    _ ->
+                        Chosen
+                end,
             true = ets:insert(Tab, {{invoked, C}, Epoch}),
             Transaction = #{
                 read_version => ReadVersion,
@@ -134,6 +152,17 @@ transaction(Tab, C, {Reader, ReaderEpoch}, {Proxy, Epoch}, R) ->
             end;
         {error, _Reason} ->
             true = ets:insert(Tab, {{no_read_version, C}, ReaderEpoch})
+    end.
+
+%% The Proxy of the highest epoch that runs, or `Default'.
+latest_proxy(Tab, Default) ->
+    Running = [{Epoch, Proxy} || [Proxy, Epoch] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'}), is_process_alive(Proxy)],
+    case lists:sort(Running) of
+        [] ->
+            Default;
+        Sorted ->
+            {Epoch, Proxy} = lists:last(Sorted),
+            {Proxy, Epoch}
     end.
 
 %% The keys of the workload. A small number of keys gives many conflicts.

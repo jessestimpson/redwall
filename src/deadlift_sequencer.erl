@@ -46,18 +46,17 @@
 %% option.
 %%
 %% A Sequencer does not learn that a later epoch exists. The Sequencer of
-%% an ended epoch still assigns versions. The LogServers of the ended epoch
-%% are stopped, so no record with these versions is stored.
+%% an ended epoch still assigns versions and still answers `read_version/1'.
+%% The LogServers of the ended epoch are stopped, so no record with these
+%% versions is stored. A Proxy confirms with the LogServers that the epoch
+%% is live before the Proxy gives the read version to a client. See
+%% {@link deadlift_proxy}.
 %%
 %% == Departures from the paper ==
 %%
 %% <ul>
 %% <li>FoundationDB also keeps the commit versions near the time of the
 %%   wall clock (`figureVersion' in the source). deadlift does not.</li>
-%% <li>A Proxy of FoundationDB confirms that its epoch is live before it
-%%   gives a read version. deadlift does not. A read version from the
-%%   Sequencer of an ended epoch can be below a commit of a later
-%%   epoch.</li>
 %% </ul>
 -module(deadlift_sequencer).
 
@@ -126,7 +125,8 @@ read_version(Sequencer) ->
     read_version(Sequencer, ?TIMEOUT_MS).
 
 %% @doc Returns the read version: the highest commit version that a Proxy
-%% has reported as committed.
+%% has reported as committed. A client must use `deadlift_proxy:read_version/1',
+%% which also confirms that the epoch is live.
 -spec read_version(gen_server:server_ref(), timeout()) -> {ok, version()}.
 read_version(Sequencer, Timeout) ->
     gen_server:call(Sequencer, read_version, Timeout).

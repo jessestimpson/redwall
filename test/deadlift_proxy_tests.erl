@@ -12,7 +12,9 @@ proxy_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> log_down(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> sequencer_down(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> transactions(Ids) end} end,
-        fun(Ids) -> {timeout, 30, fun() -> versions(Ids) end} end
+        fun(Ids) -> {timeout, 30, fun() -> versions(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> read_version_of_ended_epoch(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> read_version_with_log_down(Ids) end} end
     ]}.
 
 setup() ->
@@ -192,3 +194,30 @@ versions(Ids) ->
     ),
     {ok, V4} = deadlift_proxy:commit(P2, #{read_version => First, reads => [x], writes => [{x, 4}]}),
     ?assert(V4 > First, {V4, First}).
+
+%% The Proxy of an ended epoch gives no read version, and stops. The
+%% Sequencer of the ended epoch still answers with its read version, which
+%% is below a commit of the second epoch.
+read_version_of_ended_epoch(Ids) ->
+    {S1, P1, _} = epoch(Ids),
+    {ok, 1} = deadlift_proxy:commit(P1, a),
+    {ok, 1} = deadlift_proxy:read_version(P1),
+    {_S2, P2, _} = epoch(Ids),
+    {ok, 2} = deadlift_proxy:commit(P2, b),
+    ?assertEqual({ok, 1}, deadlift_sequencer:read_version(S1)),
+    Monitor = erlang:monitor(process, P1),
+    ?assertMatch({error, _}, deadlift_proxy:read_version(P1)),
+    ?assertEqual({shutdown, {log, read_version, stopped}}, await_down(Monitor)),
+    ?assertEqual({ok, 2}, deadlift_proxy:read_version(P2)).
+
+%% With 3 LogServers and a replication degree of 2, the Proxy gives a read
+%% version when 1 LogServer does not run, and stops when 2 do not run.
+read_version_with_log_down(Ids) ->
+    {_Sequencer, Proxy, [L1, L2 | _]} = epoch(Ids),
+    {ok, 1} = deadlift_proxy:commit(Proxy, a),
+    ok = deadlift_log:stop(deadlift_log:ref(L1)),
+    ?assertEqual({ok, 1}, deadlift_proxy:read_version(Proxy)),
+    ok = deadlift_log:stop(deadlift_log:ref(L2)),
+    Monitor = erlang:monitor(process, Proxy),
+    ?assertMatch({error, _}, deadlift_proxy:read_version(Proxy)),
+    ?assertEqual({shutdown, {log, read_version, noproc}}, await_down(Monitor)).

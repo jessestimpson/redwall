@@ -88,6 +88,8 @@ faults_test_() ->
         %% read version of an earlier epoch.
         ?assert(maps:get(not_committed, Stats, 0) > 1000, Stats),
         ?assert(maps:get(too_old, Stats, 0) > 10, Stats),
+        %% A Proxy of an ended epoch refused a read version.
+        ?assert(maps:get(no_read_version, Stats, 0) > 100, Stats),
         ?assert(maps:get(runs_with_three_epochs, Stats, 0) > 100, Stats)
     end}.
 
@@ -116,7 +118,10 @@ no_copy_is_found_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_copy}) end),
         ?debugFmt("no_copy: seed ~p, ~p", [Seed, Violation]),
-        ?assertMatch(#{property := copied}, Violation)
+        %% `copied' is the direct violation. `no_loss' is the violation of a
+        %% later recovery, which needs a record that the new LogServers did
+        %% not receive.
+        ?assert(lists:member(maps:get(property, Violation), [copied, no_loss]), Violation)
     end}.
 
 %% A planted defect: the Resolver admits every transaction.
@@ -146,6 +151,18 @@ no_report_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_report}) end),
         ?debugFmt("no_report: seed ~p, ~p", [Seed, Violation]),
         ?assertMatch(#{property := read_version_order}, Violation)
+    end}.
+
+%% A planted defect: a Proxy gives a read version without the confirmation
+%% that its epoch is live. The Proxy of an ended epoch then gives a read
+%% version below a commit of a later epoch.
+no_confirm_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_confirm}) end),
+        ?debugFmt("no_confirm: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := read_version_order}, Violation),
+        #{reader := #{reader_epoch := ReaderEpoch}, acknowledged := #{epoch := Epoch}} = Violation,
+        ?assert(ReaderEpoch < Epoch, Violation)
     end}.
 
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the

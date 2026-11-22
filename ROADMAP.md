@@ -58,7 +58,7 @@ commits and recoveries, and no run violates an invariant.
       seconds.
 - [x] Implement read versions in the Sequencer and the Proxy.
 - [x] Raise the commit version with the time, as FoundationDB does.
-- [ ] Confirm that the epoch is live before a Proxy gives a read version.
+- [x] Confirm that the epoch is live before a Proxy gives a read version.
 - [ ] Check key ranges in the Resolver.
 - [ ] Collect the transactions of a short time into one batch with one
       commit version in the Proxy.

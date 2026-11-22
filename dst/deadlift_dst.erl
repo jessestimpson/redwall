@@ -29,7 +29,8 @@
 %% <li>`recover': start a Sequencer and, after its recovery, a Proxy.</li>
 %% <li>`{transaction, R1, R2}': a client runs one transaction. It gets a
 %%   read version from one Proxy, and commits through a Proxy that can be
-%%   another one. The client uses the Proxy of the highest epoch in 3 of 4
+%%   another one. One client in three waits between the two steps, and
+%%   then commits through the Proxy of the highest epoch that runs. The client uses the Proxy of the highest epoch in 3 of 4
 %%   cases, and any Proxy that runs in the others. A Proxy can belong to an
 %%   epoch that has ended. The transaction reads and writes some of 4
 %%   keys.</li>
@@ -75,10 +76,9 @@
 %%   the guarantee of the Resolver.</li>
 %% <li>`read_version_order' - a read version is at or above the commit
 %%   version of every transaction that was acknowledged before the client
-%%   asked for the read version. The invariant applies when the epoch of
-%%   the Proxy that gave the read version is not below the epoch of the
-%%   acknowledged transaction. deadlift does not confirm that an epoch is
-%%   live before it gives a read version.</li>
+%%   asked for the read version, in any epoch. The harness checks every
+%%   read version that a client received, also when the commit failed. A Proxy of an ended epoch
+%%   must not give a read version.</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -103,6 +103,8 @@
 %%   transaction with a read version of the previous epoch.</li>
 %% <li>`no_report' - a Proxy does not report a committed LSN to the
 %%   Sequencer.</li>
+%% <li>`no_confirm' - a Proxy gives a read version without the
+%%   confirmation that its epoch is live.</li>
 %% </ul>
 %%
 %% == Limitations ==
@@ -327,6 +329,7 @@ record_stats(Tab) ->
     bump(unknown, length(ets:match(Tab, {{unknown, '_'}, '_'}))),
     bump(not_committed, length(ets:match(Tab, {{rejected, '_'}, not_committed}))),
     bump(too_old, length(ets:match(Tab, {{rejected, '_'}, transaction_too_old}))),
+    bump(no_read_version, length(ets:match(Tab, {{no_read_version, '_'}, '_'}))),
     bump(recoveries, length(Epochs)),
     bump(recoveries_failed, length(ets:match(Tab, {{recovery_failed, '_'}, '_'}))),
     %% The number of failed recoveries for each kind of reason.
@@ -426,11 +429,14 @@ has_body(LSN, C, Records) ->
         _ -> false
     end.
 
-%% `no_conflict' and `read_version_order'. Both compare every pair of
-%% acknowledged transactions, so the harness checks them only when the
-%% number of acknowledged transactions has changed.
+%% `no_conflict' and `read_version_order'. `no_conflict' compares every
+%% pair of acknowledged transactions. `read_version_order' compares every
+%% read version with every acknowledged transaction. The harness checks
+%% them only when the number of acknowledged transactions or the number of
+%% read versions has changed.
 transactions(Tab, Acks) ->
-    Count = length(Acks),
+    Reads = [Read#{client => C} || [C, Read] <- ets:match(Tab, {{read, '$1'}, '$2'})],
+    Count = {length(Acks), length(Reads)},
     case ets:lookup(Tab, transactions_checked) of
         [{_, Count}] ->
             ok;
@@ -439,7 +445,7 @@ transactions(Tab, Acks) ->
                 Txn#{client => C, epoch => Epoch, version => LSN}
              || {C, Epoch, LSN} <- Acks, [{_, Txn}] <- [ets:lookup(Tab, {txn, C})]
             ],
-            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Txns) end]) of
+            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end]) of
                 ok ->
                     true = ets:insert(Tab, {transactions_checked, Count}),
                     ok;
@@ -467,13 +473,14 @@ no_conflict(Txns) ->
             })
     end.
 
-read_version_order(Txns) ->
+%% `Reads' are the read versions that the clients received, also of the
+%% transactions that did not commit.
+read_version_order(Reads, Txns) ->
     Stale = [
         {T, A}
-     || T = #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start} <- Txns,
-        A = #{version := Version, epoch := Epoch, 'end' := End} <- Txns,
+     || T = #{read_version := ReadVersion, start := Start} <- Reads,
+        A = #{version := Version, 'end' := End} <- Txns,
         End < Start,
-        Epoch =< ReaderEpoch,
         ReadVersion < Version
     ],
     case Stale of

@@ -7,8 +7,43 @@
 %%
 %% == Read version ==
 %%
-%% `read_version/1' returns the read version of the Sequencer: the highest
-%% commit version that a Proxy has reported as committed.
+%% For `read_version/1', the Proxy sends two kinds of request at the same
+%% time:
+%%
+%% <ul>
+%% <li>The Proxy asks the Sequencer for the read version: the highest
+%%   commit version that a Proxy has reported as committed.</li>
+%% <li>The Proxy asks every LogServer of the epoch that runs whether the
+%%   epoch is live (`deadlift_log:confirm/2').</li>
+%% </ul>
+%%
+%% The Proxy answers the client when the Sequencer and k LogServers have
+%% answered, where k is the replication degree. FoundationDB has the same
+%% rule (`getLiveCommittedVersion' in `fdbserver/GrvProxyServer.actor.cpp'
+%% and `confirmEpochLive' in `fdbserver/TagPartitionedLogSystem.actor.cpp').
+%% The paper does not state it.
+%%
+%% The confirmation gives this guarantee: the read version is at or above
+%% the commit version of every transaction that was acknowledged before
+%% the client asked, in any epoch. The reason has three parts, for a Proxy
+%% of epoch `E' and m LogServers:
+%%
+%% <ul>
+%% <li>A recovery needs answers to its lock from more than m - k
+%%   LogServers of epoch `E'. At least one of the k LogServers that
+%%   confirmed is among them. That LogServer answered the lock after its
+%%   confirmation, and so after the client asked. A commit of a later
+%%   epoch is therefore acknowledged after the client asked.</li>
+%% <li>A commit of epoch `E' that was acknowledged before the client asked
+%%   was reported to the Sequencer before the Proxy asked the
+%%   Sequencer.</li>
+%% <li>A commit of an earlier epoch has a commit version below the first
+%%   commit version of epoch `E'.</li>
+%% </ul>
+%%
+%% If a LogServer answers that it is stopped, or more than m - k LogServers
+%% of the epoch do not run, the epoch has ended or cannot commit, and the
+%% Proxy stops.
 %%
 %% == Commit ==
 %%
@@ -70,8 +105,10 @@
 %% <li>The Proxy chooses the LogServers that receive the body from the LSN
 %%   (`deadlift_log:replicas/3'). FoundationDB chooses them from the tags of
 %%   the record.</li>
-%% <li>The Proxy does not confirm that its epoch is live before it gives a
-%%   read version. See {@link deadlift_sequencer}.</li>
+%% <li>A Proxy of deadlift commits and gives read versions. FoundationDB
+%%   has CommitProxies and GrvProxies.</li>
+%% <li>The Proxy confirms the epoch for each request of a read version.
+%%   FoundationDB confirms once for a batch of requests.</li>
 %% </ul>
 -module(deadlift_proxy).
 
@@ -95,7 +132,15 @@
 %% `report => false' plants a second defect: the Proxy answers the client
 %% and does not report the LSN to the Sequencer. The read version then does
 %% not follow the commits.
--type options() :: #{sequencer := gen_server:server_ref(), ack => all | replicas, report => boolean()}.
+%%
+%% `confirm => false' plants a third defect: the Proxy gives a read version
+%% without the confirmation that the epoch is live.
+-type options() :: #{
+    sequencer := gen_server:server_ref(),
+    ack => all | replicas,
+    report => boolean(),
+    confirm => boolean()
+}.
 
 %% A transaction. `reads' are the keys that the transaction read at
 %% `read_version'. `writes' are the keys and the values that the
@@ -117,6 +162,17 @@
     left = 0 :: non_neg_integer()
 }).
 
+%% A request for a read version that the Proxy has not answered.
+-record(read, {
+    from :: gen_server:from(),
+    %% The read version of the Sequencer, or `undefined' before the answer.
+    version :: version() | undefined,
+    %% The number of confirmations that the Proxy still needs.
+    needed :: non_neg_integer(),
+    %% The number of LogServers that do not run or did not answer.
+    unreachable = 0 :: non_neg_integer()
+}).
+
 -record(state, {
     sequencer :: gen_server:server_ref(),
     epoch :: deadlift_cstate:epoch() | undefined,
@@ -124,11 +180,15 @@
     replication = 1 :: pos_integer(),
     ack = all :: all | replicas,
     report = true :: boolean(),
+    confirm = true :: boolean(),
     kcv = 0 :: version(),
     %% The requests without an answer. The label of a request is
-    %% `{resolve, LSN}', `{push, LSN}' or `{report, LSN}'.
+    %% `{resolve, LSN}', `{push, LSN}', `{report, LSN}', `{live, Id}' or
+    %% `{confirm, Id}'. `Id' is the number of a request for a read version.
     requests :: gen_server:request_id_collection(),
-    commits = #{} :: #{version() => #commit{}}
+    commits = #{} :: #{version() => #commit{}},
+    reads = #{} :: #{pos_integer() => #read{}},
+    next_read = 1 :: pos_integer()
 }).
 
 -define(TIMEOUT_MS, 5000).
@@ -187,7 +247,9 @@ commit(Proxy, Transaction, Timeout) ->
 read_version(Proxy) ->
     read_version(Proxy, ?TIMEOUT_MS).
 
-%% @doc Returns a read version for a new transaction.
+%% @doc Returns a read version for a new transaction. The read version is
+%% at or above the commit version of every transaction that was
+%% acknowledged before the call.
 -spec read_version(gen_server:server_ref(), timeout()) -> {ok, version()} | {error, term()}.
 read_version(Proxy, Timeout) ->
     try
@@ -207,7 +269,14 @@ info(Proxy) ->
 
 %% @private
 init(Options = #{sequencer := Sequencer}) ->
-    {ok, #state{sequencer = Sequencer, ack = maps:get(ack, Options, all), report = maps:get(report, Options, true), requests = gen_server:reqids_new()}, {continue, start}}.
+    State = #state{
+        sequencer = Sequencer,
+        ack = maps:get(ack, Options, all),
+        report = maps:get(report, Options, true),
+        confirm = maps:get(confirm, Options, true),
+        requests = gen_server:reqids_new()
+    },
+    {ok, State, {continue, start}}.
 
 %% @private
 %% The Proxy starts with the previous epoch's end version as its KCV.
@@ -251,12 +320,30 @@ handle_call({commit, Transaction}, From, State = #state{sequencer = Sequencer, e
             Commit0 = #commit{from = From, prev = 0, body = Body},
             fail({shutdown, {sequencer, Reason}}, State#state{commits = (State#state.commits)#{0 => Commit0}})
     end;
-handle_call(read_version, _From, State = #state{sequencer = Sequencer}) ->
-    try deadlift_sequencer:read_version(Sequencer) of
-        {ok, Version} -> {reply, {ok, Version}, State}
-    catch
-        exit:Reason -> fail({shutdown, {sequencer, Reason}}, {error, Reason}, State)
-    end;
+handle_call(read_version, From, State = #state{sequencer = Sequencer, epoch = Epoch, logs = Logs, replication = K}) ->
+    #state{requests = Requests, reads = Reads, next_read = Id} = State,
+    Requests1 = gen_server:send_request(Sequencer, read_version, {live, Id}, Requests),
+    %% The Proxy sends to a LogServer only if the LogServer runs.
+    Pids =
+        case State#state.confirm of
+            true -> [deadlift_log:ref(Log) || Log <- Logs];
+            false -> []
+        end,
+    Running = [Pid || Pid <- Pids, Pid =/= undefined],
+    Requests2 = lists:foldl(
+        fun(Pid, Acc) -> gen_server:send_request(Pid, {confirm, Epoch}, {confirm, Id}, Acc) end,
+        Requests1,
+        Running
+    ),
+    Needed =
+        case State#state.confirm of
+            true -> K;
+            %% The planted defect `confirm => false'.
+            false -> 0
+        end,
+    Read = #read{from = From, needed = Needed, unreachable = length(Pids) - length(Running)},
+    State1 = State#state{requests = Requests2, reads = Reads#{Id => Read}, next_read = Id + 1},
+    read_progress(Id, noproc, State1);
 handle_call(info, _From, State = #state{epoch = Epoch, kcv = KCV, commits = Commits}) ->
     {reply, #{epoch => Epoch, kcv => KCV, waiting => map_size(Commits)}, State}.
 
@@ -269,6 +356,17 @@ handle_info(Message, State = #state{requests = Requests}) ->
     case gen_server:check_response(Message, Requests, true) of
         {{reply, Reply}, Label, Requests1} ->
             answered(Label, Reply, State#state{requests = Requests1});
+        {{error, {Reason, _Process}}, {confirm, Id}, Requests1} ->
+            State1 = State#state{requests = Requests1},
+            case State1#state.reads of
+                #{Id := Read = #read{unreachable = N}} ->
+                    Reads = (State1#state.reads)#{Id := Read#read{unreachable = N + 1}},
+                    read_progress(Id, Reason, State1#state{reads = Reads});
+                _ ->
+                    {noreply, State1}
+            end;
+        {{error, {Reason, _Process}}, {live, _Id}, Requests1} ->
+            fail({shutdown, {sequencer, read_version, Reason}}, State#state{requests = Requests1});
         {{error, {Reason, _Process}}, {Kind, LSN}, Requests1} ->
             fail({shutdown, {role(Kind), LSN, Reason}}, State#state{requests = Requests1});
         _NoRequestOrNoReply ->
@@ -292,7 +390,41 @@ split(Transaction) when is_map(Transaction) ->
 split(Body) ->
     {#{read_version => 0, reads => [], writes => []}, Body}.
 
+%% Answers the request for a read version `Id' when the Sequencer and
+%% enough LogServers have answered. Stops the Proxy when more than m - k
+%% LogServers of the epoch do not run: the epoch cannot be confirmed, and
+%% cannot commit. `Reason' is the reason of the last LogServer that the
+%% Proxy did not reach.
+read_progress(Id, Reason, State = #state{logs = Logs, replication = K, reads = Reads}) ->
+    case Reads of
+        #{Id := #read{unreachable = N}} when N > length(Logs) - K ->
+            fail({shutdown, {log, read_version, Reason}}, State);
+        #{Id := #read{from = From, version = Version, needed = 0}} when Version =/= undefined ->
+            gen_server:reply(From, {ok, Version}),
+            {noreply, State#state{reads = maps:remove(Id, Reads)}};
+        _ ->
+            {noreply, State}
+    end.
+
 %% The answer to a request.
+answered({live, Id}, {ok, Version}, State = #state{reads = Reads}) ->
+    case Reads of
+        #{Id := Read} -> read_progress(Id, noproc, State#state{reads = Reads#{Id := Read#read{version = Version}}});
+        _ -> {noreply, State}
+    end;
+answered({confirm, Id}, ok, State = #state{reads = Reads}) ->
+    case Reads of
+        #{Id := Read = #read{needed = N}} when N > 0 ->
+            read_progress(Id, noproc, State#state{reads = Reads#{Id := Read#read{needed = N - 1}}});
+        _ ->
+            %% The Proxy has answered the client, or has enough
+            %% confirmations.
+            {noreply, State}
+    end;
+answered({confirm, _Id}, {error, Reason}, State) ->
+    %% A Sequencer of a later epoch has locked the LogServer. The epoch of
+    %% the Proxy has ended.
+    fail({shutdown, {log, read_version, Reason}}, State);
 answered({resolve, LSN}, committed, State) ->
     push(LSN, State);
 answered({resolve, LSN}, Rejected, State = #state{commits = Commits}) when Rejected =:= conflict; Rejected =:= too_old ->
@@ -380,10 +512,6 @@ stored(LSN, State = #state{sequencer = Sequencer, kcv = KCV, requests = Requests
 
 fail(Reason, State) ->
     {stop, Reason, unknown(State)}.
-
-%% Stops the Proxy during a call, with an answer to the caller.
-fail(Reason, Reply, State) ->
-    {stop, Reason, Reply, unknown(State)}.
 
 unknown(State = #state{commits = Commits}) ->
     maps:foreach(

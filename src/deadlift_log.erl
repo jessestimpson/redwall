@@ -46,6 +46,14 @@
 %% `peek/3', so that the Sequencer can copy records and StorageServers can
 %% read records.
 %%
+%% == Confirmation of the epoch ==
+%%
+%% A Proxy asks the LogServers of its epoch whether the epoch is live
+%% before the Proxy gives a read version (`confirm/2'). A LogServer answers
+%% `ok' until a Sequencer locks the LogServer, and `{error, stopped}'
+%% after that. FoundationDB has the same request (`confirmRunning' in
+%% `fdbserver/TLogServer.actor.cpp'). The paper does not describe it.
+%%
 %% == Departures from the paper ==
 %%
 %% A LogServer of deadlift keeps the records in memory. A LogServer that
@@ -65,7 +73,7 @@
 
 -export([start/1, start_link/1, stop/1, ref/1]).
 -export([replicas/3]).
--export([push/6, push/7, send_push/6, lock/2, lock/3, peek/3, peek/4, info/1]).
+-export([push/6, push/7, send_push/6, lock/2, lock/3, confirm/2, peek/3, peek/4, info/1]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
 -export_type([id/0, body/0, record/0, options/0, info/0]).
@@ -211,6 +219,12 @@ lock(Log, Epoch) ->
 lock(Log, Epoch, Timeout) ->
     gen_server:call(Log, {lock, Epoch}, Timeout).
 
+%% @doc Asks whether the epoch of the LogServer is live. The result is `ok'
+%% if no Sequencer has locked the LogServer.
+-spec confirm(gen_server:server_ref(), epoch()) -> ok | {error, term()}.
+confirm(Log, Epoch) ->
+    gen_server:call(Log, {confirm, Epoch}, ?TIMEOUT_MS).
+
 %% @equiv peek(Log, After, UpTo, 5000)
 -spec peek(gen_server:server_ref(), version(), version() | infinity) -> {ok, [record()]}.
 peek(Log, After, UpTo) ->
@@ -305,6 +319,12 @@ handle_call({lock, Epoch}, _From, State = #state{dv = DV, kcv = KCV, waiting = W
         Waiting
     ),
     {reply, {ok, #{dv => DV, kcv => KCV}}, State#state{stopped_by = Epoch, waiting = #{}}};
+handle_call({confirm, Epoch}, _From, State = #state{epoch = Mine}) when Epoch =/= Mine ->
+    {reply, {error, {epoch, Mine}}, State};
+handle_call({confirm, _Epoch}, _From, State = #state{stopped_by = undefined}) ->
+    {reply, ok, State};
+handle_call({confirm, _Epoch}, _From, State) ->
+    {reply, {error, stopped}, State};
 handle_call({peek, After, UpTo}, _From, State = #state{records = Records}) ->
     {reply, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), UpTo)}, State};
 handle_call(stop, _From, State) ->

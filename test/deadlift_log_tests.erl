@@ -88,7 +88,11 @@ lock_test() ->
     {ok, 2} = deadlift_log:push(Log, 1, 1, 2, 1, {body, b}),
     R4 = send(Log, 3, 4, 2, {body, d}),
     no_answer(R4),
+    %% The LogServer confirms its epoch until the lock.
+    ?assertEqual(ok, deadlift_log:confirm(Log, 1)),
+    ?assertEqual({error, {epoch, 1}}, deadlift_log:confirm(Log, 2)),
     ?assertEqual({ok, #{dv => 2, kcv => 1}}, deadlift_log:lock(Log, 3)),
+    ?assertEqual({error, stopped}, deadlift_log:confirm(Log, 1)),
     ?assertEqual({error, stopped}, answer(R4)),
     ?assertEqual({error, stopped}, deadlift_log:push(Log, 1, 2, 3, 2, {body, c})),
     ?assertMatch(#{dv := 2, kcv := 1, stopped_by := 3, waiting := 0}, deadlift_log:info(Log)),
