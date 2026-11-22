@@ -32,15 +32,18 @@ deadlift is at the start. The repository contains:
   transaction system, checked with TLC;
 - the coordinated state, as a state machine for peace, with tests;
 - the LogServer, with tests;
-- the recovery and a Sequencer that assigns commit versions, with tests;
-- a Proxy that commits a record without a conflict check, with tests;
+- the recovery, and a Sequencer that assigns read versions and commit
+  versions, with tests;
+- the Resolver, with tests;
+- a Proxy that gives read versions and commits transactions, with tests;
 - a deterministic simulation of these parts with
-  [eta](https://github.com/jessestimpson/eta), with kills of LogServers,
-  Sequencers and Proxies.
+  [eta](https://github.com/jessestimpson/eta), with kills, partitions,
+  and lost and delayed messages.
 
-deadlift has no Resolver and no StorageServer yet. A client can commit a
-record to the LogServers. A client cannot read, and deadlift cannot run a
-transaction. See [ROADMAP.md](ROADMAP.md).
+deadlift has no StorageServer yet. A client can get a read version and
+commit a transaction with read keys and write keys, and the Resolver
+rejects a transaction with a conflict. A client cannot read a value, so
+deadlift cannot run a complete transaction. See [ROADMAP.md](ROADMAP.md).
 
 ## Design
 
@@ -53,9 +56,9 @@ deadlift keeps this design.
 |---|---|---|
 | Coordinators | Store the coordinated state | A peace cluster that runs [deadlift_cstate](src/deadlift_cstate.erl) |
 | ClusterController | Recruits the Sequencer | Not implemented |
-| Sequencer | Assigns read versions and commit versions, and performs the recovery | [deadlift_sequencer](src/deadlift_sequencer.erl) and [deadlift_recovery](src/deadlift_recovery.erl), without read versions. Modelled in [formal/Recovery.tla](formal/Recovery.tla) |
-| Proxy | Gives read versions to clients and commits transactions | [deadlift_proxy](src/deadlift_proxy.erl), without read versions and without a conflict check. Modelled |
-| Resolver | Checks a transaction for conflicts | Not implemented |
+| Sequencer | Assigns read versions and commit versions, and performs the recovery | [deadlift_sequencer](src/deadlift_sequencer.erl) and [deadlift_recovery](src/deadlift_recovery.erl). The recovery is modelled in [formal/Recovery.tla](formal/Recovery.tla) |
+| Proxy | Gives read versions to clients and commits transactions | [deadlift_proxy](src/deadlift_proxy.erl). The commit to the LogServers is modelled |
+| Resolver | Checks a transaction for conflicts | [deadlift_resolver](src/deadlift_resolver.erl). Not modelled |
 | LogServer | Stores the log records of an epoch | [deadlift_log](src/deadlift_log.erl). Modelled |
 | StorageServer | Stores data and answers reads at a version | Not implemented |
 
@@ -122,24 +125,70 @@ Sequencer stops. A recovery that fails after step 1 leaves a higher
 recovery count. A recovery that fails after step 2 leaves stopped
 LogServers. The next recovery handles both.
 
+### Versions
+
+The paper does not state the rules below. They are the rules of
+FoundationDB 7.3, from `fdbserver/ClusterRecovery.actor.cpp`,
+`fdbserver/masterserver.actor.cpp`, `fdbserver/Resolver.actor.cpp`,
+`fdbserver/SkipList.cpp` and `fdbclient/ServerKnobs.cpp`.
+
+| Rule | Value in deadlift and in FoundationDB |
+|---|---|
+| Versions for each second | 1,000,000 |
+| A commit version | The last commit version plus the versions of the time since then; at least 1 more, at most 5,000,000 more |
+| The first commit version of an epoch | The Recovery Version plus 100,000,000; 1 if the Recovery Version is 0 |
+| The read version | The highest commit version that a Proxy has reported as committed; at the start of an epoch, the first commit version |
+| The MVCC window of the Resolver | 5,000,000 versions |
+
+The gap at the start of an epoch is larger than the MVCC window. The
+Resolver of a new epoch has no history. Because of the gap, it treats a
+transaction with a read version of the previous epoch as too old.
+
+### The Resolver
+
+The Resolver follows Algorithm 1 of the paper (section 2.4.2). It keeps,
+for each key, the commit version of the last transaction that wrote the
+key.
+
+- A transaction has a conflict if a key that it read has a commit version
+  above the read version of the transaction.
+- A transaction with read keys and a read version below the MVCC window
+  is too old.
+- The Resolver handles the commit versions in their order. A request that
+  arrives before the request with the previous version waits.
+
 ### The Proxy
 
-A Proxy commits a record in three steps (paper, sections 2.4.1 and 2.4.3):
+A Proxy commits a transaction in five steps (paper, sections 2.4.1 and
+2.4.3):
 
 1. The Proxy asks the Sequencer for an LSN and the previous LSN.
-2. The Proxy sends the record to every LogServer of the epoch. The k
+2. The Proxy sends the read version, the read keys and the write keys to
+   the Resolver. If the Resolver rejects the transaction, the Proxy
+   answers the client with an error.
+3. The Proxy sends the record to every LogServer of the epoch. The k
    LogServers that replicate the record receive the body.
-3. When every LogServer of the epoch has answered, the Proxy answers the
-   client and raises its KCV to the LSN.
+4. When every LogServer of the epoch has answered, the Proxy raises its
+   KCV to the LSN and reports the LSN to the Sequencer as committed.
+5. When the Sequencer has answered, the Proxy answers the client.
+
+The Proxy also sends a record for a rejected transaction, without the
+writes. A LogServer stores a record only after the record with the
+previous LSN, so every LSN must reach the LogServers.
+
+Because of step 4, the Sequencer knows that an LSN is committed before any
+client does. A client that starts after an answer gets a read version at
+or above that LSN.
 
 The Proxy waits for every LogServer, and not only for the k LogServers
 with the body. The config `RecoveryAckReplicasOnly` of the model shows
 that a Proxy that waits for k LogServers lets a recovery discard an
 acknowledged record.
 
-If a LogServer answers with an error or is not alive, the Proxy answers
-`{error, commit_unknown_result}` to every client that waits, and stops.
-The Proxy of an ended epoch stops in this way at its next commit.
+If the Resolver, a LogServer or the Sequencer answers with an error or is
+not alive, the Proxy answers `{error, commit_unknown_result}` to every
+client that waits, and stops. The Proxy of an ended epoch stops in this
+way at its next commit.
 
 ### LogServer identifiers
 
@@ -162,13 +211,19 @@ through the registry. They send a request only to a LogServer that runs.
 - The recovery copies each record to every new LogServer. FoundationDB
   copies a record to the new LogServers that replicate the tags of the
   record.
-- The Sequencer raises the LSN by 1 for each commit version. FoundationDB
-  raises the version with the time.
+- FoundationDB keeps the commit versions near the time of the wall clock.
+  deadlift raises the commit version with the elapsed time only.
+- A Proxy of FoundationDB confirms that its epoch is live before it gives
+  a read version. deadlift does not.
+- The Resolver checks keys. The Resolver of the paper checks key ranges.
+- One Resolver handles every key. FoundationDB divides the key space over
+  several Resolvers.
 - A registry on each node finds the process of a LogServer. In
   FoundationDB the ClusterController has this function. This part is not
   in the paper.
-- The Proxy has no Resolver, and sends one record for each commit.
-  FoundationDB collects transactions into a batch with one commit version.
+- The Proxy sends one record for each commit, and the Resolver checks one
+  transaction for each request. FoundationDB collects transactions into a
+  batch with one commit version.
 - The Proxy chooses the LogServers that receive the body of a record from
   the LSN. FoundationDB chooses them from the tags of the record.
 
@@ -177,7 +232,7 @@ through the registry. They send a request only to a LogServer that runs.
 | Level | What it checks | Command | Time |
 |---|---|---|---|
 | Unit tests | The coordinated state machine, alone and on a peace cluster of three servers on one node. One LogServer: the order of the LSNs, the KCV, repeated records and the lock. The recovery on a peace cluster: the first epoch, a second epoch with records to copy, 1 and 2 LogServers down, and two recoveries at the same time. The Proxy: commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down | `make test` | 3 seconds |
-| Simulation | The LogServer, the recovery, the Sequencer and the Proxy under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 3.5 minutes |
+| Simulation | The LogServer, the recovery, the Sequencer, the Resolver and the Proxy under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 4.5 minutes |
 | Model checking | The logging protocol and the recovery, with 2 epochs | `make tlc` | about 1 minute |
 | Model checking | The same model with 3 epochs | `make tlc-long` | about 5 minutes |
 
@@ -199,7 +254,9 @@ between nodes and delays 20% of them.
 The workload has these operations:
 
 - start a Sequencer and, after its recovery, a Proxy;
-- commit a record through a Proxy of any epoch;
+- run a transaction: get a read version from a Proxy of any epoch, and
+  commit through a Proxy of any epoch, with read keys and write keys from
+  4 keys;
 - kill a LogServer of the current epoch, at most 1 for each epoch;
 - kill a Sequencer, also during its recovery;
 - kill a Proxy;
@@ -214,6 +271,8 @@ The harness checks these invariants after every step:
 | `no_loss` | No recovery ends with a missing body. `NoLoss` of the model |
 | `body_available` | The body of every acknowledged record is on a LogServer of its epoch that runs |
 | `copied` | Every LogServer of a new epoch has the body of every acknowledged record above the previous epoch's end version |
+| `no_conflict` | No acknowledged transaction read a key that another acknowledged transaction wrote between the read version and the commit version of the first one |
+| `read_version_order` | A read version is at or above the commit version of every transaction that was acknowledged before the client asked for it, if the Proxy that gave it is not of an earlier epoch |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -222,17 +281,16 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 23,735 acknowledged commits, 2,404 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 28,238 acknowledged commits, 7,422 recoveries, 2,708 kills, 703 partitions |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `durable`. This is the counterexample of `RecoveryAckReplicasOnly` |
+| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 17,781 acknowledged transactions, 4,896 rejected for a conflict, 358 too old, 2,356 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 9,889 acknowledged transactions, 7,736 rejected for a conflict, 318 too old, 7,200 recoveries, 2,624 kills, 715 partitions |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 2, `unique_versions`. This is the counterexample of `RecoveryNoCas` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
+| Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 62, `no_conflict` between a transaction of epoch 19 and a write of epoch 16 |
+| Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
 
-The suite takes about 3.5 minutes.
-
-The simulation needs the branch `send-request-and-dead-monitors` of eta.
-The branch adds `gen_server:send_request/4` to the simulated network, and
-corrects `is_process_alive/1` on a suspended process.
+The suite takes about 4.5 minutes.
 
 ## Commands
 
@@ -261,6 +319,7 @@ make tlc-long   # the TLC config with three epochs
 | [src/deadlift_log.erl](src/deadlift_log.erl) | The LogServer |
 | [src/deadlift_recovery.erl](src/deadlift_recovery.erl) | The recovery |
 | [src/deadlift_sequencer.erl](src/deadlift_sequencer.erl) | The Sequencer |
+| [src/deadlift_resolver.erl](src/deadlift_resolver.erl) | The Resolver |
 | [src/deadlift_proxy.erl](src/deadlift_proxy.erl) | The Proxy |
 | [src/deadlift_registry.erl](src/deadlift_registry.erl) | The registry of the processes of one node |
 | [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
@@ -273,6 +332,7 @@ make tlc-long   # the TLC config with three epochs
 | [test/deadlift_log_tests.erl](test/deadlift_log_tests.erl) | Tests for `deadlift_log` |
 | [test/deadlift_recovery_tests.erl](test/deadlift_recovery_tests.erl) | Tests for `deadlift_recovery` and `deadlift_sequencer` |
 | [test/deadlift_proxy_tests.erl](test/deadlift_proxy_tests.erl) | Tests for `deadlift_proxy` |
+| [test/deadlift_resolver_tests.erl](test/deadlift_resolver_tests.erl) | Tests for `deadlift_resolver` |
 | [formal/Recovery.tla](formal/Recovery.tla) | TLA+ model of the logging protocol and the recovery |
 | [formal/MCRecovery.tla](formal/MCRecovery.tla) | Constants and invariants for model checking |
 | [formal/README.md](formal/README.md) | The model, the configs and the results |
@@ -280,8 +340,16 @@ make tlc-long   # the TLC config with three epochs
 
 ## Limitations
 
-- deadlift cannot run a transaction, and a client cannot read. A client
-  can commit a record to the LogServers.
+- A client cannot read a value. deadlift has no StorageServer, so it cannot
+  run a complete transaction.
+- A read version from the Proxy of an ended epoch can be below a commit of
+  a later epoch. deadlift does not confirm that an epoch is live before it
+  gives a read version. A transaction that only reads can then read an
+  old state. A transaction with read keys that commits in the later epoch
+  is rejected as too old.
+- A Resolver that stops is not started again. The commits of its epoch
+  stop until the next recovery. The simulation does not kill a Resolver.
+- The TLA+ model has no Resolver and no read version.
 - A Proxy that stops between the assignment of an LSN and the push leaves
   an LSN that no LogServer receives. Every later record of the epoch then
   waits in the LogServers until a recovery.

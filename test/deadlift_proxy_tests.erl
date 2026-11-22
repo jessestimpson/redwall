@@ -10,7 +10,9 @@ proxy_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> commits_at_once(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> recovery_keeps_commits(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> log_down(Ids) end} end,
-        fun(Ids) -> {timeout, 30, fun() -> sequencer_down(Ids) end} end
+        fun(Ids) -> {timeout, 30, fun() -> sequencer_down(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> transactions(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> versions(Ids) end} end
     ]}.
 
 setup() ->
@@ -39,7 +41,11 @@ await_read(Ids, N) ->
 
 %% Starts a Sequencer and a Proxy for a new epoch.
 epoch(Ids) ->
-    {ok, Sequencer} = deadlift_sequencer:start(#{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200}),
+    epoch(Ids, #{versions_per_second => 0}).
+
+epoch(Ids, Options) ->
+    Base = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200},
+    {ok, Sequencer} = deadlift_sequencer:start(maps:merge(Base, Options)),
     {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer}),
     {ok, #{log_system := #{logs := Logs}}} = deadlift_sequencer:recovered(Sequencer),
     {Sequencer, Proxy, Logs}.
@@ -125,3 +131,64 @@ sequencer_down(Ids) ->
     Monitor = erlang:monitor(process, Proxy),
     ?assertEqual({error, commit_unknown_result}, deadlift_proxy:commit(Proxy, b)),
     ?assertMatch({shutdown, {sequencer, _}}, await_down(Monitor)).
+
+%% Transactions with read keys. The Resolver rejects a transaction that
+%% read a key below a later write.
+transactions(Ids) ->
+    {_Sequencer, Proxy, Logs} = epoch(Ids),
+    {ok, 1} = deadlift_proxy:read_version(Proxy),
+    {ok, 1} = deadlift_proxy:commit(Proxy, #{read_version => 1, reads => [x], writes => [{x, 1}]}),
+    %% The read version follows the commit.
+    {ok, 1} = deadlift_proxy:read_version(Proxy),
+    {ok, 2} = deadlift_proxy:commit(Proxy, #{read_version => 1, reads => [x], writes => [{x, 2}]}),
+    {ok, 2} = deadlift_proxy:read_version(Proxy),
+    %% This transaction read `x' at version 1, below the write at version 2.
+    ?assertEqual(
+        {error, not_committed},
+        deadlift_proxy:commit(Proxy, #{read_version => 1, reads => [x], writes => [{x, 3}, {y, 3}]})
+    ),
+    %% The rejected transaction has the LSN 3. The next commit follows it.
+    {ok, 4} = deadlift_proxy:commit(Proxy, #{read_version => 2, reads => [x, y], writes => [{y, 4}]}),
+    ?assertEqual(#{epoch => 1, kcv => 4, waiting => 0}, deadlift_proxy:info(Proxy)),
+    [?assertMatch(#{dv := 4}, info(L)) || L <- Logs],
+    %% The record 3 has no transaction. Each body is on 2 LogServers.
+    All = lists:sort(lists:append([bodies(L) || L <- Logs])),
+    ?assertEqual(
+        [
+            {1, [{x, 1}]},
+            {1, [{x, 1}]},
+            {2, [{x, 2}]},
+            {2, [{x, 2}]},
+            {3, no_transaction},
+            {3, no_transaction},
+            {4, [{y, 4}]},
+            {4, [{y, 4}]}
+        ],
+        All
+    ).
+
+%% The commit versions follow the clock, and a new epoch starts above the
+%% MVCC window. A transaction with a read version of the first epoch is too
+%% old in the second epoch.
+versions(Ids) ->
+    Options = #{versions_per_second => 1000000},
+    {_S1, P1, _} = epoch(Ids, Options),
+    {ok, 1} = deadlift_proxy:commit(P1, #{writes => [{x, 1}]}),
+    timer:sleep(20),
+    {ok, V2} = deadlift_proxy:commit(P1, #{read_version => 1, reads => [x], writes => [{x, 2}]}),
+    %% 20 ms are 20,000 versions.
+    ?assert(V2 >= 1 + 15000, V2),
+    ?assert(V2 < 1 + 1000000, V2),
+    {ok, V2} = deadlift_proxy:read_version(P1),
+    {S2, P2, _} = epoch(Ids, Options),
+    {ok, #{recovery_version := V2, recovery_transaction_version := First}} = deadlift_sequencer:recovered(S2),
+    ?assertEqual(V2 + 100000000, First),
+    ?assertEqual({ok, First}, deadlift_proxy:read_version(P2)),
+    %% This transaction read `x' at version 1 and did not see the write at
+    %% `V2'. The Resolver of the second epoch has no record of that write.
+    ?assertEqual(
+        {error, transaction_too_old},
+        deadlift_proxy:commit(P2, #{read_version => 1, reads => [x], writes => [{x, 3}]})
+    ),
+    {ok, V4} = deadlift_proxy:commit(P2, #{read_version => First, reads => [x], writes => [{x, 4}]}),
+    ?assert(V4 > First, {V4, First}).

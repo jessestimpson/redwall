@@ -74,6 +74,12 @@
     replication := pos_integer(),
     recruit => fun((deadlift_log:options()) -> {ok, term()} | {error, term()}),
     lock_timeout_ms => non_neg_integer(),
+    %% The options of the Sequencer. See `deadlift_sequencer'.
+    recruit_resolver => fun((deadlift_resolver:options()) -> {ok, term()} | {error, term()}),
+    versions_per_second => non_neg_integer(),
+    max_versions_in_flight => pos_integer(),
+    max_read_life => pos_integer(),
+    mvcc_window => pos_integer() | infinity,
     cstate_timeout_ms => timeout()
 }.
 
@@ -81,7 +87,9 @@
     epoch := deadlift_cstate:epoch(),
     log_system := deadlift_cstate:log_system(),
     recovery_version := version(),
-    previous_epoch_end_version := version()
+    previous_epoch_end_version := version(),
+    %% Added by the Sequencer.
+    recovery_transaction_version => version()
 }.
 
 -define(LOCK_TIMEOUT_MS, 1000).

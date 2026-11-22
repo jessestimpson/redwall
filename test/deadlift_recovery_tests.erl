@@ -41,7 +41,9 @@ await_read(Ids, N) ->
     end.
 
 options(Ids) ->
-    #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200}.
+    %% `versions_per_second => 0' makes each commit version the previous
+    %% one plus 1.
+    #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0}.
 
 %% Pushes the record `LSN' of epoch `Epoch' to `Logs'. The LogServers in
 %% `Replicas' receive the body.

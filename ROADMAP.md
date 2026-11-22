@@ -10,9 +10,9 @@ deadlift follows the design of FoundationDB as the paper describes it. See
 | TLA+ model of the logging protocol and the recovery | Done, checked with TLC |
 | Coordinated state on peace | Done, with unit tests |
 | LogServer | Done in memory, with unit tests |
-| Sequencer and recovery | Done without read versions, with unit tests |
-| Proxy | Done without a conflict check and without read versions, with unit tests |
-| Resolver | Not started |
+| Sequencer and recovery | Done, with unit tests |
+| Proxy | Done, with unit tests |
+| Resolver | Done for keys, with unit tests |
 | StorageServer | Not started |
 | Simulation with eta | Done: kills, partitions, and lost and delayed messages |
 
@@ -50,18 +50,19 @@ commits and recoveries, and no run violates an invariant.
 
 ### Milestone 2: Transactions
 
-- [ ] Implement the Resolver with Algorithm 1 of the paper and an MVCC
+- [x] Implement the Resolver with Algorithm 1 of the paper and an MVCC
       window.
-- [ ] Give a new epoch a first version that makes every transaction of the
-      earlier epoch too old for the new Resolvers. The Resolvers of a new
-      epoch have no history. The paper does not state the rule. Read the
-      FoundationDB source for the rule before this work.
-- [ ] Implement read versions in the Sequencer and the Proxy.
-- [ ] Raise the commit version with the time, as FoundationDB does. The
-      Sequencer raises the LSN by 1 now. The MVCC window is a number of
-      versions, so the Resolver needs versions that follow the time.
+- [x] Give a new epoch a first version that makes every transaction of the
+      earlier epoch too old for the new Resolvers. The rule is from the
+      FoundationDB source: the Recovery Version plus the versions of 100
+      seconds.
+- [x] Implement read versions in the Sequencer and the Proxy.
+- [x] Raise the commit version with the time, as FoundationDB does.
+- [ ] Confirm that the epoch is live before a Proxy gives a read version.
+- [ ] Check key ranges in the Resolver.
 - [ ] Collect the transactions of a short time into one batch with one
       commit version in the Proxy.
+- [ ] Kill the Resolver in the simulation.
 - [ ] Implement a StorageServer that pulls records from the LogServers,
       answers reads at a version, and discards the records above the
       Recovery Version after a recovery.
@@ -104,8 +105,8 @@ node of the cluster. See "Use cases" in [README.md](README.md).
 
 ## Verification work
 
-- [ ] Extend the model with the Resolver and the first version of an
-      epoch.
+- [ ] Extend the model with the Resolver, the read version and the first
+      version of an epoch. The implementation has them.
 - [ ] Extend the model with StorageServers and the rollback above the
       Recovery Version.
 - [ ] Model the copy of records to a subset of the new LogServers. The

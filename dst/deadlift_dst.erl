@@ -27,9 +27,12 @@
 %%
 %% <ul>
 %% <li>`recover': start a Sequencer and, after its recovery, a Proxy.</li>
-%% <li>`{commit, R}': a client commits one record through a Proxy that
-%%   runs: the Proxy of the highest epoch in 3 of 4 commits, and any Proxy
-%%   in the others. The Proxy can belong to an epoch that has ended.</li>
+%% <li>`{transaction, R1, R2}': a client runs one transaction. It gets a
+%%   read version from one Proxy, and commits through a Proxy that can be
+%%   another one. The client uses the Proxy of the highest epoch in 3 of 4
+%%   cases, and any Proxy that runs in the others. A Proxy can belong to an
+%%   epoch that has ended. The transaction reads and writes some of 4
+%%   keys.</li>
 %% <li>`{kill_log, R}': kill one LogServer of the current epoch. The
 %%   harness kills at most 1 LogServer of each epoch, because the design
 %%   tolerates the loss of k - 1 LogServers of an epoch, and a LogServer of
@@ -66,6 +69,16 @@
 %% <li>`copied' - when a recovery ends an epoch, every LogServer of the new
 %%   epoch that runs has the body of every acknowledged record of the
 %%   ended epoch above the previous epoch's end version.</li>
+%% <li>`no_conflict' - no acknowledged transaction read a key that another
+%%   acknowledged transaction wrote at a commit version above the read
+%%   version of the first transaction and below its commit version. This is
+%%   the guarantee of the Resolver.</li>
+%% <li>`read_version_order' - a read version is at or above the commit
+%%   version of every transaction that was acknowledged before the client
+%%   asked for the read version. The invariant applies when the epoch of
+%%   the Proxy that gave the read version is not below the epoch of the
+%%   acknowledged transaction. deadlift does not confirm that an epoch is
+%%   live before it gives a read version.</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -84,6 +97,12 @@
 %% <li>`no_cas' - the coordinated state accepts a write from a Sequencer
 %%   whose epoch is not the recovery count. See `RecoveryNoCas'.</li>
 %% <li>`no_copy' - a recovery copies no record to the new LogServers.</li>
+%% <li>`no_check' - the Resolver admits every transaction.</li>
+%% <li>`no_gap' - the first commit version of an epoch is the Recovery
+%%   Version plus 1. The Resolver of the new epoch then admits a
+%%   transaction with a read version of the previous epoch.</li>
+%% <li>`no_report' - a Proxy does not report a committed LSN to the
+%%   Sequencer.</li>
 %% </ul>
 %%
 %% == Limitations ==
@@ -151,12 +170,12 @@ generate(#{faults := Faults}, Rand0) ->
     Op =
         if
             not Faults, Roll < 0.08 -> recover;
-            not Faults -> {commit, R};
+            not Faults -> {transaction, R};
             %% Faults are rare. A LogServer that is lost or cut off stops the
             %% commits of its epoch until the next recovery, and only an
             %% acknowledged commit can violate most of the invariants.
             Roll < 0.12 -> recover;
-            Roll < 0.93 -> {commit, R};
+            Roll < 0.93 -> {transaction, R};
             Roll < 0.945 -> {kill_log, R};
             Roll < 0.96 -> {kill_sequencer, R};
             Roll < 0.97 -> {kill_proxy, R};
@@ -167,6 +186,9 @@ generate(#{faults := Faults}, Rand0) ->
         partition ->
             {R2, Rand3} = rand:uniform_s(1000, Rand2),
             {{partition, R, R2}, Rand3};
+        {transaction, R} ->
+            {R2, Rand3} = rand:uniform_s(1000, Rand2),
+            {{transaction, R, R2}, Rand3};
         _ ->
             {Op, Rand2}
     end.
@@ -177,19 +199,18 @@ execute(Op, S = #{n := N0}) ->
 execute(recover, N, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
     true = ets:insert(Tab, {{node, deadlift_dst_client:sequencer_node(N)}, true}),
     spawn_op(deadlift_dst_client:sequencer_node(N), fun() -> deadlift_dst_client:recover(Tab, N, CState, Mode) end, S);
-execute({commit, R}, N, S = #{tab := Tab}) ->
-    %% The client uses the Proxy of the highest epoch in 3 of 4 commits, and
-    %% any Proxy that runs in the others.
+execute({transaction, R1, R2}, N, S = #{tab := Tab}) ->
     Proxies = lists:keysort(2, [{Proxy, Epoch} || [Proxy, Epoch] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'}), is_process_alive(Proxy)]),
-    Choice =
-        case {Proxies, R rem 4} of
-            {[], _} -> none;
-            {_, 0} -> pick(R div 4, Proxies);
-            {_, _} -> lists:last(Proxies)
-        end,
-    case Choice of
-        none -> S;
-        Target -> spawn_op(clients, fun() -> deadlift_dst_client:commit(Tab, N, Target) end, S)
+    %% The Proxy of the highest epoch in 3 of 4 cases, and any Proxy that
+    %% runs in the others.
+    Choose = fun
+        (_R) when Proxies =:= [] -> none;
+        (R) when R rem 4 =:= 0 -> pick(R div 4, Proxies);
+        (_R) -> lists:last(Proxies)
+    end,
+    case {Choose(R1), Choose(R2)} of
+        {none, none} -> S;
+        {Reader, Proxy} -> spawn_op(clients, fun() -> deadlift_dst_client:transaction(Tab, N, Reader, Proxy, R1 + R2) end, S)
     end;
 execute({kill_log, R}, _N, S = #{tab := Tab, cstate := CState}) ->
     case current(CState) of
@@ -243,6 +264,7 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> durable(Acks, CState) end,
         fun() -> body_available(Acks, Logs) end,
         fun() -> copied(Tab, Acks, CState, Logs) end,
+        fun() -> transactions(Tab, Acks) end,
         fun() -> kcv_below_dv(Logs) end,
         fun() -> chain(Logs) end
     ]).
@@ -303,6 +325,8 @@ record_stats(Tab) ->
     bump(runs),
     bump(acks, length(ets:match(Tab, {{ack, '_'}, '_', '_'}))),
     bump(unknown, length(ets:match(Tab, {{unknown, '_'}, '_'}))),
+    bump(not_committed, length(ets:match(Tab, {{rejected, '_'}, not_committed}))),
+    bump(too_old, length(ets:match(Tab, {{rejected, '_'}, transaction_too_old}))),
     bump(recoveries, length(Epochs)),
     bump(recoveries_failed, length(ets:match(Tab, {{recovery_failed, '_'}, '_'}))),
     %% The number of failed recoveries for each kind of reason.
@@ -356,7 +380,7 @@ body_available(Acks, Logs) ->
             fun
                 ({{E, _Index}, #{records := Records}}) when E =:= Epoch ->
                     case gb_trees:lookup(LSN, Records) of
-                        {value, {_Prev, {body, {client, C}}}} -> true;
+                        {value, {_Prev, {body, [{_Key, {client, C}} | _]}}} -> true;
                         _ -> false
                     end;
                 (_) ->
@@ -389,17 +413,77 @@ copied(Tab, Acks, CState, Logs) ->
         LSN =< RV,
         {Id = {E, _Index}, #{records := Records}} <- Logs,
         E =:= New,
-        gb_trees:lookup(LSN, Records) =/= {value, {prev_of(LSN, Records), {body, {client, C}}}}
+        not has_body(LSN, C, Records)
     ],
     case Missing of
         [] -> ok;
         [{C, Epoch, LSN, Id} | _] -> violation(copied, #{client => C, epoch => Epoch, lsn => LSN, log => Id})
     end.
 
-prev_of(LSN, Records) ->
+has_body(LSN, C, Records) ->
     case gb_trees:lookup(LSN, Records) of
-        {value, {Prev, _Body}} -> Prev;
-        none -> none
+        {value, {_Prev, {body, [{_Key, {client, C}} | _]}}} -> true;
+        _ -> false
+    end.
+
+%% `no_conflict' and `read_version_order'. Both compare every pair of
+%% acknowledged transactions, so the harness checks them only when the
+%% number of acknowledged transactions has changed.
+transactions(Tab, Acks) ->
+    Count = length(Acks),
+    case ets:lookup(Tab, transactions_checked) of
+        [{_, Count}] ->
+            ok;
+        _ ->
+            Txns = [
+                Txn#{client => C, epoch => Epoch, version => LSN}
+             || {C, Epoch, LSN} <- Acks, [{_, Txn}] <- [ets:lookup(Tab, {txn, C})]
+            ],
+            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Txns) end]) of
+                ok ->
+                    true = ets:insert(Tab, {transactions_checked, Count}),
+                    ok;
+                Violation ->
+                    Violation
+            end
+    end.
+
+no_conflict(Txns) ->
+    Conflicts = [
+        {T, W}
+     || T = #{read_version := ReadVersion, version := Version, reads := Reads} <- Txns,
+        W = #{version := Written, writes := Writes} <- Txns,
+        Written > ReadVersion,
+        Written < Version,
+        Writes -- (Writes -- Reads) =/= []
+    ],
+    case Conflicts of
+        [] ->
+            ok;
+        [{T, W} | _] ->
+            violation(no_conflict, #{
+                reader => maps:with([client, epoch, read_version, version, reads], T),
+                writer => maps:with([client, epoch, version, writes], W)
+            })
+    end.
+
+read_version_order(Txns) ->
+    Stale = [
+        {T, A}
+     || T = #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start} <- Txns,
+        A = #{version := Version, epoch := Epoch, 'end' := End} <- Txns,
+        End < Start,
+        Epoch =< ReaderEpoch,
+        ReadVersion < Version
+    ],
+    case Stale of
+        [] ->
+            ok;
+        [{T, A} | _] ->
+            violation(read_version_order, #{
+                reader => maps:with([client, reader_epoch, read_version], T),
+                acknowledged => maps:with([client, epoch, version], A)
+            })
     end.
 
 kcv_below_dv(Logs) ->

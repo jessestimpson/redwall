@@ -79,11 +79,15 @@ faults_test_() ->
         sweep(lists:seq(1, 500), fun(Seed) -> opts(Seed, #{}) end),
         Stats = deadlift_dst:stats(),
         ?debugFmt("faults: ~p", [Stats]),
-        ?assert(maps:get(acks, Stats, 0) > 10000, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 5000, Stats),
         ?assert(maps:get(kills_log, Stats, 0) > 100, Stats),
         ?assert(maps:get(kills_sequencer, Stats, 0) > 100, Stats),
         ?assert(maps:get(kills_proxy, Stats, 0) > 100, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 100, Stats),
+        %% The Resolver rejected transactions for a conflict, and for a
+        %% read version of an earlier epoch.
+        ?assert(maps:get(not_committed, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(too_old, Stats, 0) > 10, Stats),
         ?assert(maps:get(runs_with_three_epochs, Stats, 0) > 100, Stats)
     end}.
 
@@ -113,6 +117,35 @@ no_copy_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_copy}) end),
         ?debugFmt("no_copy: seed ~p, ~p", [Seed, Violation]),
         ?assertMatch(#{property := copied}, Violation)
+    end}.
+
+%% A planted defect: the Resolver admits every transaction.
+no_check_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_check}) end),
+        ?debugFmt("no_check: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := no_conflict}, Violation)
+    end}.
+
+%% A planted defect: the first commit version of an epoch is the Recovery
+%% Version plus 1. The Resolver of the new epoch has no history, and admits
+%% a transaction that read a key below a write of the previous epoch.
+no_gap_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_gap}) end),
+        ?debugFmt("no_gap: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := no_conflict}, Violation),
+        #{reader := #{epoch := ReaderEpoch}, writer := #{epoch := WriterEpoch}} = Violation,
+        ?assert(ReaderEpoch > WriterEpoch, Violation)
+    end}.
+
+%% A planted defect: a Proxy does not report a committed LSN to the
+%% Sequencer, so a read version does not follow the commits.
+no_report_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_report}) end),
+        ?debugFmt("no_report: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := read_version_order}, Violation)
     end}.
 
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the
