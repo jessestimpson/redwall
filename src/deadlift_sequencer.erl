@@ -11,9 +11,29 @@
 %% `{shutdown, {recovery, Reason}}'. A request that arrives during the
 %% recovery waits for the end of the recovery.
 %%
-%% After the recovery, the Sequencer starts the Resolver of the epoch, and
-%% answers `commit_version/1' with a new LSN and the previous LSN. A Proxy
-%% sends both to the Resolver and to the LogServers.
+%% After the recovery, the Sequencer starts the Resolver of the epoch and
+%% commits the recovery transaction. The Sequencer then answers
+%% `commit_version/1' with a new LSN and the previous LSN. A Proxy sends
+%% both to the Resolver and to the LogServers.
+%%
+%% == Recovery transaction ==
+%%
+%% The recovery transaction is the first record of an epoch (paper, section
+%% 2.4.4). Its LSN is the first commit version of the epoch, and its
+%% previous LSN is the Recovery Version. The Sequencer sends it to the
+%% Resolver and to every LogServer of the epoch, and waits for every
+%% answer. If one of them does not answer, the Sequencer stops with the
+%% reason `{shutdown, {recovery, {recovery_transaction, Reason}}}'.
+%%
+%% The recovery transaction has two functions in deadlift:
+%%
+%% <ul>
+%% <li>The read version at the start of an epoch is the LSN of a record
+%%   that exists. A StorageServer reaches that version.</li>
+%% <li>The Resolver has handled a version of the epoch, so a transaction
+%%   with the first read version of the epoch is inside the MVCC
+%%   window.</li>
+%% </ul>
 %%
 %% == Versions ==
 %%
@@ -25,7 +45,7 @@
 %% <li>The first commit version of an epoch is the Recovery Version plus
 %%   `max_versions_in_flight' (default: the versions of 100 seconds). It is
 %%   1 if the Recovery Version is 0. Its previous LSN is the Recovery
-%%   Version.</li>
+%%   Version. The recovery transaction has this version.</li>
 %% <li>Each later commit version adds the versions of the time since the
 %%   last commit version, at `versions_per_second' (default 1,000,000). The
 %%   Sequencer adds at least 1, and at most the versions of 5 seconds.</li>
@@ -34,6 +54,25 @@
 %%   epoch.</li>
 %% </ul>
 %%
+%% == Versions in flight ==
+%%
+%% The Sequencer assigns a commit version only if the version is less than
+%% `max_versions_in_flight' above the read version. Otherwise
+%% `commit_version/1' returns `{error, versions_in_flight}'.
+%%
+%% The read version is at or below the Recovery Version of the recovery
+%% that ends the epoch, because every LogServer of the epoch has stored the
+%% record with the read version. A LogServer of the epoch therefore stores
+%% no record at or above the Recovery Version plus
+%% `max_versions_in_flight', which is the first commit version of the next
+%% epoch. A record that the recovery discards has an LSN below every
+%% version of the next epoch. A StorageServer depends on this rule (see
+%% {@link deadlift_storage}).
+%%
+%% FoundationDB uses the constant `MAX_VERSIONS_IN_FLIGHT' for both
+%% purposes. The limit in the Sequencer of deadlift is not taken from the
+%% FoundationDB source. This part is not in the paper.
+%%
 %% The gap at the start of an epoch is larger than the MVCC window of the
 %% Resolver (`mvcc_window', default: the versions of 5 seconds). The
 %% Resolver of the new epoch has no history. Because of the gap, the
@@ -41,9 +80,11 @@
 %% as too old. See {@link deadlift_resolver}.
 %%
 %% With `versions_per_second => 0', each commit version is the previous
-%% one plus 1, the first commit version of an epoch is the Recovery Version
-%% plus 1, and the MVCC window has no limit. The unit tests use this
-%% option.
+%% one plus 1, `max_versions_in_flight' is 1000, and the MVCC window has no
+%% limit. The unit tests use this option.
+%%
+%% `epoch_gap' replaces `max_versions_in_flight' in the first commit
+%% version of an epoch. It plants a defect for the simulation.
 %%
 %% A Sequencer does not learn that a later epoch exists. The Sequencer of
 %% an ended epoch still assigns versions and still answers `read_version/1'.
@@ -55,6 +96,12 @@
 %% == Departures from the paper ==
 %%
 %% <ul>
+%% <li>The Sequencer of deadlift sends the recovery transaction itself,
+%%   after the write of the coordinated state. The master of FoundationDB
+%%   sends it through a proxy, before the write of the coordinated state.
+%%   The recovery transaction of FoundationDB also contains the
+%%   configuration of the transaction system. The recovery transaction of
+%%   deadlift has no content.</li>
 %% <li>FoundationDB also keeps the commit versions near the time of the
 %%   wall clock (`figureVersion' in the source). deadlift does not.</li>
 %% </ul>
@@ -80,8 +127,6 @@
     last = 0 :: version(),
     %% The first commit version of the epoch.
     first = 1 :: version(),
-    %% Whether the Sequencer has assigned the first commit version.
-    assigned = false :: boolean(),
     %% The time of the last assignment, in microseconds.
     last_time = 0 :: integer(),
     %% The highest version that a Proxy has reported as committed.
@@ -109,13 +154,16 @@ stop(Sequencer) ->
     gen_server:stop(Sequencer).
 
 %% @equiv commit_version(Sequencer, 10000)
--spec commit_version(gen_server:server_ref()) -> {ok, epoch(), version(), version()}.
+-spec commit_version(gen_server:server_ref()) -> {ok, epoch(), version(), version()} | {error, versions_in_flight}.
 commit_version(Sequencer) ->
     commit_version(Sequencer, ?TIMEOUT_MS).
 
 %% @doc Assigns the next LSN. The result is `{ok, Epoch, Prev, LSN}', where
-%% `Prev' is the previous LSN.
--spec commit_version(gen_server:server_ref(), timeout()) -> {ok, epoch(), version(), version()}.
+%% `Prev' is the previous LSN. The result is `{error, versions_in_flight}'
+%% if the LSN would be `max_versions_in_flight' or more above the read
+%% version.
+-spec commit_version(gen_server:server_ref(), timeout()) ->
+    {ok, epoch(), version(), version()} | {error, versions_in_flight}.
 commit_version(Sequencer, Timeout) ->
     gen_server:call(Sequencer, commit_version, Timeout).
 
@@ -124,8 +172,8 @@ commit_version(Sequencer, Timeout) ->
 read_version(Sequencer) ->
     read_version(Sequencer, ?TIMEOUT_MS).
 
-%% @doc Returns the read version: the highest commit version that a Proxy
-%% has reported as committed. A client must use `deadlift_proxy:read_version/1',
+%% @doc Returns the read version: the highest LSN that a Proxy has reported
+%% as stored on every LogServer of the epoch. A client must use `deadlift_proxy:read_version/1',
 %% which also confirms that the epoch is live.
 -spec read_version(gen_server:server_ref(), timeout()) -> {ok, version()}.
 read_version(Sequencer, Timeout) ->
@@ -141,9 +189,14 @@ defaults(Options) ->
             0 -> infinity;
             _ -> 5 * PerSecond
         end,
+    InFlight =
+        case PerSecond of
+            0 -> 1000;
+            _ -> 100 * PerSecond
+        end,
     #{
         versions_per_second => PerSecond,
-        max_versions_in_flight => maps:get(max_versions_in_flight, Options, max(1, 100 * PerSecond)),
+        max_versions_in_flight => maps:get(max_versions_in_flight, Options, InFlight),
         max_read_life => maps:get(max_read_life, Options, max(1, 5 * PerSecond)),
         mvcc_window => maps:get(mvcc_window, Options, Window)
     }.
@@ -178,38 +231,88 @@ handle_continue(recover, State = #state{options = Options}) ->
             First =
                 case RV of
                     0 -> 1;
-                    _ -> RV + InFlight
+                    _ -> RV + maps:get(epoch_gap, Options, InFlight)
                 end,
             Recruit = maps:get(recruit_resolver, Options, fun deadlift_resolver:start/1),
-            case Recruit(#{epoch => Epoch, version => RV, mvcc_window => Window}) of
-                {ok, _Resolver} ->
-                    Recovered1 = Recovered#{recovery_transaction_version => First},
-                    {noreply, State#state{recovered = Recovered1, last = RV, first = First, live = First}};
+            maybe
+                {ok, _Resolver} ?= recruit_resolver(Recruit, #{epoch => Epoch, version => RV, mvcc_window => Window}),
+                ok ?= recovery_transaction(Recovered, First),
+                Recovered1 = Recovered#{recovery_transaction_version => First},
+                {noreply, State#state{
+                    recovered = Recovered1,
+                    last = First,
+                    first = First,
+                    last_time = erlang:monotonic_time(microsecond),
+                    live = First
+                }}
+            else
                 {error, Reason} ->
-                    {stop, {shutdown, {recovery, {recruit_resolver, Reason}}}, State}
+                    {stop, {shutdown, {recovery, Reason}}, State}
             end;
         {error, Reason} ->
             {stop, {shutdown, {recovery, Reason}}, State}
     end.
 
 %% @private
-handle_call(commit_version, _From, State = #state{recovered = #{epoch := Epoch}, assigned = false}) ->
-    #state{last = RV, first = First} = State,
-    State1 = State#state{last = First, assigned = true, last_time = erlang:monotonic_time(microsecond)},
-    {reply, {ok, Epoch, RV, First}, State1};
 handle_call(commit_version, _From, State = #state{recovered = #{epoch := Epoch}, options = Options}) ->
-    #state{last = Last, last_time = LastTime} = State,
-    #{versions_per_second := PerSecond, max_read_life := MaxReadLife} = defaults(Options),
+    #state{last = Last, last_time = LastTime, live = Live} = State,
+    #{versions_per_second := PerSecond, max_read_life := MaxReadLife, max_versions_in_flight := InFlight} = defaults(Options),
     Now = erlang:monotonic_time(microsecond),
     %% The rule of `getVersion' in the source.
     Add = max(1, min(MaxReadLife, PerSecond * (Now - LastTime) div 1000000)),
-    {reply, {ok, Epoch, Last, Last + Add}, State#state{last = Last + Add, last_time = Now}};
+    case Last + Add < Live + InFlight of
+        true -> {reply, {ok, Epoch, Last, Last + Add}, State#state{last = Last + Add, last_time = Now}};
+        false -> {reply, {error, versions_in_flight}, State}
+    end;
 handle_call({committed, Version}, _From, State = #state{live = Live}) ->
     {reply, ok, State#state{live = max(Live, Version)}};
 handle_call(read_version, _From, State = #state{live = Live}) ->
     {reply, {ok, Live}, State};
 handle_call(recovered, _From, State = #state{recovered = Recovered}) ->
     {reply, {ok, Recovered}, State}.
+
+recruit_resolver(Recruit, ResolverOptions) ->
+    case Recruit(ResolverOptions) of
+        {ok, Resolver} -> {ok, Resolver};
+        {error, Reason} -> {error, {recruit_resolver, Reason}}
+    end.
+
+%% Commits the recovery transaction: the record `First' with the previous
+%% LSN `RV'. The KCV of the record is the previous epoch's end version.
+recovery_transaction(Recovered, First) ->
+    #{
+        epoch := Epoch,
+        recovery_version := RV,
+        previous_epoch_end_version := PEV,
+        log_system := #{logs := Logs, replication := K}
+    } = Recovered,
+    Replicas = deadlift_log:replicas(Logs, K, First),
+    try
+        committed = call(deadlift_resolver:ref(Epoch), {resolve, Epoch, RV, First, #{read_version => 0, reads => [], writes => []}}),
+        lists:foreach(
+            fun(Log) ->
+                Sent =
+                    case lists:member(Log, Replicas) of
+                        true -> {body, recovery_transaction};
+                        false -> empty
+                    end,
+                {ok, _DV} = call(deadlift_log:ref(Log), {push, Epoch, RV, First, PEV, Sent})
+            end,
+            Logs
+        )
+    catch
+        Class:Reason when Class =:= exit; Class =:= error ->
+            {error, {recovery_transaction, reason(Reason)}}
+    end.
+
+call(undefined, _Request) ->
+    exit(noproc);
+call(Pid, Request) ->
+    gen_server:call(Pid, Request, ?TIMEOUT_MS).
+
+%% An exit reason without the description of the call.
+reason({Reason, {_Module, call, _Arguments}}) -> Reason;
+reason(Reason) -> Reason.
 
 %% @private
 handle_cast(_Message, State) ->

@@ -79,10 +79,18 @@ faults_test_() ->
         sweep(lists:seq(1, 500), fun(Seed) -> opts(Seed, #{}) end),
         Stats = deadlift_dst:stats(),
         ?debugFmt("faults: ~p", [Stats]),
-        ?assert(maps:get(acks, Stats, 0) > 5000, Stats),
+        %% A transaction has 3 steps with messages: the read version, the
+        %% reads and the commit. With faults, about 1 transaction in 8 is
+        %% acknowledged.
+        ?assert(maps:get(acks, Stats, 0) > 2000, Stats),
         ?assert(maps:get(kills_log, Stats, 0) > 100, Stats),
         ?assert(maps:get(kills_sequencer, Stats, 0) > 100, Stats),
         ?assert(maps:get(kills_proxy, Stats, 0) > 100, Stats),
+        ?assert(maps:get(kills_resolver, Stats, 0) > 100, Stats),
+        %% Clients read values, and the StorageServer removed writes that a
+        %% recovery discarded.
+        ?assert(maps:get(reads, Stats, 0) > 5000, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 10, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 100, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
         %% read version of an earlier epoch.
@@ -165,13 +173,24 @@ no_confirm_is_found_test_() ->
         ?assert(ReaderEpoch < Epoch, Violation)
     end}.
 
+%% A planted defect: the StorageServer keeps the writes above the end
+%% version of an epoch.
+no_rollback_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_rollback}) end),
+        ?debugFmt("no_rollback: seed ~p, ~p", [Seed, Violation]),
+        ?assert(lists:member(maps:get(property, Violation), [storage_rollback, read_value]), Violation)
+    end}.
+
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the
 %% write of a Sequencer whose epoch is not the recovery count.
 no_cas_is_found_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_cas}) end),
         ?debugFmt("no_cas: seed ~p, ~p", [Seed, Violation]),
-        ?assert(lists:member(maps:get(property, Violation), [durable, unique_versions]), Violation)
+        %% Two Sequencers of one epoch each give read versions. `read_version_order'
+        %% is a third consequence of the defect.
+        ?assert(lists:member(maps:get(property, Violation), [durable, unique_versions, read_version_order]), Violation)
     end}.
 
 sweep(Seeds, OptsFun) ->

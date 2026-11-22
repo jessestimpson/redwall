@@ -15,9 +15,11 @@
 %%   is the work of a ClusterController, which deadlift does not have.</li>
 %% <li>A recovery recruits 3 LogServers with a replication degree of
 %%   2.</li>
+%% <li>One StorageServer runs for the whole run. It sends each request to
+%%   a LogServer again every 1 s of the virtual clock.</li>
 %% <li>The run has the simulated network of eta. The coordinated state,
-%%   each Sequencer, each Proxy and each LogServer run on a simulated node
-%%   of their own. All clients share one node. The network policy of the
+%%   the StorageServer, each Sequencer, each Proxy, each Resolver and each
+%%   LogServer run on a simulated node of their own. All clients share one node. The network policy of the
 %%   run can lose or delay a message between two nodes.</li>
 %% <li>The registry is on no node. Every process reads it as a local
 %%   table, and no message to the registry is lost.</li>
@@ -29,8 +31,10 @@
 %% <li>`recover': start a Sequencer and, after its recovery, a Proxy.</li>
 %% <li>`{transaction, R1, R2}': a client runs one transaction. It gets a
 %%   read version from one Proxy, and commits through a Proxy that can be
-%%   another one. One client in three waits between the two steps, and
-%%   then commits through the Proxy of the highest epoch that runs. The client uses the Proxy of the highest epoch in 3 of 4
+%%   another one. Between the two steps, the client reads its read keys
+%%   from the StorageServer at the read version. One client in three then
+%%   waits, and commits through the Proxy of the highest epoch that
+%%   runs. The client uses the Proxy of the highest epoch in 3 of 4
 %%   cases, and any Proxy that runs in the others. A Proxy can belong to an
 %%   epoch that has ended. The transaction reads and writes some of 4
 %%   keys.</li>
@@ -41,6 +45,7 @@
 %% <li>`{kill_sequencer, R}': kill one Sequencer. The Sequencer can be in
 %%   the middle of a recovery.</li>
 %% <li>`{kill_proxy, R}': kill one Proxy.</li>
+%% <li>`{kill_resolver, R}': kill the Resolver of one epoch.</li>
 %% <li>`{partition, R1, R2}': cut the connection between two nodes. Each
 %%   side receives `noconnection' for its monitors on the other side.</li>
 %% <li>`heal': remove every cut.</li>
@@ -79,6 +84,16 @@
 %%   asked for the read version, in any epoch. The harness checks every
 %%   read version that a client received, also when the commit failed. A Proxy of an ended epoch
 %%   must not give a read version.</li>
+%% <li>`read_value' - a read of a key at a read version returns the write
+%%   of the acknowledged transaction with the highest commit version at or
+%%   below the read version, or a write with a higher commit version at or
+%%   below the read version whose client received no answer. The read
+%%   returns `not_found' only if no acknowledged transaction wrote the key
+%%   at or below the read version.</li>
+%% <li>`storage_rollback' - when the StorageServer has a version of an
+%%   epoch, it has no write between the end version of an earlier epoch
+%%   and the first version of the epoch after that one. A recovery
+%%   discarded every record in that range.</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -105,6 +120,8 @@
 %%   Sequencer.</li>
 %% <li>`no_confirm' - a Proxy gives a read version without the
 %%   confirmation that its epoch is live.</li>
+%% <li>`no_rollback' - the StorageServer keeps the writes above the end
+%%   version of an epoch.</li>
 %% </ul>
 %%
 %% == Limitations ==
@@ -113,6 +130,7 @@
 %% <li>The coordinated state is one process that is never killed. The run
 %%   has no peace cluster.</li>
 %% <li>A killed process does not start again. A LogServer has no disk.</li>
+%% <li>The run does not kill the StorageServer.</li>
 %% <li>deadlift does not send a message again. A lost message to a
 %%   LogServer stops the commits of the epoch until the next recovery.
 %%   FoundationDB runs on TCP, and treats a broken connection as a failure
@@ -129,6 +147,10 @@
 
 -define(STATS, deadlift_dst_stats).
 
+%% The gap between the Recovery Version and the first commit version of an
+%% epoch: the default of `max_versions_in_flight'.
+-define(EPOCH_GAP, 100000000).
+
 %% ---------------------------------------------------------------------------
 %% eta_harness
 %% ---------------------------------------------------------------------------
@@ -144,11 +166,18 @@ init(_Seed, Config) ->
     %% The topology is declared before any process creates a monitor.
     ok = eta_net:place(coordinators, [CState]),
     ok = eta_net:place(clients, []),
-    true = ets:insert(Tab, [{{node, coordinators}, true}, {{node, clients}, true}]),
+    {ok, Storage} = deadlift_storage:start(#{
+        coordinators => {local, CState},
+        poll_ms => 100,
+        rollback => Mode =/= no_rollback
+    }),
+    ok = eta_net:place(storage, [Storage]),
+    true = ets:insert(Tab, [{{node, coordinators}, true}, {{node, clients}, true}, {{node, storage}, true}, {storage, Storage}]),
     {ok, #{
         tab => Tab,
         registry => Registry,
         cstate => CState,
+        storage => Storage,
         mode => Mode,
         faults => maps:get(faults, Config, true),
         %% Every process that an operation started, oldest first.
@@ -160,8 +189,8 @@ init(_Seed, Config) ->
 %% The registry, the coordinated state, and the operation processes in the
 %% order of their start. The scheduler adopts the Sequencers, the Proxies
 %% and the LogServers as children of the processes that start them.
-processes(#{registry := Registry, cstate := CState, ops := Ops}) ->
-    [Registry, CState | [Pid || Pid <- Ops, is_process_alive(Pid)]].
+processes(#{registry := Registry, cstate := CState, storage := Storage, ops := Ops}) ->
+    [Registry, CState, Storage | [Pid || Pid <- Ops, is_process_alive(Pid)]].
 
 %% The first operation of a run is a recovery, which creates epoch 1.
 generate(#{n := 0}, Rand) ->
@@ -181,7 +210,8 @@ generate(#{faults := Faults}, Rand0) ->
             Roll < 0.945 -> {kill_log, R};
             Roll < 0.96 -> {kill_sequencer, R};
             Roll < 0.97 -> {kill_proxy, R};
-            Roll < 0.98 -> partition;
+            Roll < 0.975 -> {kill_resolver, R};
+            Roll < 0.985 -> partition;
             true -> heal
         end,
     case Op of
@@ -243,6 +273,15 @@ execute({kill_proxy, R}, _N, S = #{tab := Tab}) ->
         none -> S;
         N -> kill(deadlift_dst_client:proxy_node(N), kills_proxy, S)
     end;
+execute({kill_resolver, R}, _N, S = #{tab := Tab}) ->
+    Running = [N || [N] <- ets:match(Tab, {{recovered, '$1'}, '_', '_', '_'}), not ets:member(Tab, {killed_resolver, N})],
+    case pick(R, lists:sort(Running)) of
+        none ->
+            S;
+        N ->
+            true = ets:insert(Tab, {{killed_resolver, N}, true}),
+            kill(deadlift_dst_client:resolver_node(N), kills_resolver, S)
+    end;
 execute({partition, R1, R2}, _N, S = #{tab := Tab}) ->
     Nodes = [Node || [Node] <- ets:match(Tab, {{node, '$1'}, '_'})],
     case {pick(R1, Nodes), pick(R2, Nodes)} of
@@ -257,7 +296,7 @@ execute(heal, _N, S) ->
     ok = eta_net:heal_all(),
     S.
 
-check(#{tab := Tab, cstate := CState}) ->
+check(#{tab := Tab, cstate := CState, storage := Storage}) ->
     Acks = [{C, Epoch, LSN} || [C, Epoch, LSN] <- ets:match(Tab, {{ack, '$1'}, '$2', '$3'})],
     Logs = logs(),
     first_violation([
@@ -267,12 +306,17 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> body_available(Acks, Logs) end,
         fun() -> copied(Tab, Acks, CState, Logs) end,
         fun() -> transactions(Tab, Acks) end,
+        fun() -> storage_rollback(Tab, Storage, CState) end,
         fun() -> kcv_below_dv(Logs) end,
         fun() -> chain(Logs) end
     ]).
 
-terminate(#{tab := Tab, registry := Registry, cstate := CState, ops := Ops}) ->
+terminate(#{tab := Tab, registry := Registry, cstate := CState, storage := Storage, ops := Ops}) ->
     ok = record_stats(Tab),
+    case eta_observe:read(Storage) of
+        #{rollbacks := Rollbacks} -> bump(rollbacks, Rollbacks);
+        _ -> ok
+    end,
     Started =
         [Pid || [Pid] <- ets:match(Tab, {{sequencer, '_'}, '$1'})] ++
             [Pid || [Pid, _] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'})],
@@ -280,7 +324,7 @@ terminate(#{tab := Tab, registry := Registry, cstate := CState, ops := Ops}) ->
     %% LogServer after the harness has read the registry.
     ok = kill_all(Started ++ Ops),
     ok = kill_all([Pid || {_Id, Pid} <- log_pids()]),
-    ok = kill_all([CState, Registry]),
+    ok = kill_all([Storage, CState, Registry]),
     ok = await_unregistered(1000),
     catch ets:delete(Tab),
     ok.
@@ -330,6 +374,8 @@ record_stats(Tab) ->
     bump(not_committed, length(ets:match(Tab, {{rejected, '_'}, not_committed}))),
     bump(too_old, length(ets:match(Tab, {{rejected, '_'}, transaction_too_old}))),
     bump(no_read_version, length(ets:match(Tab, {{no_read_version, '_'}, '_'}))),
+    bump(no_read, length(ets:match(Tab, {{no_read, '_'}, '_'}))),
+    bump(reads, length([x || [#{values := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
     bump(recoveries, length(Epochs)),
     bump(recoveries_failed, length(ets:match(Tab, {{recovery_failed, '_'}, '_'}))),
     %% The number of failed recoveries for each kind of reason.
@@ -436,7 +482,7 @@ has_body(LSN, C, Records) ->
 %% read versions has changed.
 transactions(Tab, Acks) ->
     Reads = [Read#{client => C} || [C, Read] <- ets:match(Tab, {{read, '$1'}, '$2'})],
-    Count = {length(Acks), length(Reads)},
+    Count = {length(Acks), length(Reads), length([x || #{values := _} <- Reads])},
     case ets:lookup(Tab, transactions_checked) of
         [{_, Count}] ->
             ok;
@@ -445,7 +491,7 @@ transactions(Tab, Acks) ->
                 Txn#{client => C, epoch => Epoch, version => LSN}
              || {C, Epoch, LSN} <- Acks, [{_, Txn}] <- [ets:lookup(Tab, {txn, C})]
             ],
-            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end]) of
+            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns) end]) of
                 ok ->
                     true = ets:insert(Tab, {transactions_checked, Count}),
                     ok;
@@ -491,6 +537,91 @@ read_version_order(Reads, Txns) ->
                 reader => maps:with([client, reader_epoch, read_version], T),
                 acknowledged => maps:with([client, epoch, version], A)
             })
+    end.
+
+%% `Reads' have the values that the clients read from the StorageServer:
+%% `{Key, not_found}' or `{Key, {Value, Written}}', where `Written' is the
+%% LSN of the record that wrote the value. The value of a write is
+%% `{client, C}'.
+read_value(Reads, Txns) ->
+    ByClient = maps:from_list([{C, T} || T = #{client := C} <- Txns]),
+    Wrong = [
+        {R, Key, Found, Reason}
+     || R = #{read_version := ReadVersion, values := Values} <- Reads,
+        {Key, Found} <- Values,
+        Reason <- wrong_value(Key, Found, ReadVersion, ByClient, Txns)
+    ],
+    case Wrong of
+        [] ->
+            ok;
+        [{R, Key, Found, Reason} | _] ->
+            violation(read_value, #{
+                reader => maps:with([client, reader_epoch, read_version], R),
+                key => Key,
+                found => Found,
+                reason => Reason
+            })
+    end.
+
+%% The reasons why the value `Found' is wrong. The empty list means that
+%% the value is correct.
+wrong_value(Key, not_found, ReadVersion, _ByClient, Txns) ->
+    [{missed, maps:with([client, epoch, version], T)} || T <- writers(Key, 0, ReadVersion, Txns)];
+wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns) ->
+    [above_read_version || Written > ReadVersion] ++
+        case ByClient of
+            #{Writer := #{version := Version, writes := Writes}} ->
+                [{writer_committed_at, Version} || Version =/= Written] ++ [writer_did_not_write_key || not lists:member(Key, Writes)];
+            _ ->
+                []
+        end ++
+        [{missed, maps:with([client, epoch, version], T)} || T <- writers(Key, Written, ReadVersion, Txns)].
+
+%% The acknowledged transactions that wrote `Key' at a commit version above
+%% `After' and at or below `UpTo'.
+writers(Key, After, UpTo, Txns) ->
+    [T || T = #{version := Version, writes := Writes} <- Txns, Version > After, Version =< UpTo, lists:member(Key, Writes)].
+
+%% The coordinated state has the end version of each ended epoch. The
+%% first version of the next epoch is the end version plus the gap.
+storage_rollback(Tab, Storage, CState) ->
+    %% The check reads every write of the StorageServer, so the harness
+    %% performs it only when the StorageServer or the coordinated state has
+    %% changed.
+    Observed = eta_observe:read(Storage),
+    Old = maps:get(old, cstate(CState), []),
+    Key = erlang:phash2({Observed, Old}),
+    case ets:lookup(Tab, storage_checked) of
+        [{_, Key}] ->
+            ok;
+        _ ->
+            case storage_rollback(Observed, Old) of
+                ok ->
+                    true = ets:insert(Tab, {storage_checked, Key}),
+                    ok;
+                Violation ->
+                    Violation
+            end
+    end.
+
+storage_rollback(Observed, Old) ->
+    case Observed of
+        #{version := Version, data := Data} ->
+            Ends = [End || #{end_version := End} <- Old, End > 0, Version >= End + ?EPOCH_GAP],
+            Kept = [
+                {Key, Written, End}
+             || End <- Ends,
+                {Key, Versions} <- maps:to_list(Data),
+                {Written, _Value} <- Versions,
+                Written > End,
+                Written < End + ?EPOCH_GAP
+            ],
+            case Kept of
+                [] -> ok;
+                [{Key, Written, End} | _] -> violation(storage_rollback, #{key => Key, written => Written, end_version => End, storage_version => Version})
+            end;
+        _NoEventYet ->
+            ok
     end.
 
 kcv_below_dv(Logs) ->

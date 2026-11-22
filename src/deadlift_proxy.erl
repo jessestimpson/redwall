@@ -59,7 +59,8 @@
 %%   Proxy. The k LogServers that replicate the record receive the body.
 %%   The other LogServers receive an empty body.</li>
 %% <li>When every LogServer of the epoch has answered, the Proxy raises its
-%%   KCV to the LSN, and reports the LSN to the Sequencer as committed.</li>
+%%   KCV to the LSN, and reports the LSN to the Sequencer as committed. The
+%%   Proxy also reports the LSN of a record without a transaction.</li>
 %% <li>When the Sequencer has answered, the Proxy answers the client with
 %%   `{ok, LSN}'.</li>
 %% </ol>
@@ -85,6 +86,9 @@
 %% the answer to one commit before it starts the next commit.
 %%
 %% == Failure ==
+%%
+%% The Sequencer answers `{error, versions_in_flight}' when too many
+%% versions are assigned and not committed (see {@link deadlift_sequencer}).
 %%
 %% If the Resolver, a LogServer or the Sequencer answers with an error, or
 %% is not alive, the Proxy cannot know whether a later recovery keeps the
@@ -311,7 +315,11 @@ handle_call({commit, Transaction}, From, State = #state{sequencer = Sequencer, e
                     Request = {resolve, Epoch, Prev, LSN, Resolved},
                     Requests = gen_server:send_request(Resolver, Request, {resolve, LSN}, State1#state.requests),
                     {noreply, State1#state{requests = Requests}}
-            end
+            end;
+        {error, Reason} ->
+            %% The Sequencer has assigned no version to this commit.
+            Commit0 = #commit{from = From, prev = 0, body = Body},
+            fail({shutdown, {sequencer, Reason}}, State#state{commits = (State#state.commits)#{0 => Commit0}})
     catch
         exit:Reason ->
             %% The Sequencer has assigned no version to this commit, or the
@@ -445,6 +453,9 @@ answered({push, LSN}, {error, Reason}, State) ->
     fail({shutdown, {log, LSN, Reason}}, State);
 answered({report, LSN}, ok, State = #state{commits = Commits}) ->
     case maps:take(LSN, Commits) of
+        {#commit{from = none}, Commits1} ->
+            %% A record without a transaction. No client waits.
+            {noreply, State#state{commits = Commits1}};
         {#commit{from = From}, Commits1} ->
             gen_server:reply(From, {ok, LSN}),
             {noreply, State#state{commits = Commits1}};
@@ -485,12 +496,9 @@ push(LSN, State) ->
 %% One LogServer has stored the record `LSN'.
 stored(LSN, State = #state{sequencer = Sequencer, kcv = KCV, requests = Requests, commits = Commits}) ->
     case Commits of
-        #{LSN := #commit{from = none, left = 1}} ->
-            %% A record without a transaction. No client waits.
-            {noreply, State#state{kcv = max(KCV, LSN), commits = maps:remove(LSN, Commits)}};
         #{LSN := #commit{from = From, left = 1}} when not State#state.report ->
             %% The planted defect `report => false'.
-            gen_server:reply(From, {ok, LSN}),
+            From =:= none orelse gen_server:reply(From, {ok, LSN}),
             {noreply, State#state{kcv = max(KCV, LSN), commits = maps:remove(LSN, Commits)}};
         #{LSN := Commit = #commit{left = 1}} ->
             %% The Sequencer learns that the LSN is committed before the

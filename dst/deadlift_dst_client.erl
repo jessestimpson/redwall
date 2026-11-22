@@ -60,7 +60,7 @@ recover(Tab, N, CState, Mode) ->
         case Mode of
             %% The planted defect: the first commit version of an epoch is
             %% the Recovery Version plus 1, inside the MVCC window.
-            no_gap -> Options0#{max_versions_in_flight => 1};
+            no_gap -> Options0#{epoch_gap => 1};
             _ -> Options0
         end,
     %% The Sequencer starts on the node of this process.
@@ -95,7 +95,8 @@ recover(Tab, N, CState, Mode) ->
 %% key is `{client, C}'.
 %%
 %% The client records every read version that it receives, also when the
-%% commit fails.
+%% commit fails. With the read version, the client reads its read keys from
+%% the StorageServer, and records the values.
 %%
 %% One client in three waits between the read version and the commit, for
 %% 20 ms to 100 ms of the virtual clock. A recovery can end the epoch in
@@ -118,40 +119,65 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
     Start = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
     case deadlift_proxy:read_version(Reader) of
         {ok, ReadVersion} ->
-            true = ets:insert(Tab, {{read, C}, #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start}}),
-            {Proxy, Epoch} =
-                case R rem 3 of
-                    0 ->
-                        ok = timer:sleep(20 * (R rem 5 + 1)),
-                        latest_proxy(Tab, Chosen);
-                    _ ->
-                        Chosen
-                end,
-            true = ets:insert(Tab, {{invoked, C}, Epoch}),
-            Transaction = #{
-                read_version => ReadVersion,
-                reads => Reads,
-                writes => [{Key, {client, C}} || Key <- Writes]
-            },
-            case deadlift_proxy:commit(Proxy, Transaction) of
-                {ok, LSN} ->
-                    End = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
-                    true = ets:insert(Tab, {{txn, C}, #{
-                        read_version => ReadVersion,
-                        reader_epoch => ReaderEpoch,
-                        reads => Reads,
-                        writes => Writes,
-                        start => Start,
-                        'end' => End
-                    }}),
-                    true = ets:insert(Tab, {{ack, C}, Epoch, LSN});
-                {error, commit_unknown_result} ->
-                    true = ets:insert(Tab, {{unknown, C}, Epoch});
-                {error, Rejected} ->
-                    true = ets:insert(Tab, {{rejected, C}, Rejected})
+            Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
+            true = ets:insert(Tab, {{read, C}, Read}),
+            case read_keys(Tab, Reads, ReadVersion) of
+                {ok, Values} ->
+                    true = ets:insert(Tab, {{read, C}, Read#{values => Values}}),
+                    commit(Tab, C, Read, Reads, Writes, Chosen, R);
+                {error, _Reason} ->
+                    true = ets:insert(Tab, {{no_read, C}, ReaderEpoch})
             end;
         {error, _Reason} ->
             true = ets:insert(Tab, {{no_read_version, C}, ReaderEpoch})
+    end.
+
+%% Reads the keys from the StorageServer at the read version. The result
+%% has `{Key, not_found}' or `{Key, {Value, Written}}' for each key.
+read_keys(Tab, Keys, ReadVersion) ->
+    [{storage, Storage}] = ets:lookup(Tab, storage),
+    read_keys(Storage, Keys, ReadVersion, []).
+
+read_keys(_Storage, [], _ReadVersion, Values) ->
+    {ok, lists:reverse(Values)};
+read_keys(Storage, [Key | Keys], ReadVersion, Values) ->
+    case deadlift_storage:read_with_version(Storage, Key, ReadVersion, 2000) of
+        {ok, Value, Written} -> read_keys(Storage, Keys, ReadVersion, [{Key, {Value, Written}} | Values]);
+        not_found -> read_keys(Storage, Keys, ReadVersion, [{Key, not_found} | Values]);
+        {error, Reason} -> {error, Reason}
+    end.
+
+commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, Reads, Writes, Chosen, R) ->
+    {Proxy, Epoch} =
+        case R rem 3 of
+            0 ->
+                ok = timer:sleep(20 * (R rem 5 + 1)),
+                latest_proxy(Tab, Chosen);
+            _ ->
+                Chosen
+        end,
+    true = ets:insert(Tab, {{invoked, C}, Epoch}),
+    Transaction = #{
+        read_version => ReadVersion,
+        reads => Reads,
+        writes => [{Key, {client, C}} || Key <- Writes]
+    },
+    case deadlift_proxy:commit(Proxy, Transaction) of
+        {ok, LSN} ->
+            End = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
+            true = ets:insert(Tab, {{txn, C}, #{
+                read_version => ReadVersion,
+                reader_epoch => ReaderEpoch,
+                reads => Reads,
+                writes => Writes,
+                start => Start,
+                'end' => End
+            }}),
+            true = ets:insert(Tab, {{ack, C}, Epoch, LSN});
+        {error, commit_unknown_result} ->
+            true = ets:insert(Tab, {{unknown, C}, Epoch});
+        {error, Rejected} ->
+            true = ets:insert(Tab, {{rejected, C}, Rejected})
     end.
 
 %% The Proxy of the highest epoch that runs, or `Default'.

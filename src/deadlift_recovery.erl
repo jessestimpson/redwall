@@ -78,6 +78,7 @@
     recruit_resolver => fun((deadlift_resolver:options()) -> {ok, term()} | {error, term()}),
     versions_per_second => non_neg_integer(),
     max_versions_in_flight => pos_integer(),
+    epoch_gap => pos_integer(),
     max_read_life => pos_integer(),
     mvcc_window => pos_integer() | infinity,
     cstate_timeout_ms => timeout()

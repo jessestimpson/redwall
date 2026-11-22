@@ -46,6 +46,20 @@
 %% `peek/3', so that the Sequencer can copy records and StorageServers can
 %% read records.
 %%
+%% == Tail ==
+%%
+%% A StorageServer reads the records with the request `{tail, After}'
+%% (`tail/2'). The LogServer answers with the stored records above `After'
+%% and with a flag that tells whether the LogServer is stopped. If the
+%% LogServer has no record above `After' and is not stopped, the answer
+%% waits until the LogServer stores a record above `After' or is locked.
+%% The LogServer keeps one waiting request for each calling process. A new
+%% request of the same process replaces the waiting one, which gets no
+%% answer.
+%%
+%% The peek of FoundationDB waits for new records in the same way. This
+%% part is not in the paper.
+%%
 %% == Confirmation of the epoch ==
 %%
 %% A Proxy asks the LogServers of its epoch whether the epoch is live
@@ -73,7 +87,7 @@
 
 -export([start/1, start_link/1, stop/1, ref/1]).
 -export([replicas/3]).
--export([push/6, push/7, send_push/6, lock/2, lock/3, confirm/2, peek/3, peek/4, info/1]).
+-export([push/6, push/7, send_push/6, lock/2, lock/3, confirm/2, peek/3, peek/4, tail/2, tail/3, info/1]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
 -export_type([id/0, body/0, record/0, options/0, info/0]).
@@ -125,6 +139,8 @@
     %% PreviousLSN -> {LSN, KCV, Body, Callers}: the pushes that wait for
     %% the record with the previous LSN.
     waiting = #{} :: #{version() => {version(), version(), body(), [gen_server:from()]}},
+    %% Caller -> {From, After}: the tail requests that wait for a record.
+    tails = #{} :: #{pid() => {gen_server:from(), version()}},
     stopped_by :: epoch() | undefined
 }).
 
@@ -237,6 +253,18 @@ peek(Log, After, UpTo) ->
 peek(Log, After, UpTo, Timeout) ->
     gen_server:call(Log, {peek, After, UpTo}, Timeout).
 
+%% @equiv tail(Log, After, 5000)
+-spec tail(gen_server:server_ref(), version()) -> {ok, [record()], boolean()}.
+tail(Log, After) ->
+    tail(Log, After, ?TIMEOUT_MS).
+
+%% @doc Returns the stored records above `After', and whether the
+%% LogServer is stopped. The call waits while the LogServer has no record
+%% above `After' and is not stopped.
+-spec tail(gen_server:server_ref(), version(), timeout()) -> {ok, [record()], boolean()}.
+tail(Log, After, Timeout) ->
+    gen_server:call(Log, {tail, After}, Timeout).
+
 -spec info(gen_server:server_ref()) -> info().
 info(Log) ->
     gen_server:call(Log, info).
@@ -287,7 +315,7 @@ handle_call({push, _Epoch, _Prev, _LSN, _KCV, _Body}, _From, State = #state{stop
 handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV}) when Prev =:= DV, LSN > DV ->
     State1 = store(Prev, LSN, KCV, Body, State),
     gen_server:reply(From, {ok, State1#state.dv}),
-    {noreply, release(State1)};
+    {noreply, answer_tails(false, release(State1))};
 handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV, waiting = Waiting}) when Prev > DV, LSN > Prev ->
     %% The record with the previous LSN has not arrived.
     case Waiting of
@@ -318,13 +346,21 @@ handle_call({lock, Epoch}, _From, State = #state{dv = DV, kcv = KCV, waiting = W
         end,
         Waiting
     ),
-    {reply, {ok, #{dv => DV, kcv => KCV}}, State#state{stopped_by = Epoch, waiting = #{}}};
+    {reply, {ok, #{dv => DV, kcv => KCV}}, answer_tails(true, State#state{stopped_by = Epoch, waiting = #{}})};
 handle_call({confirm, Epoch}, _From, State = #state{epoch = Mine}) when Epoch =/= Mine ->
     {reply, {error, {epoch, Mine}}, State};
 handle_call({confirm, _Epoch}, _From, State = #state{stopped_by = undefined}) ->
     {reply, ok, State};
 handle_call({confirm, _Epoch}, _From, State) ->
     {reply, {error, stopped}, State};
+handle_call({tail, After}, From = {Caller, _Tag}, State = #state{dv = DV, stopped_by = By, records = Records, tails = Tails}) ->
+    case After < DV orelse By =/= undefined of
+        true ->
+            Reply = {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), By =/= undefined},
+            {reply, Reply, State#state{tails = maps:remove(Caller, Tails)}};
+        false ->
+            {noreply, State#state{tails = Tails#{Caller => {From, After}}}}
+    end;
 handle_call({peek, After, UpTo}, _From, State = #state{records = Records}) ->
     {reply, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), UpTo)}, State};
 handle_call(stop, _From, State) ->
@@ -337,6 +373,21 @@ handle_call(info, _From, State) ->
 %% @private
 handle_cast(_Message, State) ->
     {noreply, State}.
+
+%% Answers the tail requests that wait: after a push, the requests with
+%% `After' below the DV; after a lock, every request.
+answer_tails(Stopped, State = #state{dv = DV, records = Records, tails = Tails}) ->
+    Later = maps:filter(
+        fun
+            (_Caller, {From, After}) when Stopped; After < DV ->
+                gen_server:reply(From, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), Stopped}),
+                false;
+            (_Caller, _Tail) ->
+                true
+        end,
+        Tails
+    ),
+    State#state{tails = Later}.
 
 store(Prev, LSN, KCV, Body, State = #state{kcv = Mine, records = Records}) ->
     State#state{

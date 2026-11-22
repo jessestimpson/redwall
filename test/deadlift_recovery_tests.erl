@@ -161,20 +161,32 @@ two_recoveries_at_once(Ids) ->
     ?assertEqual(3, length(Recruited)),
     [?assertNot(is_process_alive(L)) || L <- Recruited].
 
-%% Two Sequencers, one after the other. The second Sequencer assigns the
-%% LSNs above the Recovery Version.
+%% Two Sequencers, one after the other. Each Sequencer commits the recovery
+%% transaction of its epoch, and assigns the LSNs above it.
 sequencer(Ids) ->
     {ok, S1} = deadlift_sequencer:start_link(options(Ids)),
-    ?assertEqual({ok, 1, 0, 1}, deadlift_sequencer:commit_version(S1)),
+    %% The recovery transaction of epoch 1 has the LSN 1.
     ?assertEqual({ok, 1, 1, 2}, deadlift_sequencer:commit_version(S1)),
-    {ok, #{epoch := 1, log_system := #{logs := Logs}}} = deadlift_sequencer:recovered(S1),
-    ok = push(1, Logs, tl(Logs), 0, 1, 0),
+    ?assertEqual({ok, 1, 2, 3}, deadlift_sequencer:commit_version(S1)),
+    {ok, #{epoch := 1, log_system := #{logs := Logs}, recovery_transaction_version := 1}} = deadlift_sequencer:recovered(S1),
+    [?assertMatch(#{dv := 1, kcv := 0}, deadlift_log:info(deadlift_log:ref(L))) || L <- Logs],
+    ?assertEqual(
+        2,
+        length([L || L <- Logs, {ok, [{1, 0, {body, recovery_transaction}}]} =:= deadlift_log:peek(deadlift_log:ref(L), 0, infinity)])
+    ),
     {ok, S2} = deadlift_sequencer:start_link(options(Ids)),
-    ?assertEqual({ok, 2, 1, 2}, deadlift_sequencer:commit_version(S2)),
-    ?assertMatch({ok, #{epoch := 2, recovery_version := 1}}, deadlift_sequencer:recovered(S2)),
+    %% The recovery transaction of epoch 2 has the LSN 1001: the Recovery
+    %% Version plus the versions in flight.
+    ?assertEqual({ok, 2, 1001, 1002}, deadlift_sequencer:commit_version(S2)),
+    ?assertMatch({ok, #{epoch := 2, recovery_version := 1, recovery_transaction_version := 1001}}, deadlift_sequencer:recovered(S2)),
+    ?assertEqual({ok, 1001}, deadlift_sequencer:read_version(S2)),
+    %% The Sequencer assigns no version that is 1000 or more above the read
+    %% version.
+    [{ok, 2, _, _} = deadlift_sequencer:commit_version(S2) || _ <- lists:seq(1003, 2000)],
+    ?assertEqual({error, versions_in_flight}, deadlift_sequencer:commit_version(S2)),
     %% The Sequencer of the ended epoch still assigns versions. The
     %% LogServers of the ended epoch store no record.
-    ?assertEqual({ok, 1, 2, 3}, deadlift_sequencer:commit_version(S1)),
+    ?assertEqual({ok, 1, 3, 4}, deadlift_sequencer:commit_version(S1)),
     ?assertEqual({error, stopped}, deadlift_log:push(deadlift_log:ref(hd(Logs)), 1, 1, 2, 0, empty)),
     %% A Sequencer whose recovery fails stops.
     process_flag(trap_exit, true),

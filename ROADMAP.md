@@ -62,11 +62,18 @@ commits and recoveries, and no run violates an invariant.
 - [ ] Check key ranges in the Resolver.
 - [ ] Collect the transactions of a short time into one batch with one
       commit version in the Proxy.
-- [ ] Kill the Resolver in the simulation.
-- [ ] Implement a StorageServer that pulls records from the LogServers,
+- [x] Kill the Resolver in the simulation.
+- [x] Implement a StorageServer that pulls records from the LogServers,
       answers reads at a version, and discards the records above the
       Recovery Version after a recovery.
-- [ ] Implement the recovery transaction (paper, section 2.4.4).
+- [x] Implement the recovery transaction (paper, section 2.4.4), without
+      content.
+- [x] Limit the versions in flight in the Sequencer, so that a discarded
+      record has an LSN below every version of the next epoch.
+- [ ] Kill the StorageServer in the simulation and start a new one.
+- [ ] Reduce the time of the simulation suite. It takes about 10 minutes
+      since the StorageServer is part of a run.
+- [ ] Keep only the versions of the MVCC window in the StorageServer.
 - [ ] Write a client: get a read version, read, commit, retry on conflict.
 - [ ] Check strict serializability of client histories with Elle.
 
