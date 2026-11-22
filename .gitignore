@@ -1,0 +1,29 @@
+.rebar3
+_build
+_checkouts
+_vendor
+.eunit
+*.o
+*.beam
+*.plt
+*.swp
+*.swo
+.erlang.cookie
+ebin
+log
+erl_crash.dump
+.rebar
+logs
+.idea
+*.iml
+rebar3.crashdump
+*~
+
+# edoc output
+doc/
+
+# TLC
+formal/states/
+formal/logs/
+formal/*_TTrace_*
+formal/tla2tools.jar
