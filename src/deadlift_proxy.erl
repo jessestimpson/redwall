@@ -85,7 +85,8 @@
 %%   LSN, the previous LSN and the Known Committed Version (KCV) of the
 %%   Proxy. The body is `{batch, Entries}', with one entry for each
 %%   transaction of the batch in the order of the batch. The entry of an
-%%   admitted transaction has the writes of the transaction. The entry of
+%%   admitted transaction has the mutations of the transaction: sets of
+%%   keys, clears of keys and clears of key ranges. The entry of
 %%   another transaction is `no_transaction'. The k LogServers that
 %%   replicate the record receive the body. The other LogServers receive
 %%   an empty body.</li>
@@ -153,7 +154,7 @@
 -export([commit/2, commit/3, commit_with_index/3, read_version/1, read_version/2, info/1]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 
--export_type([transaction/0]).
+-export_type([transaction/0, mutation/0]).
 
 -type version() :: deadlift_cstate:version().
 
@@ -183,14 +184,22 @@
 %% `read_version'. `read_ranges' are the key ranges that the transaction
 %% read at `read_version': the range `{Begin, End}' has every key `K' with
 %% `Begin =< K' and `K < End'. `writes' are the keys and the values that
-%% the transaction writes. The default of `read_version' is 0, and the
-%% default of the lists is `[]'.
+%% the transaction writes. `mutations' are further changes, which the
+%% StorageServer applies in their order after `writes'. The default of
+%% `read_version' is 0, and the default of the lists is `[]'.
 -type transaction() :: #{
     read_version => version(),
     reads => [term()],
     read_ranges => [deadlift_resolver:key_range()],
-    writes => [{term(), term()}]
+    writes => [{term(), term()}],
+    mutations => [mutation()]
 }.
+
+%% A change of the database. `{set, Key, Value}' writes a value.
+%% `{clear, Key}' removes a key. `{clear_range, Begin, End}' removes every
+%% key `K' with `Begin =< K' and `K < End'. The entry of a transaction in a
+%% log record is a list of mutations.
+-type mutation() :: {set, term(), term()} | {clear, term()} | {clear_range, term(), term()}.
 
 %% A batch that the Proxy has closed and has not finished.
 -record(commit, {
@@ -468,14 +477,24 @@ role(report) -> sequencer.
 %% The part of a transaction that the Resolver needs, and the body of the
 %% record.
 split(Transaction) when is_map(Transaction) ->
-    Writes = maps:get(writes, Transaction, []),
+    Mutations = [{set, Key, Value} || {Key, Value} <- maps:get(writes, Transaction, [])] ++ maps:get(mutations, Transaction, []),
+    %% A set and a clear of a key are writes of the key for the Resolver. A
+    %% clear of a range is a write range.
     Resolved = #{
         read_version => maps:get(read_version, Transaction, 0),
         reads => maps:get(reads, Transaction, []),
         read_ranges => maps:get(read_ranges, Transaction, []),
-        writes => [Key || {Key, _Value} <- Writes]
+        writes => lists:append([
+            case Mutation of
+                {set, Key, _Value} -> [Key];
+                {clear, Key} -> [Key];
+                {clear_range, _Begin, _End} -> []
+            end
+         || Mutation <- Mutations
+        ]),
+        write_ranges => [{Begin, End} || {clear_range, Begin, End} <- Mutations]
     },
-    {Resolved, Writes};
+    {Resolved, Mutations};
 split(Entry) ->
     {#{read_version => 0, reads => [], writes => []}, Entry}.
 

@@ -39,7 +39,7 @@ recover(Tab, N, CState, Mode) ->
     end,
     %% The Resolver of the epoch runs on a node of its own.
     RecruitResolver = fun(Resolver) ->
-        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check}) of
+        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range}) of
             {ok, Pid} ->
                 ok = eta_net:place(resolver_node(N), [Pid]),
                 true = ets:insert(Tab, {{node, resolver_node(N)}, true}),
@@ -107,6 +107,12 @@ recover(Tab, N, CState, Mode) ->
 %% reads the range from the StorageServer, and sends the range to the Proxy
 %% as a read range. The client records the keys of the range as read keys,
 %% with `not_found' for a key that the StorageServer did not return.
+%%
+%% 2 transactions in 11 clear one key range before they write their keys.
+%% The cleared keys of the transaction are the keys of the range that the
+%% transaction does not write. The client records them before the commit,
+%% in the row `{attempt, C}', because a clear can be applied when the
+%% client receives no answer.
 %%
 %% The client records every read version that it receives, also when the
 %% commit fails. With the read version, the client reads its read keys from
@@ -221,11 +227,20 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
                 Chosen
         end,
     true = ets:insert(Tab, {{invoked, C}, Epoch}),
+    Cleared =
+        case R rem 11 < 2 of
+            true -> [range(R div 11)];
+            false -> []
+        end,
+    Clears = lists:append([keys_in(Range) || Range <- Cleared]) -- Writes,
+    true = ets:insert(Tab, {{attempt, C}, Clears}),
     Transaction = #{
         read_version => ReadVersion,
         reads => Reads,
         read_ranges => Ranges,
-        writes => [{Key, {client, C}} || Key <- Writes]
+        mutations =>
+            [{clear_range, Begin, End} || {Begin, End} <- Cleared] ++
+                [{set, Key, {client, C}} || Key <- Writes]
     },
     case deadlift_proxy:commit_with_index(Proxy, Transaction, 5000) of
         {ok, LSN, Index} ->
@@ -236,6 +251,9 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
                 %% The read keys and the keys of the read ranges.
                 reads => lists:usort(Reads ++ lists:append([keys_in(Range) || Range <- Ranges])),
                 writes => Writes,
+                %% The keys that the transaction cleared and did not write.
+                clears => Clears,
+                cleared => Cleared,
                 ranges => Ranges,
                 %% The position of the transaction in its batch.
                 index => Index,

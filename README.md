@@ -297,6 +297,11 @@ writes to a store with versions (paper, sections 2.4.3 and 2.4.4).
   it. The StorageServer applies a record when it has received the body
   from one of the k LogServers that have it. Every 5 s, the
   StorageServer sends each request again, because a message can be lost.
+- A transaction has mutations: `{set, Key, Value}`, `{clear, Key}` and
+  `{clear_range, Begin, End}`. The StorageServer applies the mutations of
+  a transaction in their order. The clear of a key range is a write range
+  for the Resolver, so a transaction that read a key of the range has a
+  conflict.
 - A read at a version returns the last write to the key at or below that
   version. The read waits until the StorageServer has the version.
 - The StorageServer keeps the versions of the MVCC window, which is
@@ -363,10 +368,9 @@ through the registry. They send a request only to a LogServer that runs.
   This part is not in the paper.
 - A key is an Erlang term, and the order of the keys is the order of
   Erlang terms. A key of FoundationDB is a byte string.
-- A transaction writes keys only. FoundationDB also has an operation that
-  clears a key range, and the Resolver of FoundationDB records the range
-  as a write range. The Resolver of deadlift accepts write ranges, and no
-  other part of deadlift sends one.
+- A transaction has three mutations: the set of a key, the clear of a
+  key and the clear of a key range. FoundationDB has more, for example
+  atomic operations and versionstamps.
 - One Resolver handles every key. FoundationDB divides the key space over
   several Resolvers.
 - A registry on each node finds the process of a LogServer. In
@@ -439,19 +443,21 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,562 acknowledged transactions, of which 2,227 with a read range and 2,166 in a batch with another acknowledged transaction, 9,258 rejected for a conflict, 1,884 too old, 22,120 transactions with reads from the StorageServer, 13 reads below the MVCC window of the StorageServer, 2,276 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,407 acknowledged transactions, of which 433 with a read range and 398 in a batch with another acknowledged transaction, 3,130 rejected for a conflict, 3,095 too old, 22,732 transactions with reads from the StorageServer, of which 6,859 from a StorageServer that started after a kill, 488 reads below the MVCC window of the StorageServer, 386 rollbacks of the StorageServer, 6,030 recoveries, 3,262 kills, of which 353 of the StorageServer, 565 partitions |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,378 acknowledged transactions, of which 2,278 with a read range, 1,167 with a clear of keys and 1,973 in a batch with another acknowledged transaction, 9,447 rejected for a conflict, 1,838 too old, 22,088 transactions with reads from the StorageServer, 13 reads below the MVCC window of the StorageServer, 2,278 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,399 acknowledged transactions, of which 442 with a read range, 274 with a clear of keys and 376 in a batch with another acknowledged transaction, 3,252 rejected for a conflict, 3,055 too old, 22,688 transactions with reads from the StorageServer, of which 6,779 from a StorageServer that started after a kill, 504 reads below the MVCC window of the StorageServer, 384 rollbacks of the StorageServer, 6,034 recoveries, 3,264 kills, of which 355 of the StorageServer, 563 partitions |
 | Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
 | Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `read_version_order` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
 | Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 2, `no_conflict` |
-| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 3, `no_conflict` between the transactions with the indexes 0 and 1 of one batch |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 1, `no_conflict` between a transaction of epoch 16 and a write of epoch 15 |
+| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 2, `no_conflict` between the transactions with the indexes 2 and 4 of one batch |
+| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 2, `no_conflict`: a transaction read a key that another transaction cleared in a range |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 3, `no_conflict` between a transaction of epoch 15 and a write of epoch 12 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 18, `read_version_order`: a Proxy of epoch 13 gave a read version below a commit of epoch 16 |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 26, `read_version_order`: a Proxy of epoch 3 gave a read version below a commit of epoch 5 |
 | Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 3, `storage_rollback` |
-| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 6, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
+| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 9, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
+| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 2, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
@@ -540,7 +546,9 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - After a LogServer is stopped, the StorageServer reads the coordinated
   state every 500 ms until the coordinated state has a later epoch.
 - A read of a key range examines every key of the StorageServer.
-- deadlift has no operation that clears a key range.
+- A clear of a key range examines every key of the StorageServer.
+- In the simulation, a read that returns no value is accepted when a
+  transaction without a known result cleared the key at any version.
 - A rise of the oldest version of the StorageServer examines every key.
   The oldest version rises in steps of at least one tenth of the MVCC
   window.

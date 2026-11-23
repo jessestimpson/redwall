@@ -61,7 +61,7 @@ commits and recoveries, and no run violates an invariant.
 - [x] Confirm that the epoch is live before a Proxy gives a read version.
 - [x] Check key ranges in the Resolver, and read a key range from the
       StorageServer.
-- [ ] Add an operation that clears a key range: a mutation in the log
+- [x] Add an operation that clears a key range: a mutation in the log
       record, a write range for the Resolver, and the removal of the keys
       in the StorageServer.
 - [x] Collect the transactions of a short time into one batch with one

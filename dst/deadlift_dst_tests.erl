@@ -120,6 +120,8 @@ faults_shard(Shard) ->
         %% acknowledged.
         ?assert(maps:get(range_reads, Stats, 0) > 300, Stats),
         ?assert(maps:get(range_acks, Stats, 0) > 45, Stats),
+        %% Acknowledged transactions cleared keys.
+        ?assert(maps:get(clears, Stats, 0) > 20, Stats),
         %% Acknowledged transactions had their LSN together with another
         %% acknowledged transaction.
         ?assert(maps:get(batched, Stats, 0) > 30, Stats),
@@ -253,6 +255,24 @@ no_rollback_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_rollback}) end),
         ?debugFmt("no_rollback: seed ~p, ~p", [Seed, Violation]),
         ?assert(lists:member(maps:get(property, Violation), [storage_rollback, read_value]), Violation)
+    end}.
+
+%% A planted defect: the Resolver does not record the write ranges of a
+%% transaction. The writer of the violation cleared the key.
+no_write_range_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_write_range}) end),
+        ?debugFmt("no_write_range: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := no_conflict, writer := #{clears := [_ | _]}}, Violation)
+    end}.
+
+%% A planted defect: the StorageServer does not apply a clear. A read
+%% returns a value for a key that a later acknowledged transaction cleared.
+no_clear_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_clear}) end),
+        ?debugFmt("no_clear: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := read_value, reason := {missed, _}}, Violation)
     end}.
 
 %% A planted defect: the StorageServer answers a read below its oldest

@@ -39,7 +39,8 @@
 %%   runs. The client uses the Proxy of the highest epoch in 3 of 4
 %%   cases, and any Proxy that runs in the others. A Proxy can belong to an
 %%   epoch that has ended. The transaction reads and writes some of 4
-%%   keys. 2 transactions in 7 also read a key range.</li>
+%%   keys. 2 transactions in 7 also read a key range. 2 transactions in
+%%   11 clear a key range before they write their keys.</li>
 %% <li>`{kill_log, R}': kill one LogServer of the current epoch. The
 %%   harness kills at most 1 LogServer of each epoch, because the design
 %%   tolerates the loss of k - 1 LogServers of an epoch, and a LogServer of
@@ -96,10 +97,14 @@
 %% <li>`read_value' - a read of a key at a read version returns the write
 %%   of the acknowledged transaction with the highest commit version at or
 %%   below the read version, and with the highest index among the
-%%   transactions of that version, or a write with a higher commit version at or
-%%   below the read version whose client received no answer. The read
-%%   returns `not_found' only if no acknowledged transaction wrote the key
-%%   at or below the read version.</li>
+%%   transactions of that version, or a write with a higher commit version
+%%   at or below the read version whose client received no answer. No
+%%   acknowledged transaction wrote or cleared the key between the
+%%   returned write and the read version. The read returns `not_found'
+%%   only in three cases: no acknowledged transaction wrote the key at or
+%%   below the read version, the last acknowledged transaction that
+%%   changed the key cleared it, or a transaction without a known result
+%%   cleared the key.</li>
 %% <li>`storage_rollback' - when the StorageServer has a version of an
 %%   epoch, it has no write between the end version of an earlier epoch
 %%   and the first version of the epoch after that one. A recovery
@@ -136,6 +141,9 @@
 %%   confirmation that its epoch is live.</li>
 %% <li>`no_rollback' - the StorageServer keeps the writes above the end
 %%   version of an epoch.</li>
+%% <li>`no_write_range' - the Resolver does not record the write ranges of
+%%   a transaction, so a clear of a key range gives no conflict.</li>
+%% <li>`no_clear' - the StorageServer does not apply a clear.</li>
 %% <li>`no_window_check' - the StorageServer answers a read below its
 %%   oldest version, after it has removed older versions.</li>
 %% </ul>
@@ -227,7 +235,8 @@ start_storage(Tab, CState, {Mode, Window}, N, Generation) ->
         poll_ms => 100,
         mvcc_window => Window,
         rollback => Mode =/= no_rollback,
-        check_window => Mode =/= no_window_check
+        check_window => Mode =/= no_window_check,
+        clear => Mode =/= no_clear
     }),
     Node = deadlift_dst_client:storage_node(N),
     true = ets:insert(Tab, [{{node, Node}, true}, {{storage_started, N}, Storage}, {storage, Storage, Generation, Node}]),
@@ -452,6 +461,8 @@ record_stats(Tab) ->
     %% The transactions with reads from a StorageServer that the harness
     %% started after a kill.
     bump(reads_after_restart, length([x || [#{values := [_ | _], storage := G}] <- ets:match(Tab, {{read, '_'}, '$1'}), G > 0])),
+    %% The acknowledged transactions that cleared a key.
+    bump(clears, length([x || [#{clears := [_ | _]}] <- ets:match(Tab, {{txn, '_'}, '$1'})])),
     bump(range_reads, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
     %% The acknowledged transactions with a read range.
     bump(range_acks, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{txn, '_'}, '$1'})])),
@@ -560,13 +571,16 @@ has_body(LSN, C, Records) ->
         {value, {_Prev, {body, {batch, Entries}}}} -> 
             lists:any(
                 fun
-                    ([{_Key, {client, Writer}} | _]) -> Writer =:= C;
+                    (Entry) when is_list(Entry) -> lists:any(fun(Mutation) -> match_client(Mutation, C) end, Entry);
                     (_Other) -> false
                 end,
                 Entries
             );
         _ -> false
     end.
+
+match_client({set, _Key, {client, Writer}}, C) -> Writer =:= C;
+match_client(_Mutation, _C) -> false.
 
 %% `no_conflict' and `read_version_order'. `no_conflict' compares every
 %% pair of acknowledged transactions. `read_version_order' compares every
@@ -575,7 +589,8 @@ has_body(LSN, C, Records) ->
 %% read versions has changed.
 transactions(Tab, Acks) ->
     Reads = [Read#{client => C} || [C, Read] <- ets:match(Tab, {{read, '$1'}, '$2'})],
-    Count = {length(Acks), length(Reads), length([x || #{values := _} <- Reads])},
+    Rejected = [C || [C] <- ets:match(Tab, {{rejected, '$1'}, '_'})],
+    Count = {length(Acks), length(Reads), length([x || #{values := _} <- Reads]), length(Rejected)},
     case ets:lookup(Tab, transactions_checked) of
         [{_, Count}] ->
             ok;
@@ -584,7 +599,7 @@ transactions(Tab, Acks) ->
                 Txn#{client => C, epoch => Epoch, version => LSN}
              || {C, Epoch, LSN} <- Acks, [{_, Txn}] <- [ets:lookup(Tab, {txn, C})]
             ],
-            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns) end]) of
+            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns, open_clears(Tab, Acks, Rejected)) end]) of
                 ok ->
                     true = ets:insert(Tab, {transactions_checked, Count}),
                     ok;
@@ -597,11 +612,12 @@ no_conflict(Txns) ->
     Conflicts = [
         {T, W}
      || T = #{read_version := ReadVersion, version := Version, index := Index, reads := Reads} <- Txns,
-        W = #{version := Written, index := WriterIndex, writes := Writes} <- Txns,
+        W = #{version := Written, index := WriterIndex, writes := Writes, clears := Clears} <- Txns,
         Written > ReadVersion,
         %% An earlier version, or an earlier transaction of the batch.
         {Written, WriterIndex} < {Version, Index},
-        Writes -- (Writes -- Reads) =/= []
+        %% A key that the reader read and the writer wrote or cleared.
+        [Key || Key <- Writes ++ Clears, lists:member(Key, Reads)] =/= []
     ],
     case Conflicts of
         [] ->
@@ -609,7 +625,7 @@ no_conflict(Txns) ->
         [{T, W} | _] ->
             violation(no_conflict, #{
                 reader => maps:with([client, epoch, read_version, version, index, reads], T),
-                writer => maps:with([client, epoch, version, index, writes], W)
+                writer => maps:with([client, epoch, version, index, writes, clears], W)
             })
     end.
 
@@ -633,17 +649,24 @@ read_version_order(Reads, Txns) ->
             })
     end.
 
+%% The keys that a transaction without a known result cleared: the cleared
+%% keys of every client that started a commit and received neither an
+%% acknowledgement nor a rejection. Such a clear can be applied.
+open_clears(Tab, Acks, Rejected) ->
+    Done = [C || {C, _Epoch, _LSN} <- Acks] ++ Rejected,
+    lists:usort(lists:append([Clears || [C, Clears] <- ets:match(Tab, {{attempt, '$1'}, '$2'}), not lists:member(C, Done)])).
+
 %% `Reads' have the values that the clients read from the StorageServer:
 %% `{Key, not_found}' or `{Key, {Value, Written}}', where `Written' is the
 %% LSN of the record that wrote the value. The value of a write is
-%% `{client, C}'.
-read_value(Reads, Txns) ->
+%% `{client, C}'. `OpenClears' are the keys of `open_clears/3'.
+read_value(Reads, Txns, OpenClears) ->
     ByClient = maps:from_list([{C, T} || T = #{client := C} <- Txns]),
     Wrong = [
         {R, Key, Found, Reason}
      || R = #{read_version := ReadVersion, values := Values} <- Reads,
         {Key, Found} <- Values,
-        Reason <- wrong_value(Key, Found, ReadVersion, ByClient, Txns)
+        Reason <- wrong_value(Key, Found, ReadVersion, ByClient, Txns, OpenClears)
     ],
     case Wrong of
         [] ->
@@ -659,9 +682,18 @@ read_value(Reads, Txns) ->
 
 %% The reasons why the value `Found' is wrong. The empty list means that
 %% the value is correct.
-wrong_value(Key, not_found, ReadVersion, _ByClient, Txns) ->
-    [{missed, maps:with([client, epoch, version], T)} || T <- writers(Key, 0, ReadVersion, Txns)];
-wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns) ->
+wrong_value(Key, not_found, ReadVersion, _ByClient, Txns, OpenClears) ->
+    %% The key has no value if the last acknowledged transaction that
+    %% changed the key cleared it, or if a transaction without a known
+    %% result cleared the key.
+    case lists:sort([{{Version, Index}, T} || T = #{version := Version, index := Index} <- changers(Key, 0, ReadVersion, Txns)]) of
+        [] ->
+            [];
+        Changers ->
+            {_Order, Last = #{clears := Clears}} = lists:last(Changers),
+            [{missed, maps:with([client, epoch, version], Last)} || not lists:member(Key, Clears), not lists:member(Key, OpenClears)]
+    end;
+wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns, _OpenClears) ->
     [above_read_version || Written > ReadVersion] ++
         case ByClient of
             #{Writer := #{version := Version, writes := Writes}} ->
@@ -669,20 +701,26 @@ wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns) ->
             _ ->
                 []
         end ++
-        [{missed, maps:with([client, epoch, version], T)} || T <- writers(Key, Written, ReadVersion, Txns)] ++
+        [{missed, maps:with([client, epoch, version], T)} || T <- changers(Key, Written, ReadVersion, Txns)] ++
         %% An acknowledged transaction of the same batch, after the writer.
         [
             {missed_in_batch, maps:with([client, epoch, version, index], T)}
          || #{Writer := #{version := Version, index := Index}} <- [ByClient],
             Version =:= Written,
-            T = #{index := Later} <- writers(Key, Written - 1, Written, Txns),
+            T = #{index := Later} <- changers(Key, Written - 1, Written, Txns),
             Later > Index
         ].
 
-%% The acknowledged transactions that wrote `Key' at a commit version above
-%% `After' and at or below `UpTo'.
-writers(Key, After, UpTo, Txns) ->
-    [T || T = #{version := Version, writes := Writes} <- Txns, Version > After, Version =< UpTo, lists:member(Key, Writes)].
+%% The acknowledged transactions that wrote or cleared `Key' at a commit
+%% version above `After' and at or below `UpTo'.
+changers(Key, After, UpTo, Txns) ->
+    [
+        T
+     || T = #{version := Version, writes := Writes, clears := Clears} <- Txns,
+        Version > After,
+        Version =< UpTo,
+        lists:member(Key, Writes) orelse lists:member(Key, Clears)
+    ].
 
 %% The coordinated state has the end version of each ended epoch. The
 %% first version of the next epoch is the end version plus the gap.

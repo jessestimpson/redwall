@@ -10,6 +10,7 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> read_waits(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> batch(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> window(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> clears(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> epochs(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> rollback(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end
@@ -97,6 +98,36 @@ reads(Ids) ->
     ok = await_version(Storage, 5),
     ?assertMatch(#{version := 5, epoch := 1, rollbacks := 0}, deadlift_storage:info(Storage)).
 
+%% Clears of a key and of a key range. A read at a version before the clear
+%% returns the value.
+clears(Ids) ->
+    {Proxy, _Logs} = epoch(Ids),
+    {ok, Storage} = deadlift_storage:start(#{coordinators => Ids, poll_ms => 5, mvcc_window => 4}),
+    {ok, 2} = deadlift_proxy:commit(Proxy, #{writes => [{a, 1}, {b, 1}, {c, 1}, {d, 1}]}),
+    {ok, 3} = deadlift_proxy:commit(Proxy, #{mutations => [{clear, a}]}),
+    %% The range has `b' and `c', and does not have `d'.
+    {ok, 4} = deadlift_proxy:commit(Proxy, #{mutations => [{clear_range, b, d}, {clear, z}]}),
+    %% The mutations of a transaction are applied in their order: `c' has
+    %% the value 5, and `d' has no value.
+    {ok, 5} = deadlift_proxy:commit(Proxy, #{mutations => [{clear_range, a, z}, {set, c, 5}, {set, d, 5}, {clear, d}]}),
+    ?assertEqual({ok, [{a, 1}, {b, 1}, {c, 1}, {d, 1}]}, deadlift_storage:read_range(Storage, a, z, 2)),
+    ?assertEqual({ok, [{b, 1}, {c, 1}, {d, 1}]}, deadlift_storage:read_range(Storage, a, z, 3)),
+    ?assertEqual(not_found, deadlift_storage:read(Storage, a, 3)),
+    ?assertEqual({ok, [{d, 1}]}, deadlift_storage:read_range(Storage, a, z, 4)),
+    ?assertEqual({ok, [{c, 5}]}, deadlift_storage:read_range(Storage, a, z, 5)),
+    ?assertEqual({ok, 5, 5}, deadlift_storage:read_with_version(Storage, c, 5, 5000)),
+    %% A transaction that read `b' at the version 3 has a conflict with the
+    %% clear of the range at the version 4.
+    ?assertEqual({error, not_committed}, deadlift_proxy:commit(Proxy, #{read_version => 3, reads => [b], writes => [{e, 1}]})),
+    ?assertEqual({error, not_committed}, deadlift_proxy:commit(Proxy, #{read_version => 2, reads => [a], writes => [{e, 1}]})),
+    %% The MVCC window removes a key that has no value at the oldest
+    %% version.
+    [{ok, _} = deadlift_proxy:commit(Proxy, #{writes => [{c, N}]}) || N <- lists:seq(8, 14)],
+    ok = await_version(Storage, 14),
+    ?assertMatch(#{oldest := 10}, deadlift_storage:info(Storage)),
+    Data = all_data(Storage),
+    ?assertEqual([c], maps:keys(Data)).
+
 %% A StorageServer with an MVCC window of 10 versions. The commit `N' has
 %% the LSN `N + 1' and writes `{x, N}'. The first commit also writes `y'.
 window(Ids) ->
@@ -118,14 +149,25 @@ window(Ids) ->
     ?assertEqual({ok, [{x, 22}, {y, 1}]}, deadlift_storage:read_range(Storage, a, z, 23)),
     %% The StorageServer has 11 versions of `x': the versions 22 to 31 and
     %% the version 21.
-    #{data := #{x := Versions, y := [{2, 1}]}} = sys_state(Storage),
+    #{data := #{x := Versions, y := [{2, {set, 1}}]}} = sys_state(Storage),
     ?assertEqual(lists:seq(31, 21, -1), [Version || {Version, _Value} <- Versions]).
 
 %% The versions that the StorageServer keeps for each key.
 sys_state(Storage) ->
+    #{data => all_data(Storage)}.
+
+%% The field `data' of the state: the only map of the state whose values
+%% are lists of versions.
+all_data(Storage) ->
     State = sys:get_state(Storage),
-    [Data] = [Field || Field <- tuple_to_list(State), is_map(Field), is_map_key(x, Field)],
-    #{data => Data}.
+    [Data] = [
+        Field
+     || Field <- tuple_to_list(State),
+        is_map(Field),
+        map_size(Field) > 0,
+        lists:all(fun(V) -> is_list(V) andalso V =/= [] andalso is_tuple(hd(V)) andalso tuple_size(hd(V)) =:= 2 end, maps:values(Field))
+    ],
+    Data.
 
 %% Two transactions of one batch write the key `x'. A read returns the
 %% write of the transaction with the higher index.

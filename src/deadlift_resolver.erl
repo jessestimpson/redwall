@@ -105,8 +105,6 @@
 %% <ul>
 %% <li>A key is an Erlang term. A key of FoundationDB is a byte
 %%   string.</li>
-%% <li>The Proxy sends no write range. deadlift has no operation that
-%%   clears a range.</li>
 %% <li>One Resolver handles every key. FoundationDB divides the key space
 %%   over several Resolvers.</li>
 %% </ul>
@@ -131,14 +129,17 @@
 %% `check => false' the Resolver admits every transaction. With
 %% `check_ranges => false' the Resolver does not check the read ranges of a
 %% transaction. With `check_batch => false' the Resolver does not check a
-%% transaction against the earlier transactions of its batch.
+%% transaction against the earlier transactions of its batch. With
+%% `check_write_ranges => false' the Resolver does not record the write
+%% ranges of a transaction.
 -type options() :: #{
     epoch := epoch(),
     version := version(),
     mvcc_window => pos_integer() | infinity,
     check => boolean(),
     check_ranges => boolean(),
-    check_batch => boolean()
+    check_batch => boolean(),
+    check_write_ranges => boolean()
 }.
 
 -type key_range() :: {Begin :: term(), End :: term()}.
@@ -172,6 +173,7 @@
     check :: boolean(),
     check_ranges :: boolean(),
     check_batch :: boolean(),
+    check_write_ranges :: boolean(),
     %% PreviousVersion -> {Version, Transactions, Callers}: the requests that
     %% wait for the request with the previous version.
     waiting = #{} :: #{version() => {version(), [transaction()], [gen_server:from()]}}
@@ -329,7 +331,8 @@ init(Options = #{epoch := Epoch, version := Version}) ->
                 history = new(maps:get(mvcc_window, Options, infinity)),
                 check = maps:get(check, Options, true),
                 check_ranges = maps:get(check_ranges, Options, true),
-                check_batch = maps:get(check_batch, Options, true)
+                check_batch = maps:get(check_batch, Options, true),
+                check_write_ranges = maps:get(check_write_ranges, Options, true)
             }};
         no ->
             {stop, {already_registered, Epoch}}
@@ -365,11 +368,17 @@ handle_cast(_Message, State) ->
 
 resolve(Version, Transactions0, State = #state{history = History}) ->
     #state{check = Check, check_ranges = CheckRanges, check_batch = CheckBatch} = State,
-    Transactions =
+    Transactions1 =
         case CheckRanges of
             true -> Transactions0;
             %% The planted defect: the read ranges are not checked.
             false -> [Transaction#{read_ranges => []} || Transaction <- Transactions0]
+        end,
+    Transactions =
+        case State#state.check_write_ranges of
+            true -> Transactions1;
+            %% The planted defect: the write ranges are not recorded.
+            false -> [Transaction#{write_ranges => []} || Transaction <- Transactions1]
         end,
     WithoutReads = fun(Transaction) -> Transaction#{reads := [], read_ranges => []} end,
     {Results, History1} =

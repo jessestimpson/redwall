@@ -141,7 +141,7 @@ batches(Ids) ->
         fun({LSN, _Prev, {body, {batch, Entries}}}) ->
             ?assertEqual(
                 [N || {{L, _Index}, {ok, _, _}, N} <- lists:sort(lists:zip3(order(Answers), Answers, lists:seq(1, 50))), L =:= LSN],
-                [N || [{N, N}] <- Entries]
+                [N || [{set, N, N}] <- Entries]
             )
         end,
         [Record || Record = {_LSN, _Prev, {body, _}} <- Records]
@@ -250,18 +250,18 @@ transactions(Ids) ->
         [
             {1, recovery_transaction},
             {1, recovery_transaction},
-            {2, [{x, 1}]},
-            {2, [{x, 1}]},
-            {3, [{x, 2}]},
-            {3, [{x, 2}]},
+            {2, [{set, x, 1}]},
+            {2, [{set, x, 1}]},
+            {3, [{set, x, 2}]},
+            {3, [{set, x, 2}]},
             {4, no_transaction},
             {4, no_transaction},
-            {5, [{y, 4}]},
-            {5, [{y, 4}]},
+            {5, [{set, y, 4}]},
+            {5, [{set, y, 4}]},
             {6, no_transaction},
             {6, no_transaction},
-            {7, [{w, 5}]},
-            {7, [{w, 5}]}
+            {7, [{set, w, 5}]},
+            {7, [{set, w, 5}]}
         ],
         All
     ).

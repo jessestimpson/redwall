@@ -30,8 +30,12 @@
 %%
 %% The body of a record of a Proxy is `{batch, Entries}', with one entry
 %% for each transaction of the batch, in the order of the batch. The entry
-%% of a transaction is a list of `{Key, Value}'. Another entry, and a
-%% record with another body, contain no write. The StorageServer applies
+%% of a transaction is a list of mutations (`deadlift_proxy:mutation()'):
+%% `{set, Key, Value}', `{clear, Key}' and `{clear_range, Begin, End}'.
+%% Another entry, and a record with another body, contain no mutation. The
+%% StorageServer applies the mutations of an entry in their order. A clear
+%% adds a version without a value to each key that has a value. A clear of
+%% a range examines every key. The StorageServer applies
 %% the entries in their order. When two transactions of a batch write one
 %% key, the StorageServer keeps the value of the later transaction for the
 %% version of the batch. The StorageServer keeps every version of every
@@ -147,14 +151,16 @@
 %% `rollback => false' plants a defect for the simulation: the
 %% StorageServer keeps the writes above the end version of an epoch.
 %% `check_window => false' plants a second defect: the StorageServer
-%% answers a read below the oldest version.
+%% answers a read below the oldest version. `clear => false' plants a third
+%% defect: the StorageServer does not apply a clear.
 -type options() :: #{
     coordinators := deadlift_cstate:servers(),
     poll_ms => pos_integer(),
     cstate_timeout_ms => timeout(),
     mvcc_window => pos_integer() | infinity,
     rollback => boolean(),
-    check_window => boolean()
+    check_window => boolean(),
+    clear => boolean()
 }.
 
 -record(state, {
@@ -164,14 +170,16 @@
     rollback :: boolean(),
     window :: pos_integer() | infinity,
     check_window :: boolean(),
+    clear :: boolean(),
     %% The LSN of the last record that the StorageServer has applied.
     version = 0 :: version(),
     %% The oldest version that a read can have.
     oldest = 0 :: version(),
     %% The highest Known Committed Version that a LogServer has sent.
     kcv = 0 :: version(),
-    %% Key -> [{Version, Value}], the highest version first.
-    data = #{} :: #{term() => [{version(), term()}]},
+    %% Key -> [{Version, Change}], the highest version first. `Change' is
+    %% `{set, Value}', or `clear' for a version without a value.
+    data = #{} :: #{term() => [{version(), {set, term()} | clear}]},
     %% The log systems of all epochs, from the last read of the coordinated
     %% state, in the order of the epochs.
     systems = [] :: [map()],
@@ -299,6 +307,7 @@ init(Options = #{coordinators := Coordinators}) ->
         rollback = maps:get(rollback, Options, true),
         window = maps:get(mvcc_window, Options, ?MVCC_WINDOW),
         check_window = maps:get(check_window, Options, true),
+        clear = maps:get(clear, Options, true),
         buffer = gb_trees:empty(),
         requests = gen_server:reqids_new()
     },
@@ -484,7 +493,7 @@ apply_records(State = #state{version = Version, buffer = Buffer}) ->
                 {LSN, {Version, {body, Body}}} ->
                     State1 = State#state{
                         version = LSN,
-                        data = write(Body, LSN, State#state.data),
+                        data = write(without_clears(Body, State), LSN, State#state.data),
                         buffer = gb_trees:delete(LSN, Buffer)
                     },
                     apply_records(State1);
@@ -493,21 +502,38 @@ apply_records(State = #state{version = Version, buffer = Buffer}) ->
             end
     end.
 
+%% The planted defect `clear => false': the body without the clears.
+without_clears({batch, Entries}, #state{clear = false}) ->
+    {batch, [
+        case is_list(Entry) of
+            true -> [Mutation || Mutation <- Entry, element(1, Mutation) =:= set];
+            false -> Entry
+        end
+     || Entry <- Entries
+    ]};
+without_clears(Body, _State) ->
+    Body.
+
 write({batch, Entries}, LSN, Data) ->
     lists:foldl(fun(Entry, Acc) -> write_entry(Entry, LSN, Acc) end, Data, Entries);
 write(_NoTransaction, _LSN, Data) ->
     Data.
 
+%% Applies the mutations of one transaction, in their order.
 write_entry(Entry, LSN, Data) when is_list(Entry) ->
     lists:foldl(
         fun
-            ({Key, Value}, Acc) ->
-                case Acc of
-                    %% An earlier transaction of the batch wrote the key.
-                    #{Key := [{LSN, _Earlier} | Versions]} -> Acc#{Key := [{LSN, Value} | Versions]};
-                    #{Key := Versions} -> Acc#{Key := [{LSN, Value} | Versions]};
-                    _ -> Acc#{Key => [{LSN, Value}]}
-                end;
+            ({set, Key, Value}, Acc) ->
+                put_version(Key, LSN, {set, Value}, Acc);
+            ({clear, Key}, Acc) ->
+                clear_key(Key, LSN, Acc);
+            ({clear_range, Begin, End}, Acc) ->
+                %% The StorageServer examines every key.
+                lists:foldl(
+                    fun(Key, Acc1) -> clear_key(Key, LSN, Acc1) end,
+                    Acc,
+                    [Key || Key <- maps:keys(Acc), Key >= Begin, Key < End]
+                );
             (_Other, Acc) ->
                 Acc
         end,
@@ -516,6 +542,24 @@ write_entry(Entry, LSN, Data) when is_list(Entry) ->
     );
 write_entry(_NoTransaction, _LSN, Data) ->
     Data.
+
+%% Adds the version `LSN' of `Key'. `Change' is `{set, Value}' or `clear'.
+%% If a mutation of the same record changed the key before, the new change
+%% replaces that one.
+put_version(Key, LSN, Change, Data) ->
+    case Data of
+        #{Key := [{LSN, _Earlier} | Versions]} -> Data#{Key := [{LSN, Change} | Versions]};
+        #{Key := Versions} -> Data#{Key := [{LSN, Change} | Versions]};
+        _ -> Data#{Key => [{LSN, Change}]}
+    end.
+
+%% A clear of a key without a value adds no version.
+clear_key(Key, LSN, Data) ->
+    case Data of
+        #{Key := [{_Version, {set, _Value}} | _]} -> put_version(Key, LSN, clear, Data);
+        #{Key := [{LSN, clear}, {_Version, {set, _Value}} | _]} -> Data;
+        _ -> Data
+    end.
 
 %% ---------------------------------------------------------------------------
 %% MVCC window
@@ -528,7 +572,16 @@ advance_oldest(State = #state{window = infinity}) ->
 advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, window = Window, data = Data}) ->
     case min(Version - Window, KCV) of
         New when New - Oldest >= max(1, Window div 10) ->
-            State#state{oldest = New, data = maps:map(fun(_Key, Versions) -> prune(Versions, New) end, Data)};
+            Pruned = maps:filtermap(
+                fun(_Key, Versions) ->
+                    case prune(Versions, New) of
+                        [] -> false;
+                        Kept -> {true, Kept}
+                    end
+                end,
+                Data
+            ),
+            State#state{oldest = New, data = Pruned};
         _ ->
             State
     end.
@@ -537,6 +590,9 @@ advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, win
 %% The list has the highest version first.
 prune([Write = {Version, _Value} | Versions], Oldest) when Version > Oldest ->
     [Write | prune(Versions, Oldest)];
+prune([{_Version, clear} | _Older], _Oldest) ->
+    %% The key has no value at the oldest version.
+    [];
 prune([Write | _Older], _Oldest) ->
     [Write];
 prune([], _Oldest) ->
@@ -570,6 +626,7 @@ lookup({range, Begin, End}, Version, State = #state{data = Data}) ->
 
 lookup_key(Key, Version, #state{data = Data}) ->
     case [W || W = {Written, _Value} <- maps:get(Key, Data, []), Written =< Version] of
-        [{Written, Value} | _] -> {ok, Value, Written};
+        [{Written, {set, Value}} | _] -> {ok, Value, Written};
+        [{_Written, clear} | _] -> not_found;
         [] -> not_found
     end.
