@@ -3,7 +3,8 @@
 %% A Proxy commits log records for clients. See sections 2.4.1 and 2.4.3 of
 %% Zhou et al., "FoundationDB: A Distributed Unbundled Transactional Key
 %% Value Store", SIGMOD 2021. `formal/Recovery.tla' models the Proxy with
-%% the actions `Assign' and `Ack'.
+%% the actions `Assign' and `Ack', and a request for a read version with
+%% `ReadStart', `ReadConfirm', `ReadSeq' and `ReadDone'.
 %%
 %% == Read version ==
 %%

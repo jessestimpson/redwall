@@ -6,7 +6,8 @@
 %% Transactional Key Value Store", SIGMOD 2021. The rules that the paper
 %% does not state are taken from `fdbserver/Resolver.actor.cpp' and
 %% `fdbserver/SkipList.cpp' of FoundationDB 7.3. The comments below call
-%% them "the source".
+%% them "the source". `formal/Resolver.tla' models the Resolver with the
+%% actions `Commit' and `NewEpoch'.
 %%
 %% == Algorithm 1 ==
 %%

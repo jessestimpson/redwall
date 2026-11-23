@@ -28,8 +28,9 @@ them yet.
 
 deadlift is at the start. The repository contains:
 
-- a TLA+ model of the logging protocol and of the recovery of the
-  transaction system, checked with TLC;
+- two TLA+ models, checked with TLC: one of the logging protocol, the
+  recovery, read versions and the StorageServer, and one of the
+  Resolver;
 - the coordinated state, as a state machine for peace, with tests;
 - the LogServer, with tests;
 - the recovery, and a Sequencer that assigns read versions and commit
@@ -60,11 +61,11 @@ deadlift keeps this design.
 |---|---|---|
 | Coordinators | Store the coordinated state | A peace cluster that runs [deadlift_cstate](src/deadlift_cstate.erl) |
 | ClusterController | Recruits the Sequencer | Not implemented |
-| Sequencer | Assigns read versions and commit versions, and performs the recovery | [deadlift_sequencer](src/deadlift_sequencer.erl) and [deadlift_recovery](src/deadlift_recovery.erl). The recovery is modelled in [formal/Recovery.tla](formal/Recovery.tla) |
-| Proxy | Gives read versions to clients and commits transactions | [deadlift_proxy](src/deadlift_proxy.erl). The commit to the LogServers is modelled |
-| Resolver | Checks a transaction for conflicts | [deadlift_resolver](src/deadlift_resolver.erl). Not modelled |
+| Sequencer | Assigns read versions and commit versions, and performs the recovery | [deadlift_sequencer](src/deadlift_sequencer.erl) and [deadlift_recovery](src/deadlift_recovery.erl). The recovery, the recovery transaction and the versions are modelled in [formal/Recovery.tla](formal/Recovery.tla) |
+| Proxy | Gives read versions to clients and commits transactions | [deadlift_proxy](src/deadlift_proxy.erl). The commit to the LogServers and the read version are modelled |
+| Resolver | Checks a transaction for conflicts | [deadlift_resolver](src/deadlift_resolver.erl). Modelled in [formal/Resolver.tla](formal/Resolver.tla) |
 | LogServer | Stores the log records of an epoch | [deadlift_log](src/deadlift_log.erl). Modelled |
-| StorageServer | Stores data and answers reads at a version | [deadlift_storage](src/deadlift_storage.erl). Not modelled |
+| StorageServer | Stores data and answers reads at a version | [deadlift_storage](src/deadlift_storage.erl). Modelled, without keys and values |
 
 ### The coordinated state
 
@@ -160,9 +161,11 @@ transaction with a read version of the previous epoch as too old.
 The Sequencer of deadlift assigns a commit version only if the version is
 less than 100,000,000 above the read version. Otherwise the Sequencer
 answers `{error, versions_in_flight}` and the Proxy stops. With this
-limit, no LogServer stores a record at or above the first commit version
-of the next epoch. A record that a recovery discards therefore has an LSN
-below every version of the next epoch. The StorageServer depends on this
+limit, no LogServer stores a record of a client at or above the first
+commit version of the next epoch. A record of a client that a recovery
+discards therefore has an LSN below every version of the next epoch. A
+discarded recovery transaction can have the first LSN of the next epoch;
+it has no content. The StorageServer depends on this
 rule. FoundationDB uses the constant `MAX_VERSIONS_IN_FLIGHT` for the gap.
 The limit in the Sequencer of deadlift is not taken from the FoundationDB
 source.
@@ -324,10 +327,10 @@ through the registry. They send a request only to a LogServer that runs.
 |---|---|---|---|
 | Unit tests | The coordinated state machine, alone and on a peace cluster of three servers on one node. One LogServer: the order of the LSNs, the KCV, repeated records and the lock. The recovery on a peace cluster: the first epoch, a second epoch with records to copy, 1 and 2 LogServers down, and two recoveries at the same time. The Proxy: commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down | `make test` | 3 seconds |
 | Simulation | The LogServer, the recovery, the Sequencer, the Resolver, the Proxy and the StorageServer under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 10 minutes |
-| Model checking | The logging protocol and the recovery, with 2 epochs | `make tlc` | about 1 minute |
-| Model checking | The same model with 3 epochs | `make tlc-long` | about 5 minutes |
+| Model checking | The logging protocol, the recovery, the read versions, the StorageServer and the Resolver, with 2 epochs | `make tlc` | about 5 minutes |
+| Model checking | The logging protocol, the recovery and the StorageServer, with 3 epochs | `make tlc-long` | about 4 hours |
 
-The model has three planted bugs. TLC finds a counterexample for each. See
+The models have 9 planted bugs. TLC finds a counterexample for each. See
 [formal/README.md](formal/README.md).
 
 ### Simulation
@@ -400,7 +403,7 @@ make compile    # compile
 make test       # unit tests
 make dst        # deterministic simulation with eta
 make tlc        # the quick TLC configs
-make tlc-long   # the TLC config with three epochs
+make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 ```
 
 ## Requirements
@@ -436,9 +439,10 @@ make tlc-long   # the TLC config with three epochs
 | [test/deadlift_proxy_tests.erl](test/deadlift_proxy_tests.erl) | Tests for `deadlift_proxy` |
 | [test/deadlift_resolver_tests.erl](test/deadlift_resolver_tests.erl) | Tests for `deadlift_resolver` |
 | [test/deadlift_storage_tests.erl](test/deadlift_storage_tests.erl) | Tests for `deadlift_storage` |
-| [formal/Recovery.tla](formal/Recovery.tla) | TLA+ model of the logging protocol and the recovery |
-| [formal/MCRecovery.tla](formal/MCRecovery.tla) | Constants and invariants for model checking |
-| [formal/README.md](formal/README.md) | The model, the configs and the results |
+| [formal/Recovery.tla](formal/Recovery.tla) | TLA+ model of the logging protocol, the recovery, read versions and the StorageServer |
+| [formal/Resolver.tla](formal/Resolver.tla) | TLA+ model of the Resolver |
+| [formal/MCRecovery.tla](formal/MCRecovery.tla), [formal/MCResolver.tla](formal/MCResolver.tla) | Constants and invariants for model checking |
+| [formal/README.md](formal/README.md) | The models, the configs and the results |
 | [ROADMAP.md](ROADMAP.md) | The planned work |
 
 ## Limitations
@@ -461,8 +465,6 @@ make tlc-long   # the TLC config with three epochs
   send the message again.
 - A Resolver that stops is not started again. The commits of its epoch
   stop until the next recovery.
-- The TLA+ model has no Resolver, no read version, no recovery
-  transaction and no StorageServer.
 - A Proxy that stops between the assignment of an LSN and the push leaves
   an LSN that no LogServer receives. Every later record of the epoch then
   waits in the LogServers until a recovery.
@@ -483,10 +485,13 @@ make tlc-long   # the TLC config with three epochs
 - A LogServer does not discard records. The memory of a LogServer grows
   with every record.
 - The number of records that wait in a LogServer has no limit.
-- The model has no Resolver, no StorageServer, no tags, no recovery
-  transaction and no election of a ClusterController.
-- The model is checked with 3 LogServers, a replication degree of 2, and at
-  most 3 epochs and 3 versions.
+- The model of the recovery and the model of the Resolver are separate.
+  No model has both.
+- The models have no keys and values in the StorageServer, no tags, no
+  clock and no election of a ClusterController.
+- The models are checked with 3 LogServers, a replication degree of 2, at
+  most 3 epochs and 7 versions, and for the Resolver 2 keys and 3
+  transactions.
 - deadlift does not send a message again. In the simulation, a lost
   message to a LogServer stops the commits of the epoch until the next
   recovery.

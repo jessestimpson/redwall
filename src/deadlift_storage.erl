@@ -4,6 +4,8 @@
 %% writes of each record to a store with versions, and answers a read at a
 %% version. See sections 2.4.3 and 2.4.4 of Zhou et al., "FoundationDB: A
 %% Distributed Unbundled Transactional Key Value Store", SIGMOD 2021.
+%% `formal/Recovery.tla' models the StorageServer with the actions
+%% `SSApply' and `SSFollow'.
 %%
 %% == Records ==
 %%
@@ -69,11 +71,13 @@
 %% <ul>
 %% <li>A write of the same epoch at or below `V' is at or below the end
 %%   version of the epoch.</li>
-%% <li>A record that a recovery discards has an LSN below the first
-%%   version of the next epoch, because the Sequencer limits the versions
-%%   in flight (see {@link deadlift_sequencer}). The StorageServer
-%%   therefore reaches a version of a later epoch only through the end
-%%   version of each earlier epoch, after the rollback.</li>
+%% <li>A record of a client that a recovery discards has an LSN below the
+%%   first version of the next epoch, because the Sequencer limits the
+%%   versions in flight (see {@link deadlift_sequencer}). The
+%%   StorageServer therefore has no discarded write at or below a version
+%%   of a later epoch when it reaches that version. A discarded recovery
+%%   transaction can have the first LSN of the next epoch. It contains no
+%%   write.</li>
 %% </ul>
 %%
 %% == Departures from the paper ==

@@ -112,10 +112,13 @@ node of the cluster. See "Use cases" in [README.md](README.md).
 
 ## Verification work
 
-- [ ] Extend the model with the Resolver, the read version and the first
-      version of an epoch. The implementation has them.
-- [ ] Extend the model with StorageServers and the rollback above the
+- [x] Extend the model with the read version, the recovery transaction
+      and the first version of an epoch.
+- [x] Extend the model with the StorageServer and the rollback above the
       Recovery Version.
+- [x] Model the Resolver, in the separate model `formal/Resolver.tla`.
+- [ ] Add keys and values to the model of the StorageServer, so that the
+      model has the value that a client reads.
 - [ ] Model the copy of records to a subset of the new LogServers. The
       model copies each record to every new LogServer.
 - [ ] Validate traces of the implementation against the model, as peace

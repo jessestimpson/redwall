@@ -4,13 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-QUICK_PASS="RecoverySafe"
+QUICK_PASS="RecoverySafe RecoveryReads RecoveryStorage ResolverSafe ResolverSafeThreeEpochs ResolverSmallestGap"
 # Planted bugs: each config must produce a counterexample.
-QUICK_FAIL="RecoveryAckReplicasOnly RecoveryFewReplies RecoveryNoCas"
+QUICK_FAIL="RecoveryAckReplicasOnly RecoveryFewReplies RecoveryNoCas RecoveryNoReport RecoveryFewConfirms RecoveryNoRollback RecoveryNoInFlightLimit ResolverNoCheck ResolverNoGap"
 # Reachability: each config must reach the state that the invariant of the
 # config says is never reached.
-QUICK_REACH="RecoveryReachThirdEpoch RecoveryReachDiscard RecoveryReachCopy"
-LONG_PASS="RecoverySafeThreeEpochs"
+QUICK_REACH="RecoveryReachThirdEpoch RecoveryReachDiscard RecoveryReachCopy RecoveryReachRollback RecoveryReachReadSecondEpoch RecoveryReachStoreSecondEpoch ResolverReachConflict ResolverReachTooOldInEpoch ResolverReachTooOldAcrossEpochs ResolverReachCommitSecondEpoch"
+LONG_PASS="RecoverySafeThreeEpochs RecoveryStorageThreeEpochs"
 
 run() { # expectation configs...
   local expect="$1"; shift

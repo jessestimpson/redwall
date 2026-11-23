@@ -11,6 +11,11 @@ cd "$(dirname "$0")"
 CFG="${1:?usage: check.sh <config-basename> [pass|fail]}"
 EXPECT="${2:-pass}"
 JAR="${TLA2TOOLS_JAR:-vendor/tla2tools-v1.8.0.jar}"
+# A config whose name starts with "Resolver" belongs to MCResolver.tla.
+case "$CFG" in
+  Resolver*) MODULE=MCResolver.tla ;;
+  *) MODULE=MCRecovery.tla ;;
+esac
 OUT="$(mktemp)"
 META="$(mktemp -d)"
 trap 'rm -rf "$OUT" "$META"' EXIT
@@ -20,7 +25,7 @@ set +e
 # after every epoch and every LSN is used. That state is not an error.
 java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
   -workers auto -deadlock -noGenerateSpecTE -metadir "$META" \
-  -config "${CFG}.cfg" MCRecovery.tla 2>&1 | tee "$OUT"
+  -config "${CFG}.cfg" "$MODULE" 2>&1 | tee "$OUT"
 STATUS=${PIPESTATUS[0]}
 set -e
 

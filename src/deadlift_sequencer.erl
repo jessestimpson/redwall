@@ -3,8 +3,8 @@
 %% The Sequencer of an epoch performs the recovery, and then assigns the
 %% commit versions of the epoch. See sections 2.3.1, 2.4.1 and 2.4.4 of
 %% Zhou et al., "FoundationDB: A Distributed Unbundled Transactional Key
-%% Value Store", SIGMOD 2021. `formal/Recovery.tla' models the assignment
-%% of a version with the action `Assign'.
+%% Value Store", SIGMOD 2021. `formal/Recovery.tla' models the Sequencer
+%% with the recovery actions and with `RecoveryTxn', `Accept' and `Assign'.
 %%
 %% A Sequencer starts with a recovery ({@link deadlift_recovery}). If the
 %% recovery fails, the Sequencer stops with the reason
@@ -63,11 +63,18 @@
 %% The read version is at or below the Recovery Version of the recovery
 %% that ends the epoch, because every LogServer of the epoch has stored the
 %% record with the read version. A LogServer of the epoch therefore stores
-%% no record at or above the Recovery Version plus
+%% no record of a client at or above the Recovery Version plus
 %% `max_versions_in_flight', which is the first commit version of the next
-%% epoch. A record that the recovery discards has an LSN below every
-%% version of the next epoch. A StorageServer depends on this rule (see
-%% {@link deadlift_storage}).
+%% epoch. A record of a client that the recovery discards has an LSN below
+%% every version of the next epoch. A StorageServer depends on this rule
+%% (see {@link deadlift_storage}).
+%%
+%% The rule does not hold for the recovery transaction, which the
+%% Sequencer sends before it has a read version. If an epoch never accepts
+%% commits, the next epoch can have the same Recovery Version, and then the
+%% two recovery transactions have the same LSN. A recovery transaction has
+%% no content, so a read is not affected. `formal/Recovery.tla' has this
+%% case (`BelowNextEpoch').
 %%
 %% FoundationDB uses the constant `MAX_VERSIONS_IN_FLIGHT' for both
 %% purposes. The limit in the Sequencer of deadlift is not taken from the

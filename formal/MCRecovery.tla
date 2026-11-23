@@ -20,6 +20,18 @@ NeverDiscard ==
 
 \* A recovery copies a record from the old epoch to the new epoch.
 NeverCopy ==
-    ~(\E e \in Epochs, l \in Logs : phase[e] = "accepting" /\ e > 1 /\ data[e][l] # {} /\ last[e] = rv[e])
+    ~(\E e \in Epochs, l \in Logs : phase[e] = "accepting" /\ \E v \in data[e][l] : v <= rv[e])
+
+\* The StorageServer removes a record.
+NeverRollback == ~ssRolled
+
+\* A client receives a read version of the second epoch.
+NeverReadSecondEpoch ==
+    ~(\E r \in Reads : rVer[r] # 0 /\ rEpoch[r] = 2)
+
+\* The StorageServer applies a record of the second epoch above the
+\* recovery transaction.
+NeverStoreSecondEpoch ==
+    ~(\E v \in Versions : <<2, v>> \in ssApplied /\ v > first[2])
 
 =============================================================================
