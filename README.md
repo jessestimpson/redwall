@@ -1025,24 +1025,46 @@ servers in its place, under the scheduler and the network of eta:
   of 0.015, because the heartbeats of peace add steps for each unit of
   the virtual clock.
 
-Results of `make dst` on 2026-11-23. The 41 tests pass in 183 s:
+Results of `make dst` on 2026-11-23. The 41 tests pass in 200 s:
 
 | Test | Runs | Result |
 |---|---|---|
-| peace cluster, no faults | 50 seeds in 1 test, 80 operations each | No violation. 1,801 acknowledged transactions, 323 recoveries, 73 failed recoveries |
-| peace cluster, kills, partitions, lost and delayed messages | 200 seeds in 2 tests | No violation. 861 acknowledged transactions, 1,197 recoveries, 834 failed recoveries, 32 kills of a server of the peace cluster, 120 partitions, 199 rollbacks of StorageServers |
+| peace cluster, no faults | 50 seeds in 1 test, 80 operations each | No violation. 1,991 acknowledged transactions, 335 recoveries, 16 failed recoveries |
+| peace cluster, kills, partitions, lost and delayed messages | 200 seeds in 2 tests | No violation. 919 acknowledged transactions, 1,270 recoveries, 734 failed recoveries, 53 kills of a server of the peace cluster, 123 partitions, 242 rollbacks of StorageServers |
 | peace cluster, ClusterControllers, kills of worker nodes, partitions | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 301 acknowledged transactions, 398 recoveries, 139 elections, 24 kills of a server of the peace cluster |
 | peace cluster, ClusterControllers, cuts between ClusterController nodes | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 288 acknowledged transactions, 182 elections, 28 runs with two leaders at the same time |
 | Planted defect `no_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 1, `durable` |
 | Planted defect `no_elect_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 1, `one_leader` |
+
+The failed recoveries of the runs with a peace cluster were examined on
+2026-11-23, in 100 seeds with faults:
+
+| Reason of a failed recovery | Count | Cause |
+|---|---|---|
+| `count` | 252 | Another recovery raised the recovery count first. The harness starts recoveries at times that the seed selects, so recoveries overlap |
+| `recovery_transaction` | 60 | The first commit of the new epoch found a LogServer that a later recovery had stopped, or a killed node |
+| `locked`, `noproc`, `server_down`, `write_unknown` | 22 | A LogServer was stopped or killed, or a call to the peace cluster ended without an answer |
+| `no_leader` | 0 | The peace cluster had a leader for every recovery |
+
+- The same 100 seeds without the peace cluster and with the same rate
+  of operations have 137 failures with the reason `count`. A call to
+  the peace cluster takes several messages, each of which the network
+  can delay, so two recoveries overlap more often. This cause was
+  concluded from the counts and was not measured.
+- Before this examination, the first recovery of a run failed in 99
+  runs of 100 with `no_leader` or `noproc`, because the first operation
+  starts the servers of the cluster and the first recovery at the same
+  time. A recovery now waits until the first read of the cluster has
+  succeeded. This wait is in the harness. In a deployment, the
+  ClusterController recruits again after a failed recovery.
 
 Limitations of the simulation:
 
 - A killed server of the peace cluster does not start again, and at
   most 1 of the 3 servers is killed in a run. The cluster has no disk
   and no change of its members.
-- A run with a peace cluster acknowledges fewer transactions than a
-  run without one: 4.3 for each run with faults, against 5.0.
+- A run with a peace cluster and faults acknowledges 4.6 transactions
+  on average, against 5.0 without the cluster.
 
 - The application start (`deadlift_sup`) and `deadlift:open/0` are not
   in the simulation. Unit tests on two nodes cover them.

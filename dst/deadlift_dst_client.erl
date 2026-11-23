@@ -20,6 +20,10 @@
 %% `N' is the number of the operation. `Mode' selects a planted defect.
 recover(Tab, N, CState, Mode) ->
     ok = join(Tab, Mode),
+    %% A recovery waits for the peace cluster only until the first read
+    %% of the run has succeeded. A later recovery can fail because the
+    %% cluster has no leader.
+    _ = ets:member(Tab, cluster_ready) orelse await_cluster(Tab, CState, 200),
     %% Each LogServer runs on a simulated node of its own. The process of
     %% the epoch starts the LogServer on that node through `erpc'. The call
     %% has a limit of time, because the network can lose the request.
@@ -469,6 +473,28 @@ form_cluster(Tab, Ids) ->
         _NotRunningOrNotFormed ->
             ok = timer:sleep(20),
             form_cluster(Tab, Ids)
+    end.
+
+%% Waits until a read of the peace cluster succeeds, for at most
+%% `Attempts' reads, and then records the row `cluster_ready' in the table
+%% of the run. The first `recover' operation starts the servers of the
+%% cluster and the first recovery at the same time. Without the wait, the
+%% first recovery fails in 99 runs of 100 with `no_leader' or `noproc',
+%% and the run has no epoch until the next `recover' operation. A
+%% ClusterController recruits again after a failed recovery, so a run
+%% with ClusterControllers does not need the wait.
+await_cluster(_Tab, {local, _Pid}, _Attempts) ->
+    ok;
+await_cluster(_Tab, _CState, 0) ->
+    ok;
+await_cluster(Tab, CState = {peace, _Tab, Ids}, Attempts) ->
+    case deadlift_cstate:read(Ids, 200) of
+        {ok, _State} ->
+            true = ets:insert(Tab, {cluster_ready, true}),
+            ok;
+        {error, _Reason} ->
+            ok = timer:sleep(20),
+            await_cluster(Tab, CState, Attempts - 1)
     end.
 
 %% The StorageServers that the table of the run has.
