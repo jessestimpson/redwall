@@ -87,6 +87,10 @@ faults_test_() ->
         ?assert(maps:get(kills_sequencer, Stats, 0) > 100, Stats),
         ?assert(maps:get(kills_proxy, Stats, 0) > 100, Stats),
         ?assert(maps:get(kills_resolver, Stats, 0) > 100, Stats),
+        %% The harness killed StorageServers, and clients read from a
+        %% StorageServer that started after a kill.
+        ?assert(maps:get(kills_storage, Stats, 0) > 100, Stats),
+        ?assert(maps:get(reads_after_restart, Stats, 0) > 1000, Stats),
         %% Clients read values, and the StorageServer removed writes that a
         %% recovery discarded.
         ?assert(maps:get(reads, Stats, 0) > 5000, Stats),

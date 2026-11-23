@@ -46,6 +46,10 @@
 %%   the middle of a recovery.</li>
 %% <li>`{kill_proxy, R}': kill one Proxy.</li>
 %% <li>`{kill_resolver, R}': kill the Resolver of one epoch.</li>
+%% <li>`kill_storage': kill the StorageServer, and start a new
+%%   StorageServer without data on a new node. The new StorageServer reads
+%%   every record from the LogServers of every epoch. A client that starts
+%%   after the kill reads from the new StorageServer.</li>
 %% <li>`{partition, R1, R2}': cut the connection between two nodes. Each
 %%   side receives `noconnection' for its monitors on the other side.</li>
 %% <li>`heal': remove every cut.</li>
@@ -138,7 +142,7 @@
 %% <li>The coordinated state is one process that is never killed. The run
 %%   has no peace cluster.</li>
 %% <li>A killed process does not start again. A LogServer has no disk.</li>
-%% <li>The run does not kill the StorageServer.</li>
+%% <li>The run has one StorageServer at a time.</li>
 %% <li>deadlift does not send a message again. A lost message to a
 %%   LogServer stops the commits of the epoch until the next recovery.
 %%   FoundationDB runs on TCP, and treats a broken connection as a failure
@@ -174,17 +178,15 @@ init(_Seed, Config) ->
     %% The topology is declared before any process creates a monitor.
     ok = eta_net:place(coordinators, [CState]),
     ok = eta_net:place(clients, []),
-    {ok, Storage} = deadlift_storage:start(#{
-        coordinators => {local, CState},
-        poll_ms => 100,
-        rollback => Mode =/= no_rollback
-    }),
-    ok = eta_net:place(storage, [Storage]),
-    true = ets:insert(Tab, [{{node, coordinators}, true}, {{node, clients}, true}, {{node, storage}, true}, {storage, Storage}]),
+    true = ets:insert(Tab, [{{node, coordinators}, true}, {{node, clients}, true}]),
+    Storage = start_storage(Tab, CState, Mode, 0, 0),
+    ok = eta_net:place(deadlift_dst_client:storage_node(0), [Storage]),
     {ok, #{
         tab => Tab,
         registry => Registry,
         cstate => CState,
+        %% The first StorageServer. The table of the run has the
+        %% StorageServer that runs.
         storage => Storage,
         mode => Mode,
         faults => maps:get(faults, Config, true),
@@ -198,7 +200,28 @@ init(_Seed, Config) ->
 %% order of their start. The scheduler adopts the Sequencers, the Proxies
 %% and the LogServers as children of the processes that start them.
 processes(#{registry := Registry, cstate := CState, storage := Storage, ops := Ops}) ->
-    [Registry, CState, Storage | [Pid || Pid <- Ops, is_process_alive(Pid)]].
+    [Registry, CState | [Pid || Pid <- [Storage | Ops], is_process_alive(Pid)]].
+
+%% Starts a StorageServer. `N' is the number of the operation, and
+%% `Generation' is the number of StorageServers before this one. A new
+%% StorageServer has no data. It reads every record from the LogServers of
+%% every epoch. The StorageServer runs on the node `storage_N'. After a
+%% kill, an operation process on that node calls this function, and the
+%% StorageServer starts on the node of that process.
+start_storage(Tab, CState, Mode, N, Generation) ->
+    {ok, Storage} = deadlift_storage:start(#{
+        coordinators => {local, CState},
+        poll_ms => 100,
+        rollback => Mode =/= no_rollback
+    }),
+    Node = deadlift_dst_client:storage_node(N),
+    true = ets:insert(Tab, [{{node, Node}, true}, {{storage_started, N}, Storage}, {storage, Storage, Generation, Node}]),
+    Storage.
+
+%% The StorageServer that the table of the run has.
+storage(Tab) ->
+    [{storage, Storage, _Generation, _Node}] = ets:lookup(Tab, storage),
+    Storage.
 
 %% The first operation of a run is a recovery, which creates epoch 1.
 generate(#{n := 0}, Rand) ->
@@ -219,7 +242,8 @@ generate(#{faults := Faults}, Rand0) ->
             Roll < 0.96 -> {kill_sequencer, R};
             Roll < 0.97 -> {kill_proxy, R};
             Roll < 0.975 -> {kill_resolver, R};
-            Roll < 0.985 -> partition;
+            Roll < 0.98 -> kill_storage;
+            Roll < 0.988 -> partition;
             true -> heal
         end,
     case Op of
@@ -290,6 +314,23 @@ execute({kill_resolver, R}, _N, S = #{tab := Tab}) ->
             true = ets:insert(Tab, {{killed_resolver, N}, true}),
             kill(deadlift_dst_client:resolver_node(N), kills_resolver, S)
     end;
+execute(kill_storage, N, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
+    [{storage, Storage, Generation, Node}] = ets:lookup(Tab, storage),
+    case is_process_alive(Storage) of
+        true ->
+            %% The rollbacks of the StorageServer that the harness kills.
+            case eta_observe:read(Storage) of
+                #{rollbacks := Rollbacks} -> bump(rollbacks, Rollbacks);
+                _ -> ok
+            end,
+            S1 = kill(Node, kills_storage, S),
+            %% An operation process starts the new StorageServer, because a
+            %% process starts only in a step of the scheduler.
+            spawn_op(deadlift_dst_client:storage_node(N), fun() -> start_storage(Tab, CState, Mode, N, Generation + 1) end, S1);
+        false ->
+            %% The StorageServer after the last kill has not started.
+            S
+    end;
 execute({partition, R1, R2}, _N, S = #{tab := Tab}) ->
     Nodes = [Node || [Node] <- ets:match(Tab, {{node, '$1'}, '_'})],
     case {pick(R1, Nodes), pick(R2, Nodes)} of
@@ -304,7 +345,8 @@ execute(heal, _N, S) ->
     ok = eta_net:heal_all(),
     S.
 
-check(#{tab := Tab, cstate := CState, storage := Storage}) ->
+check(#{tab := Tab, cstate := CState}) ->
+    Storage = storage(Tab),
     Acks = [{C, Epoch, LSN} || [C, Epoch, LSN] <- ets:match(Tab, {{ack, '$1'}, '$2', '$3'})],
     Logs = logs(),
     first_violation([
@@ -319,7 +361,8 @@ check(#{tab := Tab, cstate := CState, storage := Storage}) ->
         fun() -> chain(Logs) end
     ]).
 
-terminate(#{tab := Tab, registry := Registry, cstate := CState, storage := Storage, ops := Ops}) ->
+terminate(#{tab := Tab, registry := Registry, cstate := CState, ops := Ops}) ->
+    Storage = storage(Tab),
     ok = record_stats(Tab),
     case eta_observe:read(Storage) of
         #{rollbacks := Rollbacks} -> bump(rollbacks, Rollbacks);
@@ -332,7 +375,7 @@ terminate(#{tab := Tab, registry := Registry, cstate := CState, storage := Stora
     %% LogServer after the harness has read the registry.
     ok = kill_all(Started ++ Ops),
     ok = kill_all([Pid || {_Id, Pid} <- log_pids()]),
-    ok = kill_all([Storage, CState, Registry]),
+    ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})] ++ [CState, Registry]),
     ok = await_unregistered(1000),
     catch ets:delete(Tab),
     ok.
@@ -389,6 +432,9 @@ record_stats(Tab) ->
     Repeated = LSNs -- lists:usort(LSNs),
     bump(batched, length([LSN || LSN <- LSNs, lists:member(LSN, Repeated)])),
     bump(reads, length([x || [#{values := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
+    %% The transactions with reads from a StorageServer that the harness
+    %% started after a kill.
+    bump(reads_after_restart, length([x || [#{values := [_ | _], storage := G}] <- ets:match(Tab, {{read, '_'}, '$1'}), G > 0])),
     bump(range_reads, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
     %% The acknowledged transactions with a read range.
     bump(range_acks, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{txn, '_'}, '$1'})])),

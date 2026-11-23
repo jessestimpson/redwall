@@ -9,7 +9,7 @@
 -include("deadlift_eta.hrl").
 
 -export([recover/4, transaction/5]).
--export([sequencer_node/1, proxy_node/1, log_node/1, resolver_node/1, keys/0]).
+-export([sequencer_node/1, proxy_node/1, log_node/1, resolver_node/1, storage_node/1, keys/0]).
 
 %% Starts a Sequencer, waits for the end of its recovery, and starts a
 %% Proxy for the new epoch. This is the work of a ClusterController, which
@@ -145,8 +145,8 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
             true = ets:insert(Tab, {{read, C}, Read}),
             case read_keys(Tab, Reads, Ranges, ReadVersion) of
-                {ok, Values} ->
-                    true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges}}),
+                {ok, Values, Generation} ->
+                    true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation}}),
                     commit(Tab, C, Read, {Reads, Ranges}, Writes, Chosen, R);
                 {error, _Reason} ->
                     true = ets:insert(Tab, {{no_read, C}, ReaderEpoch})
@@ -158,10 +158,13 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
 %% Reads the keys from the StorageServer at the read version. The result
 %% has `{Key, not_found}' or `{Key, {Value, Written}}' for each key.
 read_keys(Tab, Keys, Ranges, ReadVersion) ->
-    [{storage, Storage}] = ets:lookup(Tab, storage),
-    case read_each(Storage, Keys, ReadVersion, []) of
-        {ok, Values} -> read_ranges(Storage, Ranges, ReadVersion, Values);
-        Error -> Error
+    %% The StorageServer that runs. The harness starts a new one after a
+    %% kill. `Generation' is the number of StorageServers before this one.
+    [{storage, Storage, Generation, _Node}] = ets:lookup(Tab, storage),
+    maybe
+        {ok, Values0} ?= read_each(Storage, Keys, ReadVersion, []),
+        {ok, Values} ?= read_ranges(Storage, Ranges, ReadVersion, Values0),
+        {ok, Values, Generation}
     end.
 
 %% Reads the ranges from the StorageServer. Adds a result for each key of
@@ -262,6 +265,10 @@ sequencer_node(N) -> list_to_atom("sequencer_" ++ integer_to_list(N)).
 proxy_node(N) -> list_to_atom("proxy_" ++ integer_to_list(N)).
 
 resolver_node(N) -> list_to_atom("resolver_" ++ integer_to_list(N)).
+
+%% The node of the StorageServer that the operation `N' started. The first
+%% StorageServer has the number 0.
+storage_node(N) -> list_to_atom("storage_" ++ integer_to_list(N)).
 
 log_node({Epoch, Index}) ->
     list_to_atom("log_" ++ integer_to_list(Epoch) ++ "_" ++ integer_to_list(Index)).

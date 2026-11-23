@@ -385,7 +385,7 @@ of eta. The harness is [dst/deadlift_dst.erl](dst/deadlift_dst.erl).
 The simulated system has one process for the coordinated state
 ([deadlift_cstate_local](src/deadlift_cstate_local.erl)) in the place of a
 peace cluster, 3 LogServers for each epoch and a replication degree of 2.
-One StorageServer runs for the whole run. The coordinated state, the
+One StorageServer runs at a time. The coordinated state, the
 StorageServer, each Sequencer, each Proxy, each Resolver and each
 LogServer run on a simulated node of their own. The network loses 0.1% of the messages
 between nodes and delays 20% of them.
@@ -402,6 +402,8 @@ The workload has these operations:
 - kill a Sequencer, also during its recovery;
 - kill a Proxy;
 - kill the Resolver of an epoch;
+- kill the StorageServer, and start a new StorageServer without data,
+  which reads every record from the LogServers of every epoch;
 - cut the connection between two nodes, and remove every cut.
 
 The harness checks these invariants after every step:
@@ -426,16 +428,16 @@ Results of `make dst` on 2026-11-22:
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
 | No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 9,558 acknowledged transactions, of which 2,223 with a read range and 2,169 in a batch with another acknowledged transaction, 9,265 rejected for a conflict, 1,887 too old, 22,132 transactions with reads from the StorageServer, 2,279 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 2,407 acknowledged transactions, of which 457 with a read range and 398 in a batch with another acknowledged transaction, 3,234 rejected for a conflict, 3,258 too old, 23,772 transactions with reads from the StorageServer, 419 rollbacks of the StorageServer, 5,989 recoveries, 2,946 kills, 685 partitions |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 3, `durable`, the counterexample of `RecoveryAckReplicasOnly`. In 40 seeds the defect also violates `kcv_below_dv` |
+| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 2,429 acknowledged transactions, of which 438 with a read range and 401 in a batch with another acknowledged transaction, 3,213 rejected for a conflict, 3,122 too old, 23,274 transactions with reads from the StorageServer, of which 7,130 from a StorageServer that started after a kill, 386 rollbacks of the StorageServer, 5,997 recoveries, 3,276 kills, of which 347 of the StorageServer, 566 partitions |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 4, `durable` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `read_version_order` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
 | Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 2, `no_conflict` |
 | Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 3, `no_conflict` between the transactions with the indexes 0 and 1 of one batch |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 3, `no_conflict` between a transaction of epoch 15 and a write of epoch 12 |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 1, `no_conflict` between a transaction of epoch 16 and a write of epoch 15 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 1, `read_version_order`: a Proxy of epoch 12 gave a read version below a commit of epoch 13 |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 18, `read_version_order`: a Proxy of epoch 10 gave a read version below a commit of epoch 11 |
 | Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 3, `storage_rollback` |
 
 The suite takes about 10 minutes. A run has about 5,000 steps. Before the
@@ -510,7 +512,9 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - deadlift has no operation that clears a key range.
 - A read does not check the range of the MVCC window. The StorageServer
   answers a read at any version at or below its version.
-- The simulation has one StorageServer and does not kill it.
+- The simulation has one StorageServer at a time. A new StorageServer
+  starts without data after a kill. The simulation kills at most 1
+  LogServer of each epoch, so a LogServer with each body runs.
 - A request for a read version waits until the timeout of the client
   when a message to a LogServer or its answer is lost. The Proxy does not
   send the message again.

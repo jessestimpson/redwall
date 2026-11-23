@@ -76,7 +76,7 @@ commits and recoveries, and no run violates an invariant.
       content.
 - [x] Limit the versions in flight in the Sequencer, so that a discarded
       record has an LSN below every version of the next epoch.
-- [ ] Kill the StorageServer in the simulation and start a new one.
+- [x] Kill the StorageServer in the simulation and start a new one.
 - [ ] Reduce the time of the simulation suite. It takes about 10 minutes
       since the StorageServer is part of a run.
 - [ ] Keep only the versions of the MVCC window in the StorageServer.
