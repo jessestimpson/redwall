@@ -18,7 +18,10 @@
 %%   database (see `db_info/0').</li>
 %% <li>The worker reads the coordinated state again every `poll_ms'
 %%   (default 1000 ms), and at once when the ClusterController stops or
-%%   the connection to its node ends.</li>
+%%   the connection to its node ends. While no ClusterController has
+%%   answered, the worker reads after 10 ms, and doubles the time with
+%%   each read up to `poll_ms'. A worker therefore registers within some
+%%   10 ms of the election of a ClusterController.</li>
 %% <li>The worker sends a registration after each read at the interval,
 %%   also when the ClusterController has answered. The ClusterController
 %%   answers each registration with the information about the database.
@@ -119,6 +122,9 @@
 
 -define(TABLE, ?MODULE).
 -define(ROLE_TIMEOUT_MS, 5000).
+%% The first time between two polls while no ClusterController has
+%% answered. The time doubles with each poll, up to `poll_ms'.
+-define(FAST_MS, 10).
 
 -record(state, {
     options :: options(),
@@ -135,6 +141,10 @@
     %% ClusterController that it knows.
     reader :: reference() | undefined,
     again = false :: boolean(),
+    %% The timer of the next poll, and the time until the next poll while
+    %% no ClusterController has answered.
+    timer :: reference() | undefined,
+    fast_ms = ?FAST_MS :: pos_integer(),
     %% A copy of the information in the ETS table.
     db_info :: db_info() | undefined
 }).
@@ -235,9 +245,8 @@ handle_info({'EXIT', Candidate, Reason}, State = #state{candidate = Candidate}) 
     %% The candidate stopped. The worker stops too, so that a supervisor
     %% starts both again.
     {stop, {candidate, Reason}, State#state{candidate = undefined}};
-handle_info(poll, State = #state{options = Options}) ->
-    _ = erlang:send_after(maps:get(poll_ms, Options, 1000), self(), poll),
-    {noreply, find(State#state{again = true})};
+handle_info(poll, State) ->
+    {noreply, find(schedule(State#state{again = true}))};
 handle_info({'DOWN', Reader, process, _Pid, Reason}, State = #state{reader = Reader, again = Again}) ->
     State1 = State#state{reader = undefined, again = false},
     case Reason of
@@ -248,9 +257,26 @@ handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{monitor = 
     %% The ClusterController stopped, or the connection to its node ended.
     %% The worker registers again when the coordinated state has another
     %% term, or at the next poll with the same ClusterController.
-    {noreply, find(State#state{monitor = undefined, registered = false})};
+    %% The next poll is soon, so that the worker registers with a new
+    %% ClusterController shortly after its election.
+    {noreply, find(schedule(State#state{monitor = undefined, registered = false, fast_ms = ?FAST_MS}))};
 handle_info(_Message, State) ->
     {noreply, State}.
+
+%% Starts the timer of the next poll. A worker with an answer of the
+%% ClusterController polls every `poll_ms'. A worker without an answer
+%% polls after 10 ms, and doubles the time with each poll up to `poll_ms',
+%% so that it registers shortly after the election of a
+%% ClusterController.
+schedule(State = #state{options = Options, timer = Timer, registered = Registered, fast_ms = Fast}) ->
+    _ = is_reference(Timer) andalso erlang:cancel_timer(Timer),
+    PollMs = maps:get(poll_ms, Options, 1000),
+    case Registered of
+        true ->
+            State#state{timer = erlang:send_after(PollMs, self(), poll), fast_ms = ?FAST_MS};
+        false ->
+            State#state{timer = erlang:send_after(min(Fast, PollMs), self(), poll), fast_ms = min(PollMs, Fast * 2)}
+    end.
 
 %% Starts a process that reads the coordinated state, if no read is in
 %% progress.

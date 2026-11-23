@@ -22,6 +22,11 @@
 %% Each record has its body on k of the LogServers. The StorageServer
 %% applies a record when it has received the body.
 %%
+%% While the StorageServer has no log system, or a LogServer of its epoch
+%% is stopped, it reads the coordinated state after 10 ms, and doubles the
+%% time with each read up to `poll_ms'. It then follows the first epoch
+%% and the epoch after a recovery within some 10 ms.
+%%
 %% At an interval of `poll_ms', the StorageServer sends a request to each
 %% LogServer of the epoch that has received none, because a LogServer can
 %% start after the first request. At every tenth interval, the
@@ -113,6 +118,34 @@
 %%   and a rise of the oldest version examines only the versions that
 %%   leave the MVCC window.</li>
 %% </ul>
+%%
+%% == Select ==
+%%
+%% `select/7' and the query `{select, Begin, End, MatchSpec, Limit}' of
+%% `read_direct/3' evaluate an ETS match spec on the keys of a range at a
+%% read version. The match spec is for rows `{Key, Value}'. The result is
+%% the result of `ets:match_spec_run/2' on the result of a read of the
+%% range, with the key of each row: `{Key, Result}'.
+%%
+%% <ul>
+%% <li>The StorageServer reads the rows of the range in the order of the
+%%   keys with `ets:next_lookup/2', takes the value of each key at the
+%%   read version, and runs the match spec on batches of 100 rows. It
+%%   reads no row outside the range, and stops at `Limit' results.</li>
+%% <li>A benchmark on 2026-11-23 compared this walk with `ets:select/2'.
+%%   A select with guards on the key for the range reads every row of the
+%%   table: 20 ms for a table of 1,000,000 rows and a range of 100 keys,
+%%   against 6 us for the walk. See "Select" in README.md.</li>
+%% <li>For a read by message, a temporary process performs the select as
+%%   a direct read and answers the client. The StorageServer applies
+%%   records in that time.</li>
+%% <li>A match spec cannot call a function of a module, so a client cannot
+%%   run its own code in the StorageServer.</li>
+%% </ul>
+%%
+%% Only this StorageServer, with its ETS tables, has the select. Its
+%% handle has the feature `select'. FoundationDB has no such read. This
+%% part is not in the paper.
 %%
 %% == Direct reads ==
 %%
@@ -209,6 +242,7 @@
 -export([read/3, read/4, read_with_version/4, info/1]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([handle/1, read_direct/3, versions/1]).
+-export([select/7, select_rows/2]).
 -export_type([handle/0, query/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -239,9 +273,26 @@
 %% The table of the data and the published versions of a StorageServer.
 %% Element 1 of `published' is the version, and element 2 is the oldest
 %% version. `wait' is `false' only with the planted defect `wait => false'.
--type handle() :: #{data := ets:tid(), history := ets:tid(), published := atomics:atomics_ref(), wait => boolean()}.
+-type handle() :: #{
+    data := ets:tid(),
+    history := ets:tid(),
+    published := atomics:atomics_ref(),
+    wait => boolean(),
+    features => [select]
+}.
 
--type query() :: {key, term()} | {range, term(), term()}.
+-type query() ::
+    {key, term()}
+    | {range, term(), term()}
+    | {select, Begin :: term(), End :: term(), ets:match_spec(), Limit :: pos_integer() | infinity}.
+
+%% The number of rows that a select reads before it runs the match spec
+%% on them.
+-define(SELECT_BATCH, 100).
+
+%% The first time until an early read of the coordinated state. The time
+%% doubles with each such read, up to `poll_ms'.
+-define(REFRESH_MS, 10).
 
 -record(state, {
     coordinators :: deadlift_cstate:servers(),
@@ -291,7 +342,11 @@
     %% The number of rollbacks.
     rollbacks = 0 :: non_neg_integer(),
     %% The number of intervals of `poll_ms' since the start.
-    ticks = 0 :: non_neg_integer()
+    ticks = 0 :: non_neg_integer(),
+    %% The timer of the next early read of the coordinated state, and the
+    %% time until it.
+    refresh_timer :: reference() | undefined,
+    refresh_ms = ?REFRESH_MS :: pos_integer()
 }).
 
 -define(TIMEOUT_MS, 5000).
@@ -376,6 +431,29 @@ read_range_with_version(Storage, Begin, End, Version, Timeout) ->
         exit:Reason -> {error, Reason}
     end.
 
+%% @doc Evaluates a match spec on the keys of the range `{Begin, End}' at
+%% the read version `Version'. See "Select" in the module documentation.
+%% The match spec is for rows `{Key, Value}'. The result has `{Key,
+%% Result}' for each row that matches, in the order of the keys, where
+%% `Result' is the result of the body of the match spec. With a `Limit',
+%% the result has the first `Limit' of them. The errors are the errors of
+%% `read/4'.
+-spec select(gen_server:server_ref(), term(), term(), ets:match_spec(), pos_integer() | infinity, version(), timeout()) ->
+    {ok, [{term(), term()}]} | {error, term()}.
+select(Storage, Begin, End, MatchSpec, Limit, Version, Timeout) ->
+    try
+        gen_server:call(Storage, {select, Begin, End, MatchSpec, Limit, Version}, Timeout)
+    catch
+        exit:Reason -> {error, Reason}
+    end.
+
+%% @doc Runs the match spec on the rows `{Key, Value}', and returns
+%% `{Key, Result}' for each row that matches. The client uses this
+%% function for the writes of a transaction that is not committed.
+-spec select_rows([{term(), term()}], ets:match_spec()) -> [{term(), term()}].
+select_rows(Rows, MatchSpec) ->
+    ets:match_spec_run(Rows, ets:match_spec_compile(with_key(MatchSpec))).
+
 %% @doc Returns the handle for direct reads, or an error if the
 %% StorageServer does not answer.
 -spec handle(gen_server:server_ref()) -> {ok, handle()} | {error, term()}.
@@ -459,8 +537,10 @@ handle_call({read, Key, Version}, From, State) ->
     read_at({key, Key}, Version, From, State);
 handle_call({read_range, Begin, End, Version}, From, State) ->
     read_at({range, Begin, End}, Version, From, State);
-handle_call(handle, _From, State = #state{data = Data, history = History, published = Published}) ->
-    {reply, #{data => Data, history => History, published => Published, wait => State#state.wait}, State};
+handle_call({select, Begin, End, MatchSpec, Limit, Version}, From, State) ->
+    read_at({select, Begin, End, MatchSpec, Limit}, Version, From, State);
+handle_call(handle, _From, State) ->
+    {reply, handle_of(State), State};
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
     Epoch =
         case System of
@@ -497,12 +577,18 @@ handle_info(poll, State = #state{poll_ms = PollMs, system = System, stopped = St
             0 -> tail_all(State1);
             _ -> tail_new(State1)
         end,
-    {noreply, State2#state{ticks = Ticks}};
+    {noreply, watch(State2#state{ticks = Ticks})};
+handle_info(refresh, State = #state{poll_ms = PollMs, refresh_ms = Ms}) ->
+    State1 = refresh(State#state{refresh_timer = undefined}),
+    case waits_for_epoch(State1) of
+        true -> {noreply, watch(State1#state{refresh_ms = min(PollMs, Ms * 2)})};
+        false -> {noreply, State1#state{refresh_ms = ?REFRESH_MS}}
+    end;
 handle_info(Message, State = #state{requests = Requests}) ->
     case gen_server:check_response(Message, Requests, true) of
         {{reply, {ok, Records, Stopped, KCV}}, Label, Requests1} ->
             State1 = State#state{requests = Requests1, kcv = max(KCV, State#state.kcv)},
-            {noreply, advance_oldest(received(Label, Records, Stopped, State1))};
+            {noreply, watch(advance_oldest(received(Label, Records, Stopped, State1)))};
         {_ErrorOrOtherReply, _Label, Requests1} ->
             {noreply, State#state{requests = Requests1}};
         _NoRequestOrNoReply ->
@@ -512,6 +598,25 @@ handle_info(Message, State = #state{requests = Requests}) ->
 %% ---------------------------------------------------------------------------
 %% Epochs
 %% ---------------------------------------------------------------------------
+
+%% Whether the StorageServer has no log system to read: it has none yet,
+%% or a LogServer of its epoch is stopped and the next epoch is not known.
+waits_for_epoch(#state{system = System, stopped = Stopped}) ->
+    System =:= undefined orelse Stopped =/= [].
+
+%% Starts the timer of an early read of the coordinated state, if the
+%% StorageServer waits for an epoch. The first epoch and the epoch after a
+%% recovery are in the coordinated state some milliseconds after the
+%% start of the recovery. With a read only at the interval `poll_ms', a
+%% read of a client waits for up to `poll_ms' in that time. The early
+%% read is after 10 ms, and the time doubles up to `poll_ms'.
+watch(State = #state{refresh_timer = undefined, poll_ms = PollMs, refresh_ms = Ms}) ->
+    case waits_for_epoch(State) of
+        true -> State#state{refresh_timer = erlang:send_after(min(Ms, PollMs), self(), refresh)};
+        false -> State#state{refresh_ms = ?REFRESH_MS}
+    end;
+watch(State) ->
+    State.
 
 %% Reads the log systems from the coordinated state, and updates the log
 %% system that the StorageServer reads.
@@ -810,16 +915,42 @@ delete_older(_RowOfAnotherKeyOrEndOfTable, _Key, _History) ->
 %% has the version.
 read_at(_Query, Version, _From, State = #state{oldest = Oldest, check_window = true}) when Version < Oldest ->
     {reply, {error, transaction_too_old}, State};
-read_at(Query, Version, _From, State = #state{version = Mine, wait = Wait}) when Version =< Mine; not Wait ->
-    {reply, lookup(Query, Version, {State#state.data, State#state.history}), State};
+read_at(Query, Version, From, State = #state{version = Mine, wait = Wait}) when Version =< Mine; not Wait ->
+    ok = answer(From, Query, Version, State),
+    {noreply, State};
 read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
     {noreply, State#state{waiting = [{From, Query, Version} | Waiting]}}.
 
 answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
     {Ready, Later} = lists:partition(fun({_From, _Query, V}) -> V =< Version end, Waiting),
-    Tables = {State#state.data, State#state.history},
-    lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, Tables)) end, Ready),
+    lists:foreach(fun({From, Query, V}) -> answer(From, Query, V, State) end, Ready),
     State#state{waiting = Later}.
+
+%% Answers a read at a version that the StorageServer has applied. A
+%% select can read many rows, so a temporary process performs it as a
+%% direct read, and the StorageServer applies records in that time.
+answer(From, Query = {select, _Begin, _End, _MatchSpec, _Limit}, Version, State) ->
+    Handle = handle_of(State),
+    _ = spawn(fun() ->
+        Reply =
+            try read_direct(Handle, Query, Version) of
+                {ok, Result} -> Result;
+                too_old -> {error, transaction_too_old};
+                Other -> {error, Other}
+            catch
+                error:badarg -> {error, badarg}
+            end,
+        gen_server:reply(From, Reply)
+    end),
+    ok;
+answer(From, Query, Version, State) ->
+    gen_server:reply(From, lookup(Query, Version, {State#state.data, State#state.history})),
+    ok.
+
+%% The handle for direct reads. `features' has the kinds of read that this
+%% StorageServer supports in addition to keys and ranges.
+handle_of(#state{data = Data, history = History, published = Published, wait = Wait}) ->
+    #{data => Data, history => History, published => Published, wait => Wait, features => [select]}.
 
 lookup({key, Key}, Version, {Data, History}) ->
     case ets:lookup(Data, Key) of
@@ -830,7 +961,56 @@ lookup({range, Begin, End}, Version, {Data, History}) ->
     {ok, [
         {Key, Value, Written}
      || Row = {Key, _Newest, _Change} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Row, Version, Data, History)]
-    ]}.
+    ]};
+lookup({select, Begin, End, MatchSpec, Limit}, Version, {Data, History}) ->
+    Compiled = ets:match_spec_compile(with_key(MatchSpec)),
+    First =
+        case ets:lookup(Data, Begin) of
+            [Row] -> {Begin, [Row]};
+            [] -> ets:next_lookup(Data, Begin)
+        end,
+    {ok, select_walk(First, End, Version, {Data, History}, Compiled, Limit, [], 0, [], 0)}.
+
+%% Reads the rows of the range in the order of the keys, and runs the
+%% match spec on batches of `{Key, Value}' with the value of each key at
+%% `Version'. The function reads only the rows of the range, and stops
+%% when it has `Limit' results. `Batch' has the rows of the open batch,
+%% and `Acc' has the results of the earlier batches, both with the last
+%% one first.
+select_walk({Key, [Row]}, End, Version, Tables = {Data, History}, Compiled, Limit, Batch, Size, Acc, Count) when Key < End ->
+    Batch1 =
+        case visible(Row, Version, Data, History) of
+            {ok, Value, _Written} -> [{Key, Value} | Batch];
+            not_found -> Batch
+        end,
+    Next = ets:next_lookup(Data, Key),
+    case Size + 1 of
+        ?SELECT_BATCH ->
+            Results = ets:match_spec_run(lists:reverse(Batch1), Compiled),
+            case Count + length(Results) of
+                Enough when Enough >= Limit -> select_results([Results | Acc], Limit);
+                Count1 -> select_walk(Next, End, Version, Tables, Compiled, Limit, [], 0, [Results | Acc], Count1)
+            end;
+        Size1 ->
+            select_walk(Next, End, Version, Tables, Compiled, Limit, Batch1, Size1, Acc, Count)
+    end;
+select_walk(_RowAtOrAfterEndOrEndOfTable, _End, _Version, _Tables, Compiled, Limit, Batch, _Size, Acc, _Count) ->
+    select_results([ets:match_spec_run(lists:reverse(Batch), Compiled) | Acc], Limit).
+
+select_results(Acc, infinity) -> lists:append(lists:reverse(Acc));
+select_results(Acc, Limit) -> lists:sublist(lists:append(lists:reverse(Acc)), Limit).
+
+%% The match spec with the key of the row in each result: the result of a
+%% clause is `{Key, Result}', where `Result' is the result of the body of
+%% the caller. The row of the match spec is `{Key, Value}', so the key is
+%% the first element of `$_'.
+with_key(MatchSpec) when is_list(MatchSpec) ->
+    [
+        {Head, Guards, lists:droplast(Body) ++ [{{{element, 1, '$_'}, lists:last(Body)}}]}
+     || {Head, Guards, Body = [_ | _]} <- MatchSpec
+    ];
+with_key(_NoList) ->
+    error(badarg).
 
 %% The value of the last version of the key at or below `Version'. `Row'
 %% is the row of the key, which has the newest version. An older version

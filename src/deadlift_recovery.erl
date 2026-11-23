@@ -115,6 +115,10 @@
 %%   answered the lock, and none of them has the body of a record that the
 %%   recovery must copy.</li>
 %% <li>`{error, {recruit, Reason}}': a new LogServer did not start.</li>
+%% <li>`{error, {write_unknown, Reason}}': the write of the new log system
+%%   to the coordinated state had no answer. The coordinated state has the
+%%   new log system or does not have it. The recovery does not stop the
+%%   new LogServers in this case.</li>
 %% <li>`{error, Reason}': an operation on the coordinated state failed.</li>
 %% </ul>
 -spec recover(options()) -> {ok, result()} | {error, term()}.
@@ -138,9 +142,17 @@ recover(Options = #{coordinators := Coordinators, logs := M, replication := K}) 
                     recovery_version => RV,
                     previous_epoch_end_version => PEV
                 }};
-            {error, Reason} ->
+            {error, Reason} when Reason =:= badarg; element(1, Reason) =:= count ->
+                %% The coordinated state refused the write. No log system
+                %% names the new LogServers.
                 stop_logs(Logs),
-                {error, Reason}
+                {error, Reason};
+            {error, Reason} ->
+                %% The write has no answer, so the coordinated state can
+                %% have the new log system. The new LogServers continue:
+                %% if the coordinated state names them, the next recovery
+                %% needs them.
+                {error, {write_unknown, Reason}}
         end
     end.
 

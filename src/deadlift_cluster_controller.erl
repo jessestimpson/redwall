@@ -30,6 +30,10 @@
 %%   again.</li>
 %% </ol>
 %%
+%% A candidate polls again after 10 ms when the coordinated state did not
+%% answer, and doubles the time up to `poll_ms'. A peace cluster has no
+%% leader directly after its start, and does not answer in that time.
+%%
 %% A separate process performs each read and each proposal, with a limit
 %% of `cstate_timeout_ms' (default 1000 ms). The candidate or the leader
 %% answers its other messages in that time. If the answer to a proposal
@@ -164,6 +168,11 @@
 %% `{recovered, Result}' has the result of the recovery
 %% (`deadlift_recovery:result()') with the key `proxy'.
 
+%% The first time until the next poll of a candidate after the coordinated
+%% state did not answer. The time doubles with each such poll, up to
+%% `poll_ms'.
+-define(RETRY_MS, 10).
+
 -record(generation, {
     attempt :: pos_integer(),
     %% The process that waits for the recovery, with its monitor.
@@ -189,6 +198,10 @@
     %% The monitor of the process that reads the coordinated state or
     %% proposes this process.
     job :: reference() | undefined,
+    %% The timer of the next poll, and the time until the next poll of a
+    %% candidate after the coordinated state did not answer.
+    timer :: reference() | undefined,
+    retry_ms = ?RETRY_MS :: pos_integer(),
     workers = #{} :: #{pid() => {node(), deadlift_worker:class(), reference()}},
     attempt = 0 :: non_neg_integer(),
     %% Whether the leader waits for `retry_ms' after a failure.
@@ -268,9 +281,9 @@ handle_cast(_Message, State) ->
     {noreply, State}.
 
 %% @private
-handle_info(poll, State = #state{options = Options}) ->
-    _ = erlang:send_after(maps:get(poll_ms, Options, 1000), self(), poll),
-    {noreply, poll(State)};
+handle_info(poll, State = #state{options = Options, timer = Timer}) ->
+    _ = is_reference(Timer) andalso erlang:cancel_timer(Timer),
+    {noreply, poll(State#state{timer = erlang:send_after(maps:get(poll_ms, Options, 1000), self(), poll)})};
 handle_info(recruit, State) ->
     {noreply, maybe_recruit(State#state{waiting = false})};
 handle_info({recruited, Attempt, Role, Pid}, State = #state{role = leader, generation = Generation = #generation{attempt = Attempt, roles = Roles}}) ->
@@ -363,12 +376,23 @@ read(Result, State = #state{options = Options, role = Role, term = Term, known =
             %% and the answer did not arrive.
             lead(Term1, State);
         {ok, #{controller := Known}} ->
-            elect(State);
+            elect(State#state{retry_ms = ?RETRY_MS});
         {ok, #{controller := Controller}} ->
-            elect(watch(Controller, State));
+            elect(watch(Controller, State#state{retry_ms = ?RETRY_MS}));
         _ ->
-            State
+            soon(State)
     end.
+
+%% Polls again soon, after the coordinated state did not answer a
+%% candidate. A peace cluster without a leader does not answer, for
+%% example directly after its start. The time is 10 ms and doubles up to
+%% `poll_ms'.
+soon(State = #state{role = candidate, options = Options, timer = Timer, retry_ms = Retry}) ->
+    _ = is_reference(Timer) andalso erlang:cancel_timer(Timer),
+    PollMs = maps:get(poll_ms, Options, 1000),
+    State#state{timer = erlang:send_after(min(Retry, PollMs), self(), poll), retry_ms = min(PollMs, Retry * 2)};
+soon(State) ->
+    State.
 
 %% Recruits again if the recovery count of the coordinated state is above
 %% the epoch of the leader. Another Sequencer has then raised the count,
@@ -416,7 +440,7 @@ elected(Result, State = #state{role = candidate}) ->
         _ ->
             %% The coordinated state did not answer. The next poll reads
             %% it, and the process proposes itself again.
-            State
+            soon(State)
     end;
 elected(_Result, State) ->
     State.

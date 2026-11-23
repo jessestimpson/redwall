@@ -565,6 +565,53 @@ worker_candidate_test_() ->
         end
     end}.
 
+%% The poll interval of each process is 5 seconds. A node still has an
+%% epoch, a commit and a read in less than 1 second after its start,
+%% because a process that waits polls after 10 ms at first. After the stop
+%% of the process of the epoch, the next epoch, a commit and a read take
+%% less than 1 second too.
+start_time_test_() ->
+    {timeout, 60, fun() ->
+        {ok, CState} = deadlift_cstate_local:start(#{}),
+        Coordinators = {local, CState},
+        Start = erlang:monotonic_time(millisecond),
+        %% The StorageServer starts first, and the coordinated state has
+        %% no epoch.
+        {ok, Storage} = deadlift_storage:start(#{coordinators => Coordinators, poll_ms => 5000}),
+        {ok, Worker} = deadlift_worker:start(#{
+            coordinators => Coordinators,
+            poll_ms => 5000,
+            candidate => #{poll_ms => 5000, retry_ms => 10, proxy => #{versions_per_second => 0}}
+        }),
+        try
+            Db = deadlift:open(#{
+                proxy => fun() ->
+                    case deadlift_worker:db_info() of
+                        #{proxies := [Proxy]} -> Proxy;
+                        _ -> undefined
+                    end
+                end,
+                storage => Storage
+            }),
+            #{epoch := 1, proxies := [First]} = await_epoch(1),
+            ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 1) end),
+            ?assertEqual(1, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
+            Started = erlang:monotonic_time(millisecond) - Start,
+            ?assert(Started < 1000, Started),
+            Kill = erlang:monotonic_time(millisecond),
+            exit(First, kill),
+            #{epoch := 2} = await_epoch(2),
+            ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 2) end),
+            ?assertEqual(2, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
+            Recovered = erlang:monotonic_time(millisecond) - Kill,
+            ?assert(Recovered < 1000, Recovered)
+        after
+            exit(Worker, kill),
+            exit(Storage, kill),
+            exit(CState, kill)
+        end
+    end}.
+
 %% The application starts the worker, with its candidate, and the
 %% StorageServer of the node from its environment. `deadlift:open/0' then
 %% returns a database without the name of a process.

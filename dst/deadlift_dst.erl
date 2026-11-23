@@ -174,6 +174,10 @@
 %%   key, for the versions that both have applied and that are above the
 %%   oldest version of both. The writes that a recovery discarded are not
 %%   compared, because `storage_rollback' covers them.</li>
+%% <li>`select_agrees' - a `deadlift:select/4' of a client returned the
+%%   result of `ets:match_spec_run/2' on the result of `get_range/3' at
+%%   the same read version. A client with a read range evaluates two
+%%   match specs on the range.</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -591,8 +595,17 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> storage_rollback(Tab, Storages, CState) end,
         fun() -> kcv_below_dv(Logs) end,
         fun() -> chain(Logs) end,
-        fun() -> one_leader(Tab) end
+        fun() -> one_leader(Tab) end,
+        fun() -> select_agrees(Tab) end
     ]).
+
+%% A `select/4' of a client returned the result of the match spec on the
+%% result of `get_range/3' at the same read version.
+select_agrees(Tab) ->
+    case ets:match(Tab, {{select_differs, '_'}, '$1'}) of
+        [] -> ok;
+        [[Detail] | _] -> violation(select_agrees, Detail)
+    end.
 
 %% The ClusterController processes that run and are the leader, each with
 %% its term and its information about the database.
@@ -751,6 +764,7 @@ bump(Key, N) ->
 record_stats(Tab) ->
     Epochs = [Epoch || [Epoch] <- ets:match(Tab, {{recovered, '_'}, '$1', '_', '_'})],
     bump(runs),
+    bump(selects, case ets:lookup(Tab, selects) of [{selects, Selects}] -> Selects; [] -> 0 end),
     bump(runs_with_two_leaders, length(ets:lookup(Tab, two_leaders))),
     bump(leaders, length(ets:match(Tab, {{leader, '_'}, '_'}))),
     bump(role_failures, length(ets:match(Tab, {{role_failed, '_'}, '_'}))),

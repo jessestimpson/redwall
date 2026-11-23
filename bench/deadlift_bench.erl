@@ -41,6 +41,11 @@
 %%   when the StorageServer has applied the record.</li>
 %% <li>The mean times of the steps of a batch in the Proxy, from
 %%   `deadlift_epoch:info/1'.</li>
+%% <li>`select': `deadlift:select/4' on a range of 1,000 of 100,000 rows
+%%   with values of 1,000 bytes. 10 rows of a range match. `filter' gives
+%%   the same result with `get_range/3' and the match spec in the client.
+%%   The clients are on the node of the benchmark, or on the node of the
+%%   StorageServer.</li>
 %% <li>The time without an acknowledged commit after the kill of one
 %%   process: a LogServer, the process of the epoch and the
 %%   ClusterController.</li>
@@ -98,6 +103,11 @@ main(Options) ->
         [row(read_by_message, N, run(read, Db, N, Ms)) || N <- [1, 16, 64]],
         Direct = deadlift:open(#{proxy => Proxy, storage => Storage}),
         [row(read_direct, N, erpc:call(StorageNode, ?MODULE, run, [read, Direct, N, Ms], infinity)) || N <- [1, 2, 16]],
+        ok = preload_select(Db),
+        [row(select_by_message, N, run(select, Db, N, Ms)) || N <- [1, 16]],
+        [row(filter_by_message, N, run(filter, Db, N, Ms)) || N <- [1, 16]],
+        [row(select_direct, N, erpc:call(StorageNode, ?MODULE, run, [select, Direct, N, Ms], infinity)) || N <- [1, 2]],
+        [row(filter_direct, N, erpc:call(StorageNode, ?MODULE, run, [filter, Direct, N, Ms], infinity)) || N <- [1, 2]],
         breakdown(Writes, Versions),
         pauses(Cluster),
         io:format("~nThe default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):~n~n"),
@@ -222,6 +232,12 @@ client(Parent, Op, {Db, Histogram}, Measure, End) ->
                 Tx = deadlift:create_transaction(Db),
                 _ = deadlift:get_read_version(Tx),
                 Tx;
+            Scan when Scan =:= select; Scan =:= filter ->
+                %% One read version for every scan of the client. A
+                %% snapshot keeps no read conflict range.
+                Tx = deadlift:create_transaction(Db),
+                _ = deadlift:get_read_version(Tx),
+                deadlift:snapshot(Tx);
             _ ->
                 Db
         end,
@@ -263,6 +279,16 @@ op(read_after_write, Db) ->
     %% The loop measures this whole operation. The row of the table has
     %% the time of the read only, which `read_after_write/1' returns.
     read_after_write(Db);
+op(select, Snapshot) ->
+    {Begin, End} = scan_range(),
+    10 = length(deadlift:select(Snapshot, Begin, End, scan_spec())),
+    1;
+op(filter, Snapshot) ->
+    %% The same result without `select/4': the client reads the range and
+    %% runs the match spec itself.
+    {Begin, End} = scan_range(),
+    10 = length(ets:match_spec_run(deadlift:get_range(Snapshot, Begin, End), ets:match_spec_compile(scan_spec()))),
+    1;
 op(read, Tx) ->
     _ = deadlift:wait(deadlift:get(Tx, rand:uniform(10000))),
     1.
@@ -334,6 +360,41 @@ preload(Db) ->
     %% The StorageServer has applied the last record when a read at a new
     %% read version returns.
     _ = deadlift:transactional(Db, fun(Tx) -> deadlift:wait(deadlift:get(Tx, 10000)) end),
+    ok.
+
+%% A range of 1,000 of the 100,000 rows for `select' and `filter'.
+scan_range() ->
+    First = 1 + 1000 * (rand:uniform(100) - 1),
+    {{scan, First}, {scan, First + 1000}}.
+
+%% The number of each row with the status `active', which 1 row in 100
+%% has.
+scan_spec() ->
+    [{{{scan, '$1'}, #{status => active}}, [], ['$1']}].
+
+%% Writes 100,000 rows with a value of 1,000 bytes for `select' and
+%% `filter'.
+preload_select(Db) ->
+    Blob = binary:copy(<<0>>, 1000),
+    lists:foreach(
+        fun(First) ->
+            ok = deadlift:transactional(Db, fun(Tx) ->
+                lists:foreach(
+                    fun(I) ->
+                        Status =
+                            case I rem 100 of
+                                0 -> active;
+                                _ -> idle
+                            end,
+                        ok = deadlift:set(Tx, {scan, I}, #{status => Status, blob => Blob})
+                    end,
+                    lists:seq(First, First + 499)
+                )
+            end)
+        end,
+        lists:seq(1, 100000, 500)
+    ),
+    _ = deadlift:transactional(Db, fun(Tx) -> deadlift:wait(deadlift:get(Tx, {scan, 100000})) end),
     ok.
 
 header() ->

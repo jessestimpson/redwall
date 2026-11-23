@@ -214,3 +214,57 @@ versions_test() ->
     ?assertEqual({ok, 11}, deadlift_sequencer:next_version(10, 1000, 1000, 10, #{})),
     ?assertEqual({ok, 20010}, deadlift_sequencer:next_version(10, 1000, 21000, 10, #{})),
     ?assertEqual({ok, 5000010}, deadlift_sequencer:next_version(10, 0, 60000000, 10, #{})).
+
+%% The coordinated state applies the write of the new log system, and the
+%% answer does not arrive. The recovery does not stop the new LogServers,
+%% because the coordinated state names them. The next recovery locks them
+%% and succeeds.
+write_without_answer_test_() ->
+    {timeout, 30, fun() ->
+        {ok, CState} = deadlift_cstate_local:start(#{}),
+        Stub = spawn(fun() -> forward(CState) end),
+        Options = #{logs => 3, replication => 2, lock_timeout_ms => 200, cstate_timeout_ms => 100},
+        try
+            ?assertMatch({error, {write_unknown, {timeout, _}}}, deadlift_recovery:recover(Options#{coordinators => {local, Stub}})),
+            {ok, #{count := 1, current := #{epoch := 1, logs := Logs}}} = deadlift_cstate:read({local, CState}),
+            ?assertEqual(3, length([Log || Log <- Logs, deadlift_log:ref(Log) =/= undefined])),
+            ?assertMatch(
+                {ok, #{epoch := 2, recovery_version := 0}},
+                deadlift_recovery:recover(Options#{coordinators => {local, CState}})
+            ),
+            [?assertMatch(#{stopped_by := 2}, deadlift_log:info(deadlift_log:ref(Log))) || Log <- Logs],
+            %% A refused write stops the new LogServers. The recovery
+            %% below locks the count 2, and another recovery raises the
+            %% count before its write.
+            Started = ets:new(started, [public, bag]),
+            Recruit = fun(LogOptions) ->
+                {ok, Pid} = deadlift_log:start(LogOptions),
+                _ =
+                    case ets:insert_new(Started, {raised, true}) of
+                        true -> {ok, 4, _} = deadlift_cstate:lock({local, CState}, 3, other);
+                        false -> ok
+                    end,
+                true = ets:insert(Started, {log, Pid}),
+                {ok, Pid}
+            end,
+            ?assertEqual({error, {count, 4}}, deadlift_recovery:recover(Options#{coordinators => {local, CState}, recruit => Recruit})),
+            ?assertEqual([false, false, false], [is_process_alive(Pid) || {log, Pid} <- ets:lookup(Started, log)])
+        after
+            exit(Stub, kill),
+            exit(CState, kill)
+        end
+    end}.
+
+%% Sends each request to the coordinated state `CState' and returns its
+%% answer, except for a write of a log system: the coordinated state
+%% applies the write, and the caller gets no answer.
+forward(CState) ->
+    receive
+        {'$gen_call', From, Request} ->
+            Reply = gen_server:call(CState, Request),
+            case Request of
+                {propose, {write, _, _, _, _}} -> ok;
+                _ -> gen_server:reply(From, Reply)
+            end,
+            forward(CState)
+    end.

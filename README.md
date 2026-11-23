@@ -153,11 +153,19 @@ section 2.4.4):
    LogServer starts with the DV RV, the KCV PEV and the records of step 4.
 6. The Sequencer writes the new log system to the coordinated state.
 
-The Sequencer then starts the Resolver of the epoch and commits the
-recovery transaction (paper, section 2.4.4). The recovery transaction is
-the first record of the epoch. Its LSN is the first commit version of the
-epoch, and its previous LSN is the RV. The Sequencer sends it to the
-Resolver and to every LogServer of the epoch. The read version at the
+If the coordinated state refuses the write of step 6, the recovery stops
+the new LogServers. If the write has no answer, the recovery fails and
+does not stop them, because the coordinated state can have the new log
+system, and the next recovery then needs its LogServers. Until
+2026-11-23 the recovery stopped the new LogServers in both cases. A
+simulation run with a lost answer then ended with a coordinated state
+whose LogServers were stopped, and no later recovery succeeded.
+
+The Sequencer then commits the recovery transaction (paper, section
+2.4.4). The recovery transaction is the first record of the epoch. Its
+LSN is the first commit version of the epoch, and its previous LSN is the
+RV. The process of the epoch sends it to every LogServer of the epoch,
+and gives its version to the conflict check of the Resolver. The read version at the
 start of an epoch is therefore the LSN of a record that exists, and a
 StorageServer reaches it. The recovery transaction of deadlift has no
 content.
@@ -338,6 +346,58 @@ end).
   | `default` | The values of FoundationDB | 10 | 1,000 | `true` |
   | `ets` | The StorageServer of deadlift, with the data in ETS tables in memory | 1 | 100 | `true` |
   `transactional/2` then runs the function again.
+
+### Select
+
+`deadlift:select/4` evaluates an ETS match spec on the keys of a range,
+and returns the results in the order of the keys:
+
+```erlang
+%% The numbers of the users with the status `active'.
+Spec = [{{{user, '$1'}, #{status => active}}, [], ['$1']}],
+deadlift:transactional(Db, fun(Tx) ->
+    deadlift:select(Tx, {user, 0}, {user, 1000000}, Spec, [{limit, 100}])
+end).
+```
+
+- The match spec is for rows `{Key, Value}`. The result is the result of
+  `ets:match_spec_run/2` on the result of `get_range/3`.
+- The StorageServer evaluates the match spec. A value that does not
+  match does not reach the client, and on the node of the StorageServer
+  it is not copied for the caller.
+- The transaction gets the whole range as a read conflict range, as
+  `get_range/3` does. A write of another transaction to a key of the
+  range that does not match is a conflict too, because the write can
+  make the key match. A select of a snapshot gives no conflict.
+- The function sees the sets and the clears of its transaction.
+- The options are a list. `{limit, N}` returns the first `N` results.
+- The StorageServer walks the rows of the range. The cost of a select
+  grows with the number of keys of the range, and not with the number of
+  results. A select is not an index.
+- Only the StorageServer with ETS tables supports the function. Its
+  handle has the feature `select`. On a StorageServer without the
+  feature, a select on the node of the StorageServer raises
+  `{unsupported, select}`.
+- FoundationDB and erlfdb have no such function. This part is not in the
+  paper.
+
+A benchmark on 2026-11-23 compared three ways to evaluate a match spec
+on a range of an ETS table of the kind `ordered_set` with 1,000,000 rows
+of the StorageServer, of which 1 in 100 matches. The benchmark is not
+part of this repository. The owner of the project chose the walk.
+
+| Keys | Keys of the range | `ets:select/2` with guards for the range (us) | `ets:select/2` with a bound prefix of the key (us) | Walk with `ets:next_lookup/2` (us) |
+|---|---|---|---|---|
+| Integers | 100 | 19,796 | Not possible | 6 |
+| Integers | 10,000 | 20,044 | Not possible | 567 |
+| Integers | 250,000 | 20,003 | Not possible | 13,389 |
+| Tuples, 2 prefixes of 500,000 keys | 100 | 20,671 | 10,755 | 8 |
+| Tuples, 2 prefixes of 500,000 keys | 10,000 | 20,945 | 10,787 | 803 |
+| Tuples, 2 prefixes of 500,000 keys | 250,000 | 20,995 | 10,880 | 21,052 |
+
+A select with guards reads every row of the table, and a select with a
+bound prefix reads every row of the prefix. The walk reads the rows of
+the range.
 
 ### The Proxy
 
@@ -668,6 +728,34 @@ Example, in `sys.config`, for a node that runs every role:
 `deadlift_cstate:machine/0`. The application does not start the peace
 cluster.
 
+### Start time
+
+The times of the steps of a start of one node, with all roles on the
+node, measured on 2026-11-23 in 3 to 5 runs:
+
+| Step | Before | After |
+|---|---|---|
+| The peace cluster has a leader | 1,290 ms to 1,538 ms | 0 ms to 1 ms with `peace:trigger_election/1`, and 1,010 ms to 1,284 ms without it |
+| The worker knows the ClusterController and is registered | 1,002 ms to 1,004 ms | 11 ms to 13 ms |
+| The first epoch | 0 ms to 6 ms | 0 ms to 6 ms |
+| The first commit | 0 ms to 2 ms | 0 ms to 1 ms |
+| The first read | 493 ms to 500 ms | 0 ms to 25 ms |
+| The whole start | 2,793 ms to 3,061 ms | 35 ms to 46 ms with `peace:trigger_election/1` |
+
+- A worker without an answer of a ClusterController, a candidate without
+  an answer of the coordinated state, and a StorageServer without a log
+  system read the coordinated state after 10 ms, and double the time
+  with each read up to their poll interval. Before, each of them waited
+  for its poll interval, which is 1,000 ms for the worker and 500 ms for
+  the StorageServer.
+- A peace cluster has no leader until an election timeout has passed.
+  `peace:trigger_election/1` starts an election at once. A caller that
+  starts a peace cluster for deadlift calls it after
+  `peace:start_cluster/3`.
+- The same early reads shorten the time after a recovery in which a
+  read of a client waits: a StorageServer follows the epoch after a
+  recovery within some 10 ms. Before, it followed at its poll interval.
+
 On such a node, `deadlift:open/0` returns a database:
 
 ```erlang
@@ -775,6 +863,7 @@ The harness checks these invariants after every step:
 | `read_value` | A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer |
 | `storage_rollback` | When a StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one |
 | `replicas_agree` | Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both |
+| `select_agrees` | A `deadlift:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -783,26 +872,26 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 8,833 acknowledged transactions, of which 2,370 with a read range, 1,057 with a clear of keys and 492 in a batch with another acknowledged transaction, 3,474 rejected for a conflict, 391 too old, 12,625 transactions with reads, of which 5,011 with direct reads on the node of a StorageServer and 2,467 by message only, 16 reads below the MVCC window of the StorageServer, 1,407 recoveries, 91 failed recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 4,296 acknowledged transactions, of which 983 with a read range, 485 with a clear of keys and 388 in a batch with another acknowledged transaction, 4,185 rejected for a conflict, 1,766 too old, 14,602 transactions with reads, of which 2,640 after the start of a new StorageServer, 173 while one of several StorageServers was not alive, 5,986 with direct reads on the node of a StorageServer and 2,856 by message only, 237 reads below the MVCC window of the StorageServer, 811 rollbacks of StorageServers, 3,776 recoveries, 1,376 failed recoveries, 1,604 kills, of which 202 of a StorageServer, 305 partitions |
-| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,686 acknowledged transactions, 320 recoveries, 3 failed recoveries, 50 elections |
-| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,232 acknowledged transactions, 1,323 recoveries, 121 failed recoveries, 504 kills of a worker node, of which 274 with a ClusterController process, 311 elections, 243 recoveries after the failure of a role, 228 rollbacks of StorageServers, 112 partitions |
-| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 27 runs with two leaders at the same time, 211 elections, 2 epochs that the leader found superseded, 563 acknowledged transactions, 698 recoveries, 262 kills of a worker node, 34 cuts |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 8,883 acknowledged transactions, of which 2,289 with a read range, 1,100 with a clear of keys and 546 in a batch with another acknowledged transaction, 3,446 rejected for a conflict, 391 too old, 12,683 transactions with reads, of which 4,995 with direct reads on the node of a StorageServer and 2,517 by message only, 7,610 selects, 12 reads below the MVCC window of the StorageServer, 1,388 recoveries, 89 failed recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 3,934 acknowledged transactions, of which 839 with a read range, 497 with a clear of keys and 371 in a batch with another acknowledged transaction, 3,756 rejected for a conflict, 1,470 too old, 13,757 transactions with reads, of which 2,475 after the start of a new StorageServer, 237 while one of several StorageServers was not alive, 5,646 with direct reads on the node of a StorageServer and 2,781 by message only, 8,326 selects, 164 reads below the MVCC window of the StorageServer, 1,145 rollbacks of StorageServers, 3,666 recoveries, 1,397 failed recoveries, 1,641 kills, of which 210 of a StorageServer, 285 partitions |
+| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,708 acknowledged transactions, 328 recoveries, 2 failed recoveries, 50 elections |
+| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,267 acknowledged transactions, 1,256 recoveries, 165 failed recoveries, 541 kills of a worker node, of which 306 with a ClusterController process, 308 elections, 244 recoveries after the failure of a role, 368 rollbacks of StorageServers, 96 partitions |
+| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 16 runs with two leaders at the same time, 172 elections, 2 epochs that the leader found superseded, 619 acknowledged transactions, 641 recoveries, 264 kills of a worker node, 30 cuts |
 | Planted defect: the coordinated state accepts the proposal of a candidate for the ClusterController with any term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 1, `one_leader`: two processes are the leader of term 1 |
-| Planted defect: a ClusterController does not recruit after the failure of a role | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 4, `epoch`: the run ends with an epoch whose Sequencer or Proxy does not run |
-| Planted defect: a ClusterController stays the leader when the coordinated state has another term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 5, `stale_leader` |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 3, `kcv_below_dv`. In 120 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
-| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 2, `copied` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
+| Planted defect: a ClusterController does not recruit after the failure of a role | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 2, `epoch`: the run ends with an epoch whose Sequencer or Proxy does not run |
+| Planted defect: a ClusterController stays the leader when the coordinated state has another term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 1, `stale_leader` |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 9, `kcv_below_dv`. In 120 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
+| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 3, `kcv_below_dv` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
-| Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 3, `no_conflict` |
-| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 3, `no_conflict` between two transactions of one batch |
-| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 3, `no_conflict`: a transaction read a key that another transaction cleared in a range |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 1, `no_conflict` |
+| Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 1, `no_conflict` |
+| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 1, `no_conflict` between two transactions of one batch |
+| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 1, `no_conflict`: a transaction read a key that another transaction cleared in a range |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` |
 | Planted defect: the process of an epoch does not raise its read version after a commit | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 30, `read_version_order` |
-| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 1, `storage_rollback` |
-| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 20, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 1, `read_version_order` |
+| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 8, `storage_rollback` |
+| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 3, `select_agrees`: a select and a read of one range differ, because the StorageServer removed versions between the two |
 | Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 3, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 | Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
 | Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value` |
@@ -854,6 +943,8 @@ A value has 100 bytes.
 | `conflict` | `read_write` with 100 keys. Each key then has several hundred versions in the MVCC window |
 | `read_version` | One read version from the Proxy |
 | `read_after_write` | A client commits a write and reads the key at the commit version. The row has the time of the read, which ends when the StorageServer has applied the record |
+| `select_by_message`, `select_direct` | `deadlift:select/4` on a range of 1,000 of 100,000 rows with values of 1,000 bytes, of which 10 match, from the node of the benchmark and on the node of the StorageServer |
+| `filter_by_message`, `filter_direct` | The same result with `get_range/3` and the match spec in the client |
 | `read_by_message` | The read of one key at a read version that the client has, from the node of the benchmark |
 | `read_direct` | The same read by a client on the node of the StorageServer, from the ETS table |
 
@@ -865,81 +956,93 @@ more. The machine has 4 performance cores and 6 efficiency cores.
 
 | Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
 |---|---|---|---|---|---|---|
-| `write` | 1 | 11642 | 86 | 119 | 170 | 1.00 |
-| `write` | 4 | 25874 | 150 | 239 | 301 | 1.00 |
-| `write` | 16 | 57195 | 275 | 418 | 499 | 1.00 |
-| `write` | 64 | 101397 | 615 | 936 | 1069 | 1.00 |
-| `write` | 256 | 116232 | 2166 | 3340 | 3773 | 1.00 |
-| `read_write` | 1 | 4093 | 232 | 425 | 611 | 1.00 |
-| `read_write` | 4 | 10135 | 364 | 811 | 1119 | 1.00 |
-| `read_write` | 16 | 22415 | 711 | 972 | 1087 | 1.00 |
-| `read_write` | 64 | 37743 | 1675 | 2417 | 2721 | 1.00 |
-| `read_write` | 256 | 43973 | 5796 | 7596 | 8196 | 1.00 |
-| `conflict` | 64 | 23976 | 1123 | 24096 | 59096 | 1.20 |
-| `read_version` | 1 | 15855 | 63 | 89 | 105 | 1.00 |
-| `read_version` | 4 | 42004 | 93 | 143 | 171 | 1.00 |
-| `read_version` | 16 | 100107 | 157 | 240 | 301 | 1.00 |
-| `read_version` | 64 | 156276 | 416 | 608 | 742 | 1.00 |
-| `read_version` | 256 | 154504 | 1621 | 2220 | 2523 | 1.00 |
-| `read_after_write` | 1 | 8060 | 31 | 49 | 69 | 1.00 |
-| `read_after_write` | 16 | 37154 | 124 | 260 | 318 | 1.00 |
-| `read_by_message` | 1 | 37245 | 27 | 33 | 68 | 1.00 |
-| `read_by_message` | 16 | 164120 | 94 | 169 | 232 | 1.00 |
-| `read_by_message` | 64 | 181250 | 355 | 540 | 640 | 1.00 |
-| `read_direct` | 1 | 583776 | 2 | 2 | 3 | 1.00 |
-| `read_direct` | 2 | 1057812 | 2 | 3 | 15 | 1.00 |
-| `read_direct` | 16 | 980976 | 2 | 840 | 964 | 1.00 |
+| `write` | 1 | 10980 | 91 | 115 | 152 | 1.00 |
+| `write` | 4 | 25980 | 150 | 231 | 301 | 1.00 |
+| `write` | 16 | 57208 | 276 | 407 | 484 | 1.00 |
+| `write` | 64 | 103292 | 607 | 910 | 1053 | 1.00 |
+| `write` | 256 | 119996 | 2084 | 3293 | 3899 | 1.00 |
+| `read_write` | 1 | 4072 | 232 | 443 | 615 | 1.00 |
+| `read_write` | 4 | 10020 | 365 | 836 | 1084 | 1.00 |
+| `read_write` | 16 | 22785 | 700 | 955 | 1078 | 1.00 |
+| `read_write` | 64 | 38056 | 1661 | 2375 | 2615 | 1.00 |
+| `read_write` | 256 | 45404 | 5596 | 7396 | 8096 | 1.00 |
+| `conflict` | 64 | 24076 | 1116 | 24496 | 58496 | 1.20 |
+| `read_version` | 1 | 15045 | 67 | 91 | 104 | 1.00 |
+| `read_version` | 4 | 42210 | 93 | 143 | 171 | 1.00 |
+| `read_version` | 16 | 105178 | 149 | 232 | 298 | 1.00 |
+| `read_version` | 64 | 156377 | 411 | 646 | 889 | 1.00 |
+| `read_version` | 256 | 159358 | 1573 | 2167 | 2442 | 1.00 |
+| `read_after_write` | 1 | 8091 | 30 | 45 | 66 | 1.00 |
+| `read_after_write` | 16 | 37800 | 121 | 254 | 310 | 1.00 |
+| `read_by_message` | 1 | 39599 | 25 | 32 | 42 | 1.00 |
+| `read_by_message` | 16 | 169207 | 92 | 153 | 192 | 1.00 |
+| `read_by_message` | 64 | 177140 | 361 | 572 | 665 | 1.00 |
+| `read_direct` | 1 | 618957 | 2 | 2 | 3 | 1.00 |
+| `read_direct` | 2 | 1104973 | 2 | 3 | 15 | 1.00 |
+| `read_direct` | 16 | 1031356 | 2 | 744 | 1006 | 1.00 |
+| `select_by_message` | 1 | 3446 | 289 | 375 | 404 | 1.00 |
+| `select_by_message` | 16 | 6855 | 2309 | 3157 | 4796 | 1.00 |
+| `filter_by_message` | 1 | 831 | 1197 | 1329 | 1398 | 1.00 |
+| `filter_by_message` | 16 | 1429 | 11096 | 12096 | 12496 | 1.00 |
+| `select_direct` | 1 | 5538 | 170 | 272 | 301 | 1.00 |
+| `select_direct` | 2 | 7654 | 255 | 366 | 402 | 1.00 |
+| `filter_direct` | 1 | 1467 | 677 | 834 | 870 | 1.00 |
+| `filter_direct` | 2 | 2603 | 762 | 982 | 1049 | 1.00 |
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
 | Clients | Transactions per batch | Wait for the close (us) | Conflict check (us) | LogServers (us) |
 |---|---|---|---|---|
-| 1 | 1.0 | 0 | 3 | 40 |
-| 4 | 1.8 | 23 | 6 | 60 |
-| 16 | 5.7 | 43 | 19 | 76 |
-| 64 | 21.2 | 63 | 78 | 129 |
-| 256 | 63.4 | 136 | 288 | 251 |
+| 1 | 1.0 | 0 | 3 | 43 |
+| 4 | 1.8 | 23 | 6 | 61 |
+| 16 | 5.7 | 44 | 19 | 77 |
+| 64 | 21.1 | 64 | 74 | 128 |
+| 256 | 66.5 | 145 | 294 | 260 |
 
 The longest single time of each step:
 
 | Clients | Wait for the close (us) | Conflict check (us) | LogServers (us) |
 |---|---|---|---|
-| 1 | 7 | 24 | 202 |
-| 4 | 141 | 104 | 181 |
-| 16 | 164 | 93 | 229 |
-| 64 | 276 | 315 | 379 |
-| 256 | 560 | 1152 | 897 |
+| 1 | 9 | 27 | 181 |
+| 4 | 124 | 108 | 165 |
+| 16 | 168 | 89 | 227 |
+| 64 | 240 | 220 | 347 |
+| 256 | 691 | 1270 | 992 |
 
 The confirmations of the Proxy for `read_version`:
 
 | Clients | Requests per confirmation | Time of a confirmation (us) |
 |---|---|---|
-| 1 | 1.0 | 28 |
+| 1 | 1.0 | 31 |
 | 4 | 1.7 | 36 |
-| 16 | 5.3 | 49 |
-| 64 | 11.2 | 68 |
-| 256 | 12.3 | 72 |
+| 16 | 5.3 | 46 |
+| 64 | 10.9 | 66 |
+| 256 | 12.6 | 72 |
 
 Garbage collections and uninterrupted runs of a process of 2 ms or more, since the start of the cluster:
 
 | Kind | Process | Count | Longest (ms) | Sum (ms) |
 |---|---|---|---|---|
+| long_gc | `deadlift_log` | 8 | 4 | 27 |
+| long_schedule | `deadlift_storage` | 5 | 14 | 38 |
+| long_gc | `deadlift_storage` | 4 | 13 | 40 |
+| long_schedule | `deadlift_log` | 2 | 3 | 6 |
 
 The default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 833 | 1 | 2 |
-| proxy | 571 | 2 | 3 |
-| cluster_controller | 5 | 3 | 4 |
+| log | 604 | 1 | 2 |
+| proxy | 562 | 2 | 3 |
+| cluster_controller | 12 | 3 | 4 |
 
 `retry_ms` 35:
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 56 | 1 | 2 |
-| proxy | 69 | 2 | 3 |
-| cluster_controller | 6 | 3 | 4 |
+| log | 58 | 1 | 2 |
+| proxy | 74 | 2 | 3 |
+| cluster_controller | 10 | 3 | 4 |
 
 In the two tables of kills, 8 clients write, and the time is the longest
 time without an acknowledged commit after the kill of one process.

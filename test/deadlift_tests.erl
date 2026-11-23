@@ -17,7 +17,9 @@ client_test_() ->
         fun(Db) -> {timeout, 30, fun() -> lifecycle(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> too_old(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> replicas(Db) end} end,
-        fun(Db) -> {timeout, 30, fun() -> replica_behind(Db) end} end
+        fun(Db) -> {timeout, 30, fun() -> replica_behind(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> select(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> select_random(Db) end} end
     ]}.
 
 setup() ->
@@ -46,6 +48,134 @@ await_read(Ids, N) ->
             timer:sleep(100),
             await_read(Ids, N - 1)
     end.
+
+%% `select/4' evaluates a match spec on a key range. The result is the
+%% result of `ets:match_spec_run/2' on the result of `get_range/3', for a
+%% read from the ETS tables and for a read by message.
+select(Db = {deadlift_database, Servers}) ->
+    Message = {deadlift_database, Servers#{direct => false}},
+    ok = deadlift:transactional(Db, fun(Tx) ->
+        lists:foreach(
+            fun(I) ->
+                Status =
+                    case I rem 10 of
+                        0 -> active;
+                        _ -> idle
+                    end,
+                ok = deadlift:set(Tx, {user, I}, #{status => Status, n => I, blob => binary:copy(<<0>>, 100)})
+            end,
+            lists:seq(1, 300)
+        ),
+        deadlift:set(Tx, {zone, 1}, #{status => active, n => 0})
+    end),
+    Active = [{{{user, '$1'}, #{status => active, n => '$2'}}, [{'>', '$1', 100}], [{{'$1', '$2'}}]}],
+    Specs = [
+        Active,
+        %% The whole row, and the variables of the head.
+        [{{{user, '$1'}, #{status => active}}, [{'<', '$1', 40}], ['$_']}],
+        [{{{user, '$1'}, #{n => '$2'}}, [{'=:=', {'rem', '$2', 50}, 0}], ['$$']}],
+        %% Two clauses.
+        [{{{user, 7}, '_'}, [], [seven]}, {{'$1', #{status => active}}, [], ['$1']}],
+        %% No row matches.
+        [{{'_', #{status => deleted}}, [], [true]}]
+    ],
+    Compare = fun(D, Begin, End) ->
+        deadlift:transactional(D, fun(Tx) ->
+            Rows = deadlift:get_range(Tx, Begin, End),
+            lists:foreach(
+                fun(Spec) ->
+                    Expected = ets:match_spec_run(Rows, ets:match_spec_compile(Spec)),
+                    ?assertEqual(Expected, deadlift:select(Tx, Begin, End, Spec), Spec),
+                    ?assertEqual(lists:sublist(Expected, 3), deadlift:select(Tx, Begin, End, Spec, [{limit, 3}]), Spec)
+                end,
+                Specs
+            ),
+            length(Rows)
+        end)
+    end,
+    [?assertEqual(Count, Compare(D, Begin, End)) || D <- [Db, Message], {Begin, End, Count} <- [{{user, 0}, {user, 999}, 300}, {{user, 50}, {user, 150}, 100}, {a, z, 0}, {{user, 0}, {zone, 9}, 301}]],
+    ?assertEqual([{I, I} || I <- lists:seq(110, 300, 10)], deadlift:transactional(Db, fun(Tx) -> deadlift:select(Tx, {user, 0}, {user, 999}, Active) end)),
+    %% The function sees the sets and the clears of its transaction.
+    lists:foreach(
+        fun(D) ->
+            {Limited, All} = deadlift:transactional(D, fun(Tx) ->
+                ok = deadlift:set(Tx, {user, 105}, #{status => active, n => 105}),
+                ok = deadlift:clear(Tx, {user, 120}),
+                ok = deadlift:clear_range(Tx, {user, 125}, {user, 145}),
+                ok = deadlift:set(Tx, {user, 130}, #{status => idle, n => 130}),
+                {deadlift:select(Tx, {user, 0}, {user, 999}, Active, [{limit, 2}]), deadlift:select(Tx, {user, 0}, {user, 999}, Active)}
+            end),
+            ?assertEqual([{105, 105}, {110, 110}], Limited),
+            ?assertEqual([{105, 105}, {110, 110}, {150, 150}], lists:sublist(All, 3))
+        end,
+        [Db, Message]
+    ),
+    ok = deadlift:transactional(Db, fun(Tx) ->
+        ok = deadlift:clear(Tx, {user, 105}),
+        ok = deadlift:set(Tx, {user, 120}, #{status => active, n => 120}),
+        lists:foreach(fun(I) -> deadlift:set(Tx, {user, I}, #{status => active, n => I}) end, [130, 140])
+    end),
+    %% A write of another transaction to a key of the range that does not
+    %% match is a conflict.
+    Tx1 = deadlift:create_transaction(Db),
+    ?assertEqual(20, length(deadlift:select(Tx1, {user, 0}, {user, 999}, Active))),
+    ok = deadlift:set(Tx1, other, 1),
+    ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, {user, 101}, #{status => idle, n => 101}) end),
+    ?assertError({erlfdb_error, 1020}, deadlift:wait(deadlift:commit(Tx1))),
+    %% A select of a snapshot gives no conflict.
+    Tx2 = deadlift:create_transaction(Db),
+    ?assertEqual(20, length(deadlift:select(deadlift:snapshot(Tx2), {user, 0}, {user, 999}, Active))),
+    ok = deadlift:set(Tx2, other, 2),
+    ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, {user, 102}, #{status => idle, n => 102}) end),
+    ok = deadlift:wait(deadlift:commit(Tx2)),
+    %% A term that is not a match spec.
+    Tx3 = deadlift:create_transaction(Db),
+    ?assertError(badarg, deadlift:select(Tx3, a, z, [{no_spec}])),
+    ?assertError(badarg, deadlift:select(Tx3, a, z, no_list)).
+
+%% 400 random transactions set and clear some of 30 keys. After each one,
+%% `select/4' at the newest version and at an older version of the MVCC
+%% window gives the result of `ets:match_spec_run/2' on `get_range/3', for
+%% a read from the ETS tables and for a read by message.
+select_random(Db = {deadlift_database, Servers}) ->
+    Message = {deadlift_database, Servers#{direct => false}},
+    Specs = [
+        [{{'$1', '$2'}, [{'>', '$2', 500}], [{{'$1', '$2'}}]}],
+        [{{'$1', '$2'}, [{'=:=', {'rem', '$1', 3}, 0}], ['$2']}],
+        [{'_', [], ['$_']}]
+    ],
+    Check = fun(D, ReadVersion) ->
+        Tx = deadlift:create_transaction(D),
+        _ = is_integer(ReadVersion) andalso deadlift:set_read_version(Tx, ReadVersion),
+        try
+            Rows = deadlift:get_range(Tx, 5, 25),
+            [?assertEqual(ets:match_spec_run(Rows, ets:match_spec_compile(Spec)), deadlift:select(Tx, 5, 25, Spec)) || Spec <- Specs],
+            ok
+        catch
+            %% The older version left the MVCC window.
+            error:{erlfdb_error, 1007} -> too_old
+        end
+    end,
+    Rand0 = rand:seed_s(exsss, {7, 8, 9}),
+    {_, Checks} = lists:foldl(
+        fun(_N, {Rand1, Count}) ->
+            {[Kind, K1, K2, Value, Back], Rand2} = lists:mapfoldl(fun(Max, R) -> rand:uniform_s(Max, R) end, Rand1, [10, 30, 30, 1000, 15]),
+            ok = deadlift:transactional(Db, fun(Tx) ->
+                case Kind of
+                    1 -> deadlift:clear(Tx, K1);
+                    2 -> deadlift:clear_range(Tx, min(K1, K2), max(K1, K2));
+                    _ -> deadlift:set(Tx, K1, Value)
+                end
+            end),
+            Newest = deadlift:transactional(Db, fun(Tx) -> deadlift:get_read_version(Tx) end),
+            Results = [Check(D, V) || D <- [Db, Message], V <- [newest, max(1, Newest - Back)]],
+            {Rand2, Count + length([ok || ok <- Results])}
+        end,
+        {Rand0, 0},
+        lists:seq(1, 400)
+    ),
+    %% Most checks are inside the MVCC window.
+    ?assert(Checks > 1000, Checks).
 
 %% Sets, reads, a range read, clears and the versions of a transaction.
 basics(Db) ->

@@ -177,7 +177,7 @@
 -include("deadlift_eta.hrl").
 
 -export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
--export([get/2, get_range/3, set/3, clear/2, clear_range/3]).
+-export([get/2, get_range/3, select/4, select/5, set/3, clear/2, clear_range/3]).
 -export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
 -export([add_read_conflict_key/2, add_read_conflict_range/3, is_read_only/1]).
@@ -394,6 +394,63 @@ get_range(TxOrSnapshot, Begin, End) ->
     _ = Conflict andalso ets:insert(Table, {{rr, next(Table)}, Begin, End}),
     lists:ukeymerge(1, Written, Stored).
 
+%% @equiv select(TxOrSnapshot, Begin, End, MatchSpec, [])
+-spec select(transaction() | snapshot(), key(), key(), ets:match_spec()) -> [term()].
+select(TxOrSnapshot, Begin, End, MatchSpec) ->
+    select(TxOrSnapshot, Begin, End, MatchSpec, []).
+
+%% @doc Evaluates an ETS match spec on the keys of the range
+%% `{Begin, End}', and returns the results in the order of the keys.
+%%
+%% The match spec is for rows `{Key, Value}'. The result is the result of
+%% `ets:match_spec_run/2' on the result of `get_range/3'. The
+%% StorageServer evaluates the match spec, so a value that does not match
+%% does not reach the client. See "Select" in {@link deadlift_storage}.
+%%
+%% <ul>
+%% <li>The transaction gets the whole range as a read conflict range, as
+%%   `get_range/3' does. A write of another transaction to a key of the
+%%   range that does not match is a conflict too, because the write can
+%%   make the key match.</li>
+%% <li>The function sees the sets and the clears of this transaction.</li>
+%% <li>`Options' is a list. `{limit, N}' returns the first `N' results. To
+%%   continue, a caller starts the next call at the last key, and
+%%   excludes that key with a guard of the match spec.</li>
+%% <li>A match spec that ETS does not accept raises `badarg'.</li>
+%% </ul>
+%%
+%% FoundationDB and erlfdb have no such function. Only a StorageServer
+%% whose handle has the feature `select' supports it. This part is not in
+%% the paper.
+-spec select(transaction() | snapshot(), key(), key(), ets:match_spec(), [{limit, pos_integer()}]) -> [term()].
+select(TxOrSnapshot, Begin, End, MatchSpec, Options) when is_list(Options) ->
+    {Table, Conflict} = table(TxOrSnapshot),
+    Limit = proplists:get_value(limit, Options, infinity),
+    %% The writes of this transaction in the range.
+    Guards = [{'>=', '$1', {const, Begin}}, {'<', '$1', {const, End}}],
+    Written = ets:select(Table, [{{{w, '$1'}, {set, '$2'}}, Guards, [{{'$1', '$2'}}]}]),
+    Mine = deadlift_storage:select_rows(Written, MatchSpec),
+    Own =
+        ets:select_count(Table, [{{{w, '$1'}, '_'}, Guards, [true]}]) > 0 orelse
+            ets:select_count(Table, [{{{cr, '_'}, '$1', '$2'}, [{'<', '$1', {const, End}}, {'<', {const, Begin}, '$2'}], [true]}]) > 0,
+    %% The StorageServer applies the limit only if the transaction has
+    %% changed no key of the range. Otherwise a stored result can be a key
+    %% that the transaction cleared, and the limit is applied after the
+    %% merge.
+    Pushed =
+        case Own of
+            true -> infinity;
+            false -> Limit
+        end,
+    {ok, Rows} = read(Table, {select, Begin, End, MatchSpec, Pushed}),
+    Stored = [Row || Row = {Key, _Result} <- Rows, not ets:member(Table, {w, Key}), not cleared(Table, Key)],
+    _ = Conflict andalso ets:insert(Table, {{rr, next(Table)}, Begin, End}),
+    Results = [Result || {_Key, Result} <- lists:ukeymerge(1, Mine, Stored)],
+    case Limit of
+        infinity -> Results;
+        _ -> lists:sublist(Results, Limit)
+    end.
+
 %% The key is in a key range that the transaction cleared, and the
 %% transaction has not written the key after that.
 cleared(Table, Key) ->
@@ -447,13 +504,23 @@ read_direct_each(Table, [Storage | Storages], Query, Version) ->
     Answer =
         case handle(Table, Storage) of
             none -> gone;
-            Handle -> deadlift_storage:read_direct(Handle, Query, Version)
+            Handle -> read_handle(Handle, Query, Version)
         end,
     case Answer of
         {ok, Result} -> {ok, Result};
         too_old -> too_old;
         _BehindOrGone -> read_direct_each(Table, Storages, Query, Version)
     end.
+
+%% A direct read. A select needs a StorageServer with the feature
+%% `select'.
+read_handle(Handle, Query, Version) when element(1, Query) =:= select ->
+    case lists:member(select, maps:get(features, Handle, [])) of
+        true -> deadlift_storage:read_direct(Handle, Query, Version);
+        false -> error({unsupported, select})
+    end;
+read_handle(Handle, Query, Version) ->
+    deadlift_storage:read_direct(Handle, Query, Version).
 
 handle(Table, Storage) ->
     case ets:lookup(Table, {storage_handle, Storage}) of
@@ -483,10 +550,12 @@ read_by_message([Storage | Storages], Query, Version, Timeout, Code) ->
     Answer =
         case Query of
             {key, Key} -> deadlift_storage:read_with_version(Storage, Key, Version, Timeout);
-            {range, Begin, End} -> deadlift_storage:read_range_with_version(Storage, Begin, End, Version, Timeout)
+            {range, Begin, End} -> deadlift_storage:read_range_with_version(Storage, Begin, End, Version, Timeout);
+            {select, Begin, End, MatchSpec, Limit} -> deadlift_storage:select(Storage, Begin, End, MatchSpec, Limit, Version, Timeout)
         end,
     case Answer of
         {error, transaction_too_old} -> error({erlfdb_error, ?TRANSACTION_TOO_OLD});
+        {error, badarg} -> error(badarg);
         {error, {timeout, _}} -> read_by_message(Storages, Query, Version, Timeout, ?FUTURE_VERSION);
         {error, _Reason} -> read_by_message(Storages, Query, Version, Timeout, Code);
         Result -> Result

@@ -320,6 +320,7 @@ read_keys(Tab, Tx, Keys, Ranges) ->
         InRanges = lists:append([
             begin
                 Found = deadlift:get_range(Tx, Begin, End),
+                ok = select(Tab, Tx, Range, Found),
                 %% The read returns no key outside the range, and the keys
                 %% are in their order.
                 [] = [Key || {Key, _Value} <- Found, not lists:member(Key, keys_in(Range))],
@@ -333,6 +334,29 @@ read_keys(Tab, Tx, Keys, Ranges) ->
         error:{erlfdb_error, 1007} -> {error, transaction_too_old};
         error:{erlfdb_error, Code} -> {error, Code}
     end.
+
+%% Evaluates two match specs on the range with `deadlift:select/4', at the
+%% read version of the transaction. The first one returns every row, and
+%% the second one the keys of the rows of a client with an even number.
+%% The results must be the results of `ets:match_spec_run/2' on `Found',
+%% the result of `get_range/3'. The function records a difference in the
+%% table of the run, for the invariant `select_agrees'.
+select(Tab, Tx, {Begin, End}, Found) ->
+    Specs = [
+        [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}],
+        [{{'$1', {client, '$2'}}, [{'=:=', {'rem', '$2', 2}, 0}], ['$1']}]
+    ],
+    lists:foreach(
+        fun(Spec) ->
+            Expected = ets:match_spec_run(Found, ets:match_spec_compile(Spec)),
+            N = ets:update_counter(Tab, selects, 1, {selects, 0}),
+            case deadlift:select(Tx, Begin, End, Spec) of
+                Expected -> ok;
+                Other -> true = ets:insert(Tab, {{select_differs, N}, #{range => {Begin, End}, expected => Expected, selected => Other}})
+            end
+        end,
+        Specs
+    ).
 
 %% The StorageServers that the table of the run has.
 storages(Tab) ->

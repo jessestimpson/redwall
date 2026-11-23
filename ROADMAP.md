@@ -124,6 +124,12 @@ and partitions.
 The goal is that deadlift replaces erlfdb in an application. The client
 has the basic functions. The remaining parts, in the planned order:
 
+- [x] `select/4`: evaluate an ETS match spec on a key range in the
+      StorageServer with ETS tables. erlfdb has no such function.
+- [ ] `select` for every key with a prefix, with `ets:select/2` and a
+      bound prefix of the key, together with `get_range_startswith`.
+- [ ] A count with a match spec, and a continuation for `select` with a
+      limit.
 - [ ] `get_range` with `limit` and `reverse`, key selectors and
       `get_key`. This step makes the tuple layer, subspaces and the
       directory layer of erlfdb usable.
@@ -140,6 +146,9 @@ has the basic functions. The remaining parts, in the planned order:
 - [ ] `get_last_error/0`. erlfdb keeps the last error in the process
       dictionary, and an error that causes a retry is hidden by a later
       timeout error of the transaction. The design is open.
+- [x] Shorten the start of a node from about 3 s to about 40 ms: a
+      process that waits for the ClusterController, for the coordinated
+      state or for an epoch reads again after 10 ms.
 - [x] `open/0`: find the Proxy and the StorageServer on a node that runs
       the application with a worker and a StorageServer.
 - [ ] Find the Proxy and the StorageServers from the coordinators in
