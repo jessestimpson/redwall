@@ -147,6 +147,46 @@
 %% handle has the feature `select'. FoundationDB has no such read. This
 %% part is not in the paper.
 %%
+%% == Mapped range ==
+%%
+%% `mapped_range/7' and the query `{mapped, Begin, End, Mapper, Limit}' of
+%% `read_direct/3' are the mapped range read of FoundationDB
+%% (`getMappedKeyValuesQ' and `mapKeyValues' of
+%% `fdbserver/storageserver.actor.cpp', FoundationDB 7.3.62). The
+%% StorageServer reads the rows of the range `{Begin, End}' at the read
+%% version, builds a mapped key from each row with the mapper (see
+%% {@link deadlift_mapper}), and performs a second read at the same read
+%% version: a read of the mapped key, or a read of every key that starts
+%% with the mapped key.
+%%
+%% The result has one element for each row of the range, in the order of
+%% the keys: `{{Key, Value}, {SecondBegin, SecondEnd}, Rows}'.
+%% `{SecondBegin, SecondEnd}' is the key range of the second read, and
+%% `Rows' is the list of `{Key, Value}' that the second read found. A row
+%% whose second read finds nothing is in the result with an empty list.
+%% With a `Limit', the result has the first `Limit' rows of the range.
+%%
+%% <ul>
+%% <li>The StorageServer walks the range with `ets:next_lookup/2', as a
+%%   select does, and performs each second read on the same tables. A
+%%   StorageServer of deadlift has every key, so no second read goes to
+%%   another StorageServer. A StorageServer of FoundationDB reads a mapped
+%%   key of another shard through a client transaction at the same
+%%   version.</li>
+%% <li>A second read of a prefix has no limit of rows. FoundationDB
+%%   returns the first 2,000 rows and 10,000,000 bytes of it
+%%   (`QUICK_GET_KEY_VALUES_LIMIT'), with a flag that the client must
+%%   examine.</li>
+%% <li>A mapped range read has no limit of bytes. FoundationDB ends a
+%%   reply at 80,000 bytes.</li>
+%% <li>For a read by message, a temporary process performs the read as a
+%%   direct read, as for a select.</li>
+%% <li>An error of the mapper ends the read with `{error, {mapper,
+%%   Reason}}'.</li>
+%% </ul>
+%%
+%% The handle has the feature `mapped_range'.
+%%
 %% == Direct reads ==
 %%
 %% A client can read the table of the data in its own process, without a
@@ -242,7 +282,8 @@
 -export([read/3, read/4, read_with_version/4, info/1]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([handle/1, read_direct/3, versions/1]).
--export([select/7, select_rows/2]).
+-export([select/7, select_rows/2, mapped_range/7]).
+-export_type([mapped_row/0]).
 -export_type([handle/0, query/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -278,13 +319,18 @@
     history := ets:tid(),
     published := atomics:atomics_ref(),
     wait => boolean(),
-    features => [select]
+    features => [select | mapped_range]
 }.
 
 -type query() ::
     {key, term()}
     | {range, term(), term()}
-    | {select, Begin :: term(), End :: term(), ets:match_spec(), Limit :: pos_integer() | infinity}.
+    | {select, Begin :: term(), End :: term(), ets:match_spec(), Limit :: pos_integer() | infinity}
+    | {mapped, Begin :: term(), End :: term(), deadlift_mapper:mapper(), Limit :: pos_integer() | infinity}.
+
+%% A row of a mapped range read: the row of the range, the key range of
+%% the second read, and the rows that the second read found.
+-type mapped_row() :: {{term(), term()}, {binary(), binary()}, [{term(), term()}]}.
 
 %% The number of rows that a select reads before it runs the match spec
 %% on them.
@@ -447,6 +493,19 @@ select(Storage, Begin, End, MatchSpec, Limit, Version, Timeout) ->
         exit:Reason -> {error, Reason}
     end.
 
+%% @doc Reads the range `{Begin, End}' at the read version `Version', and
+%% performs the second read of the mapper for each row. See "Mapped range"
+%% in the module documentation. The errors are the errors of `read/4', and
+%% `{error, {mapper, Reason}}' with a reason of {@link deadlift_mapper}.
+-spec mapped_range(gen_server:server_ref(), term(), term(), deadlift_mapper:mapper(), pos_integer() | infinity, version(), timeout()) ->
+    {ok, [mapped_row()]} | {error, term()}.
+mapped_range(Storage, Begin, End, Mapper, Limit, Version, Timeout) ->
+    try
+        gen_server:call(Storage, {mapped, Begin, End, Mapper, Limit, Version}, Timeout)
+    catch
+        exit:Reason -> {error, Reason}
+    end.
+
 %% @doc Runs the match spec on the rows `{Key, Value}', and returns
 %% `{Key, Result}' for each row that matches. The client uses this
 %% function for the writes of a transaction that is not committed.
@@ -539,6 +598,8 @@ handle_call({read_range, Begin, End, Version}, From, State) ->
     read_at({range, Begin, End}, Version, From, State);
 handle_call({select, Begin, End, MatchSpec, Limit, Version}, From, State) ->
     read_at({select, Begin, End, MatchSpec, Limit}, Version, From, State);
+handle_call({mapped, Begin, End, Mapper, Limit, Version}, From, State) ->
+    read_at({mapped, Begin, End, Mapper, Limit}, Version, From, State);
 handle_call(handle, _From, State) ->
     {reply, handle_of(State), State};
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
@@ -927,9 +988,10 @@ answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
     State#state{waiting = Later}.
 
 %% Answers a read at a version that the StorageServer has applied. A
-%% select can read many rows, so a temporary process performs it as a
-%% direct read, and the StorageServer applies records in that time.
-answer(From, Query = {select, _Begin, _End, _MatchSpec, _Limit}, Version, State) ->
+%% select and a mapped range read can read many rows, so a temporary
+%% process performs each as a direct read, and the StorageServer applies
+%% records in that time.
+answer(From, Query, Version, State) when element(1, Query) =:= select; element(1, Query) =:= mapped ->
     Handle = handle_of(State),
     _ = spawn(fun() ->
         Reply =
@@ -950,7 +1012,7 @@ answer(From, Query, Version, State) ->
 %% The handle for direct reads. `features' has the kinds of read that this
 %% StorageServer supports in addition to keys and ranges.
 handle_of(#state{data = Data, history = History, published = Published, wait = Wait}) ->
-    #{data => Data, history => History, published => Published, wait => Wait, features => [select]}.
+    #{data => Data, history => History, published => Published, wait => Wait, features => [select, mapped_range]}.
 
 lookup({key, Key}, Version, {Data, History}) ->
     case ets:lookup(Data, Key) of
@@ -969,7 +1031,56 @@ lookup({select, Begin, End, MatchSpec, Limit}, Version, {Data, History}) ->
             [Row] -> {Begin, [Row]};
             [] -> ets:next_lookup(Data, Begin)
         end,
-    {ok, select_walk(First, End, Version, {Data, History}, Compiled, Limit, [], 0, [], 0)}.
+    {ok, select_walk(First, End, Version, {Data, History}, Compiled, Limit, [], 0, [], 0)};
+
+lookup({mapped, Begin, End, Mapper, Limit}, Version, Tables = {Data, _History}) ->
+    case deadlift_mapper:compile(Mapper) of
+        {ok, Compiled} ->
+            First =
+                case ets:lookup(Data, Begin) of
+                    [Row] -> {Begin, [Row]};
+                    [] -> ets:next_lookup(Data, Begin)
+                end,
+            mapped_walk(First, End, Version, Tables, Compiled, Limit, []);
+        {error, Reason} ->
+            {error, {mapper, Reason}}
+    end.
+
+%% Reads the rows of the range in the order of the keys, and performs the
+%% second read for each row that has a value at `Version'. `Left' is the
+%% number of rows that the result can still take.
+mapped_walk({Key, [Row]}, End, Version, Tables = {Data, History}, Compiled, Left, Acc) when Key < End, Left =/= 0 ->
+    Next = ets:next_lookup(Data, Key),
+    case visible(Row, Version, Data, History) of
+        {ok, Value, _Written} ->
+            case deadlift_mapper:key(Compiled, Key, Value) of
+                {ok, Mapped} ->
+                    Mode = deadlift_mapper:mode(Compiled),
+                    Range = deadlift_mapper:range(Mode, Mapped),
+                    Found = second_read(Mode, Range, Version, Tables),
+                    Left1 =
+                        case Left of
+                            infinity -> infinity;
+                            _ -> Left - 1
+                        end,
+                    mapped_walk(Next, End, Version, Tables, Compiled, Left1, [{{Key, Value}, Range, Found} | Acc]);
+                {error, Reason} ->
+                    {error, {mapper, Reason}}
+            end;
+        not_found ->
+            mapped_walk(Next, End, Version, Tables, Compiled, Left, Acc)
+    end;
+mapped_walk(_RowAtOrAfterEndOrEndOfTableOrNoneLeft, _End, _Version, _Tables, _Compiled, _Left, Acc) ->
+    {ok, lists:reverse(Acc)}.
+
+second_read(point, {Key, _After}, Version, Tables) ->
+    case lookup({key, Key}, Version, Tables) of
+        {ok, Value, _Written} -> [{Key, Value}];
+        not_found -> []
+    end;
+second_read(range, {Begin, End}, Version, Tables) ->
+    {ok, Rows} = lookup({range, Begin, End}, Version, Tables),
+    [{Key, Value} || {Key, Value, _Written} <- Rows].
 
 %% Reads the rows of the range in the order of the keys, and runs the
 %% match spec on batches of `{Key, Value}' with the value of each key at

@@ -46,6 +46,11 @@
 %%   the same result with `get_range/3' and the match spec in the client.
 %%   The clients are on the node of the benchmark, or on the node of the
 %%   StorageServer.</li>
+%% <li>`mapped': `deadlift:get_mapped_range/4' on 100 index rows of
+%%   10,000, each with a second read of one record with a value of 1,000
+%%   bytes. `join' gives the same result with `get_range/3' for the index
+%%   rows and one `get_range/3' for each record. The clients are on the
+%%   node of the benchmark, or on the node of the StorageServer.</li>
 %% <li>The time without an acknowledged commit after the kill of one
 %%   process: a LogServer, the process of the epoch and the
 %%   ClusterController.</li>
@@ -108,6 +113,11 @@ main(Options) ->
         [row(filter_by_message, N, run(filter, Db, N, Ms)) || N <- [1, 16]],
         [row(select_direct, N, erpc:call(StorageNode, ?MODULE, run, [select, Direct, N, Ms], infinity)) || N <- [1, 2]],
         [row(filter_direct, N, erpc:call(StorageNode, ?MODULE, run, [filter, Direct, N, Ms], infinity)) || N <- [1, 2]],
+        ok = preload_mapped(Db),
+        [row(mapped_by_message, N, run(mapped, Db, N, Ms)) || N <- [1, 16]],
+        [row(join_by_message, N, run(join, Db, N, Ms)) || N <- [1, 16]],
+        [row(mapped_direct, N, erpc:call(StorageNode, ?MODULE, run, [mapped, Direct, N, Ms], infinity)) || N <- [1, 2]],
+        [row(join_direct, N, erpc:call(StorageNode, ?MODULE, run, [join, Direct, N, Ms], infinity)) || N <- [1, 2]],
         breakdown(Writes, Versions),
         pauses(Cluster),
         io:format("~nThe default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):~n~n"),
@@ -238,6 +248,12 @@ client(Parent, Op, {Db, Histogram}, Measure, End) ->
                 Tx = deadlift:create_transaction(Db),
                 _ = deadlift:get_read_version(Tx),
                 deadlift:snapshot(Tx);
+            Join when Join =:= mapped; Join =:= join ->
+                %% One read version for every read of the client. Each
+                %% operation has a transaction of its own, because a
+                %% mapped range read is not allowed in a snapshot, and
+                %% adds read conflict ranges to its transaction.
+                {Db, deadlift:transactional(Db, fun(Tx) -> deadlift:get_read_version(Tx) end)};
             _ ->
                 Db
         end,
@@ -288,6 +304,30 @@ op(filter, Snapshot) ->
     %% runs the match spec itself.
     {Begin, End} = scan_range(),
     10 = length(ets:match_spec_run(deadlift:get_range(Snapshot, Begin, End), ets:match_spec_compile(scan_spec()))),
+    1;
+op(Join, {Db, Version}) when Join =:= mapped; Join =:= join ->
+    Tx = {deadlift_transaction, Table} = deadlift:create_transaction(Db),
+    ok = deadlift:set_read_version(Tx, Version),
+    {Begin, End} = deadlift_mapper:range(range, deadlift_tuple:pack({<<"b">>, <<"index">>, rand:uniform(100)})),
+    Rows =
+        case Join of
+            mapped ->
+                deadlift:get_mapped_range(Tx, Begin, End, {<<"b">>, <<"record">>, <<"{K[3]}">>, <<"{...}">>});
+            join ->
+                %% The same result without `get_mapped_range/4': the
+                %% client reads the index rows, and then each record.
+                [
+                    begin
+                        {_, _, _, Id} = deadlift_tuple:unpack(Key),
+                        Range = {From, To} = deadlift_mapper:range(range, deadlift_tuple:pack({<<"b">>, <<"record">>, Id})),
+                        {Row, Range, deadlift:get_range(Tx, From, To)}
+                    end
+                 || Row = {Key, _Value} <- deadlift:get_range(Tx, Begin, End)
+                ]
+        end,
+    100 = length(Rows),
+    [{_Index, _Range, [{_Key, <<_:1000/binary, _/binary>>}]} | _] = Rows,
+    true = ets:delete(Table),
     1;
 op(read, Tx) ->
     _ = deadlift:wait(deadlift:get(Tx, rand:uniform(10000))),
@@ -371,6 +411,29 @@ scan_range() ->
 %% has.
 scan_spec() ->
     [{{{scan, '$1'}, #{status => active}}, [], ['$1']}].
+
+%% Writes 10,000 index rows and 10,000 records for `mapped' and `join'.
+%% The key of an index row is `{<<"b">>, <<"index">>, Group, Id}', with
+%% 100 groups of 100 rows. The key of a record is
+%% `{<<"b">>, <<"record">>, Id}', and its value is a tuple with a byte
+%% string of 1,000 bytes.
+preload_mapped(Db) ->
+    Value = deadlift_tuple:pack({binary:copy(<<1>>, 1000)}),
+    lists:foreach(
+        fun(Group) ->
+            ok = deadlift:transactional(Db, fun(Tx) ->
+                lists:foreach(
+                    fun(N) ->
+                        Id = Group * 1000 + N,
+                        ok = deadlift:set(Tx, deadlift_tuple:pack({<<"b">>, <<"index">>, Group, Id}), <<>>),
+                        ok = deadlift:set(Tx, deadlift_tuple:pack({<<"b">>, <<"record">>, Id}), Value)
+                    end,
+                    lists:seq(1, 100)
+                )
+            end)
+        end,
+        lists:seq(1, 100)
+    ).
 
 %% Writes 100,000 rows with a value of 1,000 bytes for `select' and
 %% `filter'.

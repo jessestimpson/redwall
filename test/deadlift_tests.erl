@@ -19,7 +19,10 @@ client_test_() ->
         fun(Db) -> {timeout, 30, fun() -> replicas(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> replica_behind(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> select(Db) end} end,
-        fun(Db) -> {timeout, 60, fun() -> select_random(Db) end} end
+        fun(Db) -> {timeout, 60, fun() -> select_random(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> mapped_range(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> mapped_range_conflicts(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> mapped_range_random(Db) end} end
     ]}.
 
 setup() ->
@@ -502,3 +505,242 @@ profile_test() ->
     Start = erlang:monotonic_time(millisecond),
     [ok = deadlift:on_error(Tx, 1020) || _ <- lists:seq(1, 30)],
     ?assert(erlang:monotonic_time(millisecond) - Start < 3100).
+
+pack(Tuple) -> deadlift_tuple:pack(Tuple).
+
+%% The layout of the tests of FoundationDB (`bindings/c/test/unit/
+%% unit_tests.cpp', `GetMappedRange'): an index row has the key
+%% `{Prefix, <<"INDEX">>, IndexKey, Id}' and an empty value, and a record
+%% has 3 rows with the keys `{Prefix, <<"RECORD">>, Id, Split}'.
+index_key(I) -> pack({<<"p">>, <<"INDEX">>, <<"index-", (integer_to_binary(I))/binary>>, I}).
+record_key(I, Split) -> pack({<<"p">>, <<"RECORD">>, I, Split}).
+record_value(I, Split) -> pack({<<"data-", (integer_to_binary(I))/binary>>, Split}).
+
+load_records(Db, Ids) ->
+    deadlift:transactional(Db, fun(Tx) ->
+        lists:foreach(
+            fun(I) ->
+                ok = deadlift:set(Tx, index_key(I), pack({})),
+                [ok = deadlift:set(Tx, record_key(I, Split), record_value(I, Split)) || Split <- [0, 1, 2]]
+            end,
+            Ids
+        )
+    end).
+
+%% `get_mapped_range/5' with the mapper of FoundationDB, for a read from
+%% the ETS tables and for a read by message.
+mapped_range(Db = {deadlift_database, Servers}) ->
+    Message = {deadlift_database, Servers#{direct => false}},
+    Ids = lists:seq(10, 27),
+    ok = load_records(Db, Ids),
+    %% A record without an index row, an index row without a record, and
+    %% rows that are not tuples.
+    ok = deadlift:transactional(Db, fun(Tx) ->
+        ok = deadlift:set(Tx, index_key(99), pack({})),
+        [ok = deadlift:set(Tx, record_key(50, Split), record_value(50, Split)) || Split <- [0, 1, 2]],
+        ok = deadlift:set(Tx, pack({<<"q">>, 1}), pack({<<"p">>, <<"RECORD">>, 10})),
+        ok = deadlift:set(Tx, pack({<<"q">>, 2}), no_tuple),
+        ok = deadlift:set(Tx, {term, key}, pack({}))
+    end),
+    {Begin, End} = {pack({<<"p">>, <<"INDEX">>}), pack({<<"p">>, <<"INDEY">>})},
+    Mapper = {<<"p">>, <<"RECORD">>, <<"{K[3]}">>, <<"{...}">>},
+    Record = fun(I) -> [{record_key(I, Split), record_value(I, Split)} || Split <- [0, 1, 2]] end,
+    Prefix = fun(I) -> pack({<<"p">>, <<"RECORD">>, I}) end,
+    Second = fun(I) -> deadlift_mapper:range(range, Prefix(I)) end,
+    ?assertEqual({Prefix(10), Prefix(11)}, Second(10)),
+    Row = fun
+        (99) -> {{index_key(99), <<>>}, Second(99), []};
+        (I) -> {{index_key(I), <<>>}, Second(I), Record(I)}
+    end,
+    Read = fun(D, From, To, M, Options) -> deadlift:transactional(D, fun(Tx) -> deadlift:get_mapped_range(Tx, From, To, M, Options) end) end,
+    lists:foreach(
+        fun(D) ->
+            All = deadlift:transactional(D, fun(Tx) -> deadlift:get_mapped_range(Tx, Begin, End, Mapper) end),
+            ?assertEqual([Row(I) || I <- Ids ++ [99]], All),
+            %% The mapper in its packed form.
+            ?assertEqual(All, Read(D, Begin, End, pack(Mapper), [])),
+            ?assertEqual(All, Read(D, Begin, End, Mapper, [{limit, 0}, {streaming_mode, want_all}])),
+            %% A limit, and the next call after the last key.
+            Page1 = Read(D, Begin, End, Mapper, [{limit, 7}]),
+            ?assertEqual([Row(I) || I <- lists:seq(10, 16)], Page1),
+            {{Last, _}, _, _} = lists:last(Page1),
+            ?assertEqual([Row(I) || I <- lists:seq(17, 21)], Read(D, <<Last/binary, 0>>, End, Mapper, [{limit, 5}])),
+            ?assertEqual([], Read(D, pack({<<"none">>}), pack({<<"nonf">>}), Mapper, [])),
+            %% A mapper without `{...}': the second read is a read of one
+            %% key.
+            Point = {<<"p">>, <<"RECORD">>, <<"{K[3]}">>, 1},
+            ?assertEqual(
+                [{{index_key(I), <<>>}, {record_key(I, 1), <<(record_key(I, 1))/binary, 0>>}, [{record_key(I, 1), record_value(I, 1)}]} || I <- [10, 11]],
+                Read(D, Begin, End, Point, [{limit, 2}])
+            ),
+            ?assertEqual({{index_key(99), <<>>}, {record_key(99, 1), <<(record_key(99, 1))/binary, 0>>}, []}, lists:last(Read(D, Begin, End, Point, []))),
+            %% The mapped key from the value of the row.
+            ?assertEqual(
+                [{{pack({<<"q">>, 1}), pack({<<"p">>, <<"RECORD">>, 10})}, {Prefix(10), Prefix(11)}, Record(10)}],
+                Read(D, pack({<<"q">>, 1}), pack({<<"q">>, 2}), {<<"{V[0]}">>, <<"{V[1]}">>, <<"{V[2]}">>, <<"{...}">>}, [])
+            ),
+            %% A mapper of literals reads rows that are not tuples.
+            ?assertEqual(
+                [{{{term, key}, <<>>}, {Prefix(10), Prefix(11)}, Record(10)}],
+                Read(D, {term, a}, {term, z}, {<<"p">>, <<"RECORD">>, 10, <<"{...}">>}, [])
+            ),
+            %% The errors of the mapper.
+            Q = {pack({<<"q">>}), pack({<<"r">>})},
+            Error = fun({From, To}, M) ->
+                Tx = deadlift:create_transaction(D),
+                try deadlift:get_mapped_range(Tx, From, To, M) of
+                    Rows -> {ok, Rows}
+                catch
+                    error:{erlfdb_error, Code} ->
+                        ?assertError({erlfdb_error, Code}, deadlift:on_error(Tx, Code)),
+                        Code
+                end
+            end,
+            ?assertEqual(2043, Error(Q, <<"no tuple">>)),
+            ?assertEqual(2032, Error(Q, {<<"{...}">>, <<"x">>})),
+            ?assertEqual(2030, Error(Q, {<<"{K[7]}">>})),
+            ?assertEqual(2030, Error(Q, {<<"{K[x]}">>})),
+            ?assertEqual(2042, Error(Q, {<<"{K[0]}">>, <<"{V[0]}">>})),
+            ?assertEqual(2041, Error({{term, a}, {term, z}}, {<<"{K[0]}">>})),
+            %% A range without rows gives no error of a row.
+            ?assertEqual({ok, []}, Error({pack({<<"none">>}), pack({<<"nonf">>})}, {<<"{K[7]}">>})),
+            Tx = deadlift:create_transaction(D),
+            ?assertError({unsupported, term_mapper}, deadlift:get_mapped_range(Tx, Begin, End, {term, anything})),
+            ?assertError({unsupported, reverse}, deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{reverse, true}])),
+            ?assertError({erlfdb_error, 2108}, deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{snapshot, true}])),
+            ?assertError({erlfdb_error, 2108}, deadlift:get_mapped_range(deadlift:snapshot(Tx), Begin, End, Mapper)),
+            ?assertError(badarg, deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{limit, -1}])),
+            ?assertError(badarg, deadlift:get_mapped_range(Tx, Begin, End, "list")),
+            ?assertError({invalid_tuple_term, an_atom}, deadlift:get_mapped_range(Tx, Begin, End, {an_atom, <<"{...}">>}))
+        end,
+        [Db, Message]
+    ).
+
+%% The read conflict ranges of `get_mapped_range/5', and the error for a
+%% write of the same transaction.
+mapped_range_conflicts(Db) ->
+    ok = load_records(Db, lists:seq(10, 19)),
+    {Begin, End} = {pack({<<"p">>, <<"INDEX">>}), pack({<<"p">>, <<"INDEY">>})},
+    Range = {<<"p">>, <<"RECORD">>, <<"{K[3]}">>, <<"{...}">>},
+    Point = {<<"p">>, <<"RECORD">>, <<"{K[3]}">>, 1},
+    %% `Other' runs in another transaction between the read and the commit
+    %% of a transaction. The result is `ok' or the error code of the
+    %% commit.
+    Commit = fun(Mapper, Options, Other) ->
+        Tx = deadlift:create_transaction(Db),
+        _ = deadlift:get_mapped_range(Tx, Begin, End, Mapper, Options),
+        ok = deadlift:set(Tx, other, 1),
+        ok = deadlift:transactional(Db, Other),
+        try
+            deadlift:wait(deadlift:commit(Tx))
+        catch
+            error:{erlfdb_error, Code} -> Code
+        end
+    end,
+    Set = fun(Key) -> fun(Tx) -> deadlift:set(Tx, Key, pack({<<"new">>})) end end,
+    %% A new index row, a changed record row and a new record row.
+    ?assertEqual(1020, Commit(Range, [], Set(index_key(5)))),
+    ?assertEqual(1020, Commit(Range, [], Set(record_key(12, 2)))),
+    ?assertEqual(1020, Commit(Range, [], Set(record_key(12, 7)))),
+    ?assertEqual(1020, Commit(Range, [], fun(Tx) -> deadlift:clear(Tx, record_key(19, 0)) end)),
+    %% A record that no index row names.
+    ?assertEqual(ok, Commit(Range, [], Set(record_key(40, 0)))),
+    ?assertEqual(ok, Commit(Range, [], Set(pack({<<"p">>, <<"RECORD">>})))),
+    %% With a limit, the keys after the last row give no conflict.
+    ?assertEqual(ok, Commit(Range, [{limit, 3}], Set(index_key(18)))),
+    ?assertEqual(ok, Commit(Range, [{limit, 3}], Set(record_key(18, 0)))),
+    ?assertEqual(1020, Commit(Range, [{limit, 3}], Set(index_key(11)))),
+    ?assertEqual(1020, Commit(Range, [{limit, 3}], Set(record_key(12, 0)))),
+    %% A second read of one key.
+    ?assertEqual(1020, Commit(Point, [], Set(record_key(13, 1)))),
+    ?assertEqual(ok, Commit(Point, [], Set(record_key(13, 0)))),
+    %% The transaction has written or cleared a key of the range or of a
+    %% second read.
+    Own = fun(Mapper, Write) ->
+        Tx = deadlift:create_transaction(Db),
+        ok = Write(Tx),
+        try deadlift:get_mapped_range(Tx, Begin, End, Mapper) of
+            Rows -> {ok, length(Rows)}
+        catch
+            error:{erlfdb_error, Code} -> Code
+        end
+    end,
+    ?assertEqual(2039, Own(Range, Set(index_key(14)))),
+    ?assertEqual(2039, Own(Range, Set(record_key(14, 9)))),
+    ?assertEqual(2039, Own(Range, fun(Tx) -> deadlift:clear(Tx, record_key(14, 0)) end)),
+    ?assertEqual(2039, Own(Range, fun(Tx) -> deadlift:clear_range(Tx, record_key(15, 1), record_key(15, 2)) end)),
+    ?assertEqual({ok, 11}, Own(Range, fun(Tx) -> deadlift:clear_range(Tx, record_key(40, 0), record_key(41, 0)) end)),
+    ?assertEqual(2039, Own(Point, Set(record_key(14, 1)))),
+    ?assertEqual({ok, 11}, Own(Point, Set(record_key(14, 0)))),
+    ?assertEqual({ok, 11}, Own(Range, Set(record_key(40, 0)))).
+
+%% 300 random transactions set and clear index rows and records. After
+%% each one, `get_mapped_range/5' at the newest version and at an older
+%% version of the MVCC window gives the result of `get_range/3' and of the
+%% second reads with `get_range/3' and `get/2' at the same read version,
+%% for a read from the ETS tables and for a read by message.
+mapped_range_random(Db = {deadlift_database, Servers}) ->
+    Message = {deadlift_database, Servers#{direct => false}},
+    {Begin, End} = {pack({<<"p">>, <<"INDEX">>}), pack({<<"p">>, <<"INDEY">>})},
+    Check = fun(D, ReadVersion, Limit) ->
+        Mapped = deadlift:create_transaction(D),
+        Plain = deadlift:create_transaction(D),
+        try
+            Version =
+                case ReadVersion of
+                    newest -> deadlift:get_read_version(Plain);
+                    _ -> ReadVersion
+                end,
+            ok = deadlift:set_read_version(Mapped, Version),
+            ok = deadlift:set_read_version(Plain, Version),
+            Rows = lists:sublist(deadlift:get_range(Plain, Begin, End), Limit),
+            ?assertEqual(
+                [
+                    begin
+                        {_, _, _, I} = deadlift_tuple:unpack(Key),
+                        Range = {From, To} = deadlift_mapper:range(range, pack({<<"p">>, <<"RECORD">>, I})),
+                        {{Key, Value}, Range, deadlift:get_range(Plain, From, To)}
+                    end
+                 || {Key, Value} <- Rows
+                ],
+                deadlift:get_mapped_range(Mapped, Begin, End, {<<"p">>, <<"RECORD">>, <<"{K[3]}">>, <<"{...}">>}, [{limit, Limit}])
+            ),
+            ?assertEqual(
+                [
+                    begin
+                        {_, _, _, I} = deadlift_tuple:unpack(Key),
+                        Second = record_key(I, 1),
+                        {{Key, Value}, {Second, <<Second/binary, 0>>}, [{Second, Found} || Found <- [deadlift:get(Plain, Second)], Found =/= not_found]}
+                    end
+                 || {Key, Value} <- Rows
+                ],
+                deadlift:get_mapped_range(Mapped, Begin, End, {<<"p">>, <<"RECORD">>, <<"{K[3]}">>, 1}, [{limit, Limit}])
+            ),
+            ok
+        catch
+            %% The older version left the MVCC window.
+            error:{erlfdb_error, 1007} -> too_old
+        end
+    end,
+    Rand0 = rand:seed_s(exsss, {4, 5, 6}),
+    {_, Checks} = lists:foldl(
+        fun(N, {Rand, Acc}) ->
+            {R, Rand1} = rand:uniform_s(1 bsl 30, Rand),
+            I = R rem 12,
+            ok = deadlift:transactional(Db, fun(Tx) ->
+                case (R bsr 8) rem 5 of
+                    0 -> deadlift:clear(Tx, index_key(I));
+                    1 -> deadlift:clear_range(Tx, record_key(I, 0), record_key(I, 2));
+                    2 -> deadlift:set(Tx, index_key(I), pack({N}));
+                    _ -> deadlift:set(Tx, record_key(I, (R bsr 12) rem 3), pack({N}))
+                end
+            end),
+            Version = deadlift:transactional(Db, fun(Tx) -> deadlift:get_read_version(Tx) end),
+            Results = [Check(D, V, Limit) || D <- [Db, Message], V <- [newest, Version - (R bsr 16) rem 15], Limit <- [(R bsr 20) rem 4 + 1, 100]],
+            {Rand1, Results ++ Acc}
+        end,
+        {Rand0, []},
+        lists:seq(1, 300)
+    ),
+    %% Most reads are inside the MVCC window.
+    ?assert(length([ok || ok <- Checks]) > 1500, length([ok || ok <- Checks])).

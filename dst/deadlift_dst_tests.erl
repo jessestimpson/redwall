@@ -387,10 +387,11 @@ no_window_check_is_found_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_window_check}) end),
         ?debugFmt("no_window_check: seed ~p, ~p", [Seed, Violation]),
-        %% A read returns no value for a key that has one, or a select
-        %% and a read of the same range differ, because the two read at
-        %% two times and the StorageServer removes versions in between.
-        ?assert(lists:member(maps:get(property, Violation), [read_value, select_agrees]), Violation)
+        %% A read returns no value for a key that has one, or a select or
+        %% a mapped range read and a read of the same range differ,
+        %% because the two read at two times and the StorageServer removes
+        %% versions in between.
+        ?assert(lists:member(maps:get(property, Violation), [read_value, select_agrees, mapped_range_agrees]), Violation)
     end}.
 
 %% A planted defect: the StorageServer answers a read at a version that it

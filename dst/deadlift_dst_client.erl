@@ -288,7 +288,7 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             ok = deadlift:set_read_version(Tx, ReadVersion),
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
             true = ets:insert(Tab, {{read, C}, Read}),
-            case read_keys(Tab, Tx, Reads, Ranges) of
+            case read_keys(Tab, Db, Tx, Reads, Ranges) of
                 {ok, Values, Generation, Down} ->
                     true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation, down => Down, direct => Direct, local => node() =/= clients}}),
                     commit(Tab, C, Tx, Read, {Reads, Ranges}, Writes, Chosen, R);
@@ -309,7 +309,7 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
 %% each key of the workload in each range. The client library does not
 %% return the LSN of the record that wrote a value. The harness finds that
 %% LSN in the records of the LogServers.
-read_keys(Tab, Tx, Keys, Ranges) ->
+read_keys(Tab, Db, Tx, Keys, Ranges) ->
     %% `Generation' is the number of StorageServers that the harness
     %% started after a kill. `Down' is the number of StorageServers that
     %% are not alive, and the number of StorageServers.
@@ -321,6 +321,7 @@ read_keys(Tab, Tx, Keys, Ranges) ->
             begin
                 Found = deadlift:get_range(Tx, Begin, End),
                 ok = select(Tab, Tx, Range, Found),
+                ok = mapped_range(Tab, Db, deadlift:get_read_version(Tx), Range, Found),
                 %% The read returns no key outside the range, and the keys
                 %% are in their order.
                 [] = [Key || {Key, _Value} <- Found, not lists:member(Key, keys_in(Range))],
@@ -358,6 +359,46 @@ select(Tab, Tx, {Begin, End}, Found) ->
         Specs
     ).
 
+%% Reads the range with `deadlift:get_mapped_range/4' and two mappers, at
+%% the read version of the transaction:
+%%
+%% <ul>
+%% <li>The mapper `{<<"k">>, <<"{K[1]}">>}' maps each key to itself, so the
+%%   second read of a row must return the row.</li>
+%% <li>The mapper `{<<"k">>, <<"{...}">>}' maps each key to every key of
+%%   the workload, so the second read of a row must return the result of
+%%   `get_range/3' on every key.</li>
+%% </ul>
+%%
+%% `Found' is the result of `get_range/3' on the range. The reads use a
+%% second transaction with the same read version, so that the transaction
+%% of the client gets no read conflict range from them. The function
+%% records a difference in the table of the run, for the invariant
+%% `mapped_range_agrees'.
+mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found) ->
+    Tx = {deadlift_transaction, Table} = deadlift:create_transaction(Db),
+    try
+        ok = deadlift:set_read_version(Tx, ReadVersion),
+        Every = {From, To} = deadlift_mapper:range(range, deadlift_tuple:pack({<<"k">>})),
+        All = deadlift:get_range(deadlift:snapshot(Tx), From, To),
+        Cases = [
+            {{<<"k">>, <<"{K[1]}">>}, [{Row, deadlift_mapper:range(point, Key), [Row]} || Row = {Key, _Value} <- Found]},
+            {{<<"k">>, <<"{...}">>}, [{Row, Every, All} || Row <- Found]}
+        ],
+        lists:foreach(
+            fun({Mapper, Expected}) ->
+                N = ets:update_counter(Tab, mapped_reads, 1, {mapped_reads, 0}),
+                case deadlift:get_mapped_range(Tx, Begin, End, Mapper) of
+                    Expected -> ok;
+                    Other -> true = ets:insert(Tab, {{mapped_differs, N}, #{range => {Begin, End}, mapper => Mapper, expected => Expected, mapped => Other}})
+                end
+            end,
+            Cases
+        )
+    after
+        ets:delete(Table)
+    end.
+
 %% The StorageServers that the table of the run has.
 storages(Tab) ->
     [Storage || [_Slot, Storage] <- lists:sort(ets:match(Tab, {{storage, '$1'}, '$2', '_', '_'}))].
@@ -369,9 +410,9 @@ found(Value) -> {Value, unknown}.
 keys_in({Begin, End}) ->
     [Key || Key <- keys(), Key >= Begin, Key < End].
 
-%% One of the 10 ranges whose bounds are the 4 keys and `k5'.
+%% One of the 10 ranges whose bounds are the 4 keys and the key 5.
 range(R) ->
-    Bounds = keys() ++ [k5],
+    Bounds = keys() ++ [key(5)],
     Pairs = [{Begin, End} || Begin <- Bounds, End <- Bounds, Begin < End],
     lists:nth(R rem length(Pairs) + 1, Pairs).
 
@@ -434,7 +475,11 @@ latest_proxy(Tab, Default) ->
     end.
 
 %% The keys of the workload. A small number of keys gives many conflicts.
-keys() -> [k1, k2, k3, k4].
+%% The keys are packed tuples, so that the mapper of
+%% `deadlift:get_mapped_range/4' can read them.
+keys() -> [key(I) || I <- [1, 2, 3, 4]].
+
+key(I) -> deadlift_tuple:pack({<<"k">>, I}).
 
 %% The simulated nodes. `N' is the number of the `recover' operation.
 sequencer_node(N) -> list_to_atom("sequencer_" ++ integer_to_list(N)).

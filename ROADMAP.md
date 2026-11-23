@@ -126,12 +126,19 @@ has the basic functions. The remaining parts, in the planned order:
 
 - [x] `select/4`: evaluate an ETS match spec on a key range in the
       StorageServer with ETS tables. erlfdb has no such function.
+- [x] `get_mapped_range/4,5` with the mapper of FoundationDB, and the
+      tuple layer (`deadlift_tuple`). The argument `{term, Term}` is
+      reserved for a mapper that is an Erlang term.
+- [ ] A mapper that is an Erlang term, for `get_mapped_range`. The
+      design is open. FoundationDB has no such mapper.
+- [ ] `get_mapped_range` with key selectors, `reverse`, a database as
+      the first argument, and the fold and iterator forms of erlfdb.
 - [ ] `select` for every key with a prefix, with `ets:select/2` and a
       bound prefix of the key, together with `get_range_startswith`.
 - [ ] A count with a match spec, and a continuation for `select` with a
       limit.
 - [ ] `get_range` with `limit` and `reverse`, key selectors and
-      `get_key`. This step makes the tuple layer, subspaces and the
+      `get_key`. This step makes subspaces and the
       directory layer of erlfdb usable.
 - [ ] The fold functions, `get_range_startswith` and
       `clear_range_startswith`.

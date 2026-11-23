@@ -399,6 +399,81 @@ A select with guards reads every row of the table, and a select with a
 bound prefix reads every row of the prefix. The walk reads the rows of
 the range.
 
+### Mapped range
+
+`deadlift:get_mapped_range/4,5` is `erlfdb:get_mapped_range/4,5`, which
+is `getMappedRange` of FoundationDB 7.3. The function reads a key range,
+and the StorageServer performs a second read for each row of the range.
+An application reads the rows of an index and the record of each row in
+one request:
+
+```erlang
+%% The key of an index row is {<<"index">>, City, Id}, and the key of a
+%% record is {<<"user">>, Id}. Both are packed with deadlift_tuple.
+Mapper = {<<"user">>, <<"{K[2]}">>, <<"{...}">>},
+{Begin, End} = deadlift_tuple:range({<<"index">>, <<"Oslo">>}),
+deadlift:transactional(Db, fun(Tx) ->
+    deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{limit, 100}])
+end).
+%% [{{IndexKey, IndexValue}, {SecondBegin, SecondEnd}, [{UserKey, User}]}, ...]
+```
+
+The mapper describes the key of the second read. deadlift has two kinds
+of mapper:
+
+| Mapper | Argument of `get_mapped_range` | Status |
+|---|---|---|
+| The mapper of FoundationDB: a tuple of the tuple layer | A tuple, which the client packs as erlfdb does, or a binary with the packed tuple | Supported |
+| A mapper that is an Erlang term | `{term, Term}` | Reserved. The call raises `{unsupported, term_mapper}`. deadlift is free to define this mapper later, because FoundationDB has none |
+
+The elements of the mapper of FoundationDB:
+
+| Element of the mapper | Element of the mapped key |
+|---|---|
+| `{K[i]}` | Element `i` of the key of the row, from 0. The key must be a packed tuple |
+| `{V[i]}` | Element `i` of the value of the row, from 0. The value must be a packed tuple |
+| `{...}`, as the last element | None. The second read is a read of every key that starts with the mapped key. Without it, the second read is a read of the mapped key |
+| A string with `{{` or `}}` | The string with `{{` replaced by `{` and `}}` replaced by `}` |
+| Another element | The element itself |
+
+- The result has one element for each row of the range, in the order of
+  the keys: the row, the key range of the second read, and the rows that
+  the second read found. A row whose second read finds nothing has an
+  empty list. The type is `mapped_kv()` of erlfdb.
+- The second reads use the read version of the transaction.
+- The transaction gets a read conflict range for the range and one for
+  each second read.
+- The function does not return the writes of its transaction. It raises
+  2039 if the transaction has written or cleared a key of the range or
+  of a second read. It raises 2108 for a snapshot. FoundationDB has both
+  rules.
+- The errors of the mapper have the codes of FoundationDB: 2030
+  (`mapper_bad_index`), 2032 (`mapper_bad_range_decriptor`), 2041
+  (`key_not_tuple`), 2042 (`value_not_tuple`) and 2043
+  (`mapper_not_tuple`).
+- The options are a list. `{limit, N}` returns the first `N` rows of the
+  range. A caller continues after the key of the last row.
+- [src/deadlift_tuple.erl](src/deadlift_tuple.erl) is the tuple layer:
+  a copy of `erlfdb_tuple` of erlfdb 1.2.3 (Apache License 2.0).
+- The handle of the StorageServer has the feature `mapped_range`.
+
+Differences from FoundationDB 7.3.62 and erlfdb 1.2.3:
+
+- A mapper without `{...}` returns every row with its key, its value and
+  the result of the second read. The StorageServer of FoundationDB
+  returns the key and the value of the first and of the last row only,
+  and the bindings for C and for Erlang decode only the result of a
+  mapper with `{...}`.
+- A second read of a prefix has no limit. FoundationDB returns the first
+  2,000 rows of it.
+- The read has no limit of bytes. FoundationDB ends a reply at 80,000
+  bytes.
+- A mapper with `{...}` as the only element raises 2032. The
+  StorageServer of FoundationDB fails an assertion.
+- The function takes keys and a transaction. erlfdb also takes key
+  selectors and a database, and has the options `reverse`, `wait`,
+  `target_bytes` and `streaming_mode`.
+
 ### The Proxy
 
 The process of an epoch commits a batch of transactions in five steps
@@ -864,6 +939,7 @@ The harness checks these invariants after every step:
 | `storage_rollback` | When a StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one |
 | `replicas_agree` | Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both |
 | `select_agrees` | A `deadlift:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
+| `mapped_range_agrees` | A `deadlift:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -895,6 +971,16 @@ Results of `make dst` on 2026-11-22:
 | Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 3, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 | Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
 | Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value` |
+
+A run of `make dst` on 2026-11-23, with the invariant
+`mapped_range_agrees`: the 32 tests pass in 122 s. The runs compared
+21,780 mapped range reads with reads of the same read version:
+
+| Tests | Mapped range reads compared | Result |
+|---|---|---|
+| No kills, no partitions, no lost or delayed messages | 7,622 | No violation |
+| Kills, partitions, lost and delayed messages | 8,111 | No violation |
+| ClusterControllers, 4 tests | 6,047 | No violation |
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
@@ -945,6 +1031,8 @@ A value has 100 bytes.
 | `read_after_write` | A client commits a write and reads the key at the commit version. The row has the time of the read, which ends when the StorageServer has applied the record |
 | `select_by_message`, `select_direct` | `deadlift:select/4` on a range of 1,000 of 100,000 rows with values of 1,000 bytes, of which 10 match, from the node of the benchmark and on the node of the StorageServer |
 | `filter_by_message`, `filter_direct` | The same result with `get_range/3` and the match spec in the client |
+| `mapped_by_message`, `mapped_direct` | `deadlift:get_mapped_range/4` on 100 index rows of 10,000, each with a second read of one record with a value of 1,000 bytes, from the node of the benchmark and on the node of the StorageServer |
+| `join_by_message`, `join_direct` | The same result with `get_range/3` for the index rows and one `get_range/3` for each record |
 | `read_by_message` | The read of one key at a read version that the client has, from the node of the benchmark |
 | `read_direct` | The same read by a client on the node of the StorageServer, from the ETS table |
 
@@ -988,6 +1076,20 @@ more. The machine has 4 performance cores and 6 efficiency cores.
 | `select_direct` | 2 | 7654 | 255 | 366 | 402 | 1.00 |
 | `filter_direct` | 1 | 1467 | 677 | 834 | 870 | 1.00 |
 | `filter_direct` | 2 | 2603 | 762 | 982 | 1049 | 1.00 |
+| `mapped_by_message` | 1 | 2496 | 400 | 438 | 467 | 1.00 |
+| `mapped_by_message` | 16 | 6554 | 2443 | 2658 | 3053 | 1.00 |
+| `join_by_message` | 1 | 348 | 2899 | 3056 | 3355 | 1.00 |
+| `join_by_message` | 16 | 1395 | 11396 | 12496 | 13196 | 1.00 |
+| `mapped_direct` | 1 | 3717 | 269 | 293 | 313 | 1.00 |
+| `mapped_direct` | 2 | 6870 | 291 | 331 | 356 | 1.00 |
+| `join_direct` | 1 | 2612 | 384 | 421 | 457 | 1.00 |
+| `join_direct` | 2 | 4480 | 446 | 507 | 598 | 1.00 |
+
+The rows `mapped` and `join` are from a later run on 2026-11-23. With
+one client on the node of the benchmark, a mapped range read takes 400
+us, and the same reads by the client take 2,899 us, because the client
+sends 101 requests. On the node of the StorageServer the times are 269
+us and 384 us.
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
@@ -1242,6 +1344,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/deadlift_epoch.erl](src/deadlift_epoch.erl) | The process of an epoch: the Sequencer, the Resolver and the Proxy |
 | [src/deadlift_storage.erl](src/deadlift_storage.erl) | The StorageServer |
 | [src/deadlift.erl](src/deadlift.erl) | The client, with the function names of erlfdb |
+| [src/deadlift_mapper.erl](src/deadlift_mapper.erl) | The mapper of a mapped range read |
+| [src/deadlift_tuple.erl](src/deadlift_tuple.erl), [src/deadlift_float.erl](src/deadlift_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |
 | [src/deadlift_cluster_controller.erl](src/deadlift_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |
 | [src/deadlift_worker.erl](src/deadlift_worker.erl) | The worker of one node, which starts roles for the ClusterController |
 | [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
@@ -1259,6 +1363,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [test/deadlift_epoch_tests.erl](test/deadlift_epoch_tests.erl) | Tests for `deadlift_epoch` |
 | [test/deadlift_resolver_tests.erl](test/deadlift_resolver_tests.erl) | Tests for `deadlift_resolver` |
 | [test/deadlift_storage_tests.erl](test/deadlift_storage_tests.erl) | Tests for `deadlift_storage` |
+| [test/deadlift_mapper_tests.erl](test/deadlift_mapper_tests.erl) | Tests for `deadlift_mapper`, with the cases of the unit test of FoundationDB |
 | [formal/Recovery.tla](formal/Recovery.tla) | TLA+ model of the logging protocol, the recovery, read versions and the StorageServer |
 | [formal/Resolver.tla](formal/Resolver.tla) | TLA+ model of the Resolver |
 | [formal/MCRecovery.tla](formal/MCRecovery.tla), [formal/MCResolver.tla](formal/MCResolver.tla) | Constants and invariants for model checking |
@@ -1273,7 +1378,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - The client has the basic functions of erlfdb only. It has no key
   selectors, no options of `get_range`, no atomic operations, no
   versionstamped keys and values, no watches, no transaction options, no
-  tenants and no `get_last_error/0`. It has no tuple layer, no subspaces
+  tenants and no `get_last_error/0`. It has the tuple layer, but no subspaces
   and no directory layer.
 - A database of the client is a Proxy and a list of StorageServers that
   the caller names. deadlift has no process that tells a client which

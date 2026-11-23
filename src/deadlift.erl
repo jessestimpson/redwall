@@ -108,6 +108,8 @@
 %% <li>1021, `commit_unknown_result': the transaction is committed or is
 %%   not committed.</li>
 %% <li>1025, `transaction_cancelled'.</li>
+%% <li>2030, 2032, 2039, 2041, 2042, 2043 and 2108: the errors of
+%%   `get_mapped_range/5'.</li>
 %% <li>1037, `process_behind': the Proxy does not answer, or no
 %%   StorageServer is alive. FoundationDB has this code for a StorageServer that is
 %%   behind. The client of FoundationDB waits for a new Proxy instead of
@@ -155,6 +157,8 @@
 %% == Limitations ==
 %%
 %% <ul>
+%% <li>`get_mapped_range/5' has a part of the options of erlfdb. See the
+%%   documentation of the function.</li>
 %% <li>The module has no key selectors, no options of `get_range', no
 %%   atomic operations, no versionstamped keys and values, no watches, no
 %%   transaction options, no tenants and no `get_last_error/0'.</li>
@@ -178,15 +182,24 @@
 
 -export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, select/4, select/5, set/3, clear/2, clear_range/3]).
+-export([get_mapped_range/4, get_mapped_range/5]).
 -export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
 -export([add_read_conflict_key/2, add_read_conflict_range/3, is_read_only/1]).
 
--export_type([database/0, transaction/0, snapshot/0, key/0, value/0, profile/0]).
+-export_type([database/0, transaction/0, snapshot/0, key/0, value/0, profile/0, mapper/0, mapped_kv/0]).
 
 -type key() :: term().
 -type value() :: term().
 -type version() :: deadlift_cstate:version().
+
+%% A mapper of `get_mapped_range/5'. A tuple and a binary are the mapper
+%% of FoundationDB. `{term, Term}' is reserved.
+-type mapper() :: tuple() | binary() | {term, term()}.
+
+%% A row of `get_mapped_range/5', as in erlfdb: the row of the range, the
+%% key range of the second read, and the rows of the second read.
+-type mapped_kv() :: {{key(), value()}, {key(), key()}, [{key(), value()}]}.
 
 %% A process, or a function that returns the process that runs now.
 -type server() :: gen_server:server_ref() | fun(() -> gen_server:server_ref() | undefined).
@@ -230,6 +243,8 @@
 -define(COMMIT_UNKNOWN_RESULT, 1021).
 -define(TRANSACTION_CANCELLED, 1025).
 -define(PROCESS_BEHIND, 1037).
+-define(GET_MAPPED_RANGE_READS_YOUR_WRITES, 2039).
+-define(UNSUPPORTED_OPERATION, 2108).
 
 %% ---------------------------------------------------------------------------
 %% Database and transaction
@@ -430,9 +445,7 @@ select(TxOrSnapshot, Begin, End, MatchSpec, Options) when is_list(Options) ->
     Guards = [{'>=', '$1', {const, Begin}}, {'<', '$1', {const, End}}],
     Written = ets:select(Table, [{{{w, '$1'}, {set, '$2'}}, Guards, [{{'$1', '$2'}}]}]),
     Mine = deadlift_storage:select_rows(Written, MatchSpec),
-    Own =
-        ets:select_count(Table, [{{{w, '$1'}, '_'}, Guards, [true]}]) > 0 orelse
-            ets:select_count(Table, [{{{cr, '_'}, '$1', '$2'}, [{'<', '$1', {const, End}}, {'<', {const, Begin}, '$2'}], [true]}]) > 0,
+    Own = changed(Table, Begin, End),
     %% The StorageServer applies the limit only if the transaction has
     %% changed no key of the range. Otherwise a stored result can be a key
     %% that the transaction cleared, and the limit is applied after the
@@ -450,6 +463,128 @@ select(TxOrSnapshot, Begin, End, MatchSpec, Options) when is_list(Options) ->
         infinity -> Results;
         _ -> lists:sublist(Results, Limit)
     end.
+
+%% @equiv get_mapped_range(Tx, Begin, End, Mapper, [])
+-spec get_mapped_range(transaction(), key(), key(), mapper()) -> [mapped_kv()].
+get_mapped_range(Tx, Begin, End, Mapper) ->
+    get_mapped_range(Tx, Begin, End, Mapper, []).
+
+%% @doc Reads the keys `K' with `Begin =< K' and `K < End', and performs
+%% a second read for each of them in the StorageServer. The function is
+%% `erlfdb:get_mapped_range/5', which is `getMappedRange' of FoundationDB
+%% 7.3. An application uses it to read the rows of an index and the record
+%% of each row in one request.
+%%
+%% ```
+%% %% The key of an index row is {<<"index">>, City, Id} and the key of a
+%% %% record is {<<"user">>, Id}, both packed with deadlift_tuple.
+%% Mapper = {<<"user">>, <<"{K[2]}">>, <<"{...}">>},
+%% {Begin, End} = deadlift_tuple:range({<<"index">>, <<"Oslo">>}),
+%% [{{IndexKey, _}, _Range, [{UserKey, User}]} | _] =
+%%     deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{limit, 100}])
+%% '''
+%%
+%% `Mapper' describes the key of the second read. See
+%% {@link deadlift_mapper} for the mapper of FoundationDB.
+%%
+%% <ul>
+%% <li>A tuple is the mapper of FoundationDB as erlfdb takes it. The
+%%   function packs it with `deadlift_tuple:pack/1'.</li>
+%% <li>A binary is the mapper of FoundationDB in its packed form.</li>
+%% <li>`{term, Term}' is reserved for a mapper that is an Erlang term.
+%%   deadlift defines no such mapper yet, and the function raises
+%%   `{unsupported, term_mapper}'. FoundationDB has no such mapper. No
+%%   tuple of the tuple layer starts with the atom `term'.</li>
+%% </ul>
+%%
+%% The result has one element for each key of the range, in the order of
+%% the keys: `{{Key, Value}, {SecondBegin, SecondEnd}, Rows}'.
+%% `{SecondBegin, SecondEnd}' is the key range of the second read, and
+%% `Rows' has the `{Key, Value}' that the second read found.
+%%
+%% <ul>
+%% <li>`Options' is a list. `{limit, N}' returns the first `N' keys of the
+%%   range, and 0 is no limit. To continue, a caller starts the next call
+%%   after the key of the last element. `{snapshot, true}' raises 2108,
+%%   and `{reverse, true}' raises `{unsupported, reverse}'. The function
+%%   ignores the other options of erlfdb.</li>
+%% <li>The transaction gets a read conflict range for the range, and one
+%%   for each second read. With a limit that the result reaches, the
+%%   conflict range of the range ends after the last key, if that key is a
+%%   binary.</li>
+%% <li>The function does not return the writes of the transaction. If the
+%%   transaction has written or cleared a key of the range or of a second
+%%   read, the function raises 2039,
+%%   `get_mapped_range_reads_your_writes', as FoundationDB does.</li>
+%% <li>A snapshot raises 2108, `unsupported_operation', as FoundationDB
+%%   does for a transaction with read-your-writes.</li>
+%% <li>The errors of the mapper are 2030, 2032, 2041, 2042 and 2043. See
+%%   {@link deadlift_mapper}. `on_error/2' raises them again.</li>
+%% <li>A StorageServer whose handle does not have the feature
+%%   `mapped_range' raises `{unsupported, mapped_range}'.</li>
+%% </ul>
+%%
+%% Differences from FoundationDB and erlfdb:
+%%
+%% <ul>
+%% <li>A mapper without `{...}' gives a second read of one key. The result
+%%   of deadlift has the key range `{MappedKey, <<MappedKey/binary, 0>>}'
+%%   and the list with the row of the key, or an empty list. The bindings
+%%   of FoundationDB for C and for Erlang decode only a result of a mapper
+%%   with `{...}', and the StorageServer of FoundationDB returns the key
+%%   and the value of the first and of the last row only.</li>
+%% <li>`Begin' and `End' are keys. erlfdb also takes key selectors.</li>
+%% <li>The first argument is a transaction. erlfdb also takes a
+%%   database.</li>
+%% <li>The result is the list. erlfdb can return a future or an iterator
+%%   with the option `wait'.</li>
+%% </ul>
+-spec get_mapped_range(transaction(), key(), key(), mapper(), [{limit, non_neg_integer()} | {atom(), term()}]) -> [mapped_kv()].
+get_mapped_range(?IS_SS, _Begin, _End, _Mapper, _Options) ->
+    error({erlfdb_error, ?UNSUPPORTED_OPERATION});
+get_mapped_range(?IS_TX = Tx, Begin, End, Mapper, Options) when is_list(Options) ->
+    {Table, _Conflict} = table(Tx),
+    Limit =
+        case proplists:get_value(limit, Options, 0) of
+            0 -> infinity;
+            N when is_integer(N), N > 0 -> N;
+            _ -> error(badarg)
+        end,
+    _ = proplists:get_value(snapshot, Options, false) =:= true andalso error({erlfdb_error, ?UNSUPPORTED_OPERATION}),
+    _ = lists:member(proplists:get_value(reverse, Options, false), [false, 0]) orelse error({unsupported, reverse}),
+    Packed =
+        case Mapper of
+            {term, _Term} -> error({unsupported, term_mapper});
+            _ when is_tuple(Mapper) -> deadlift_tuple:pack(Mapper);
+            _ when is_binary(Mapper) -> Mapper;
+            _ -> error(badarg)
+        end,
+    case read(Table, {mapped, Begin, End, {tuple, Packed}, Limit}) of
+        {ok, Rows} ->
+            %% The range that the result covers.
+            Primary =
+                case Rows =/= [] andalso lists:last(Rows) of
+                    {{Last, _Value}, _Range, _Found} when length(Rows) =:= Limit, is_binary(Last) -> {Begin, <<Last/binary, 0>>};
+                    _ -> {Begin, End}
+                end,
+            Ranges = [Primary | [Range || {_Row, Range, _Found} <- Rows]],
+            _ = [error({erlfdb_error, ?GET_MAPPED_RANGE_READS_YOUR_WRITES}) || {From, To} <- Ranges, changed(Table, From, To)],
+            true = ets:insert(Table, [conflict(Table, Range) || Range <- Ranges]),
+            Rows;
+        {error, {mapper, Reason}} ->
+            error({erlfdb_error, deadlift_mapper:code(Reason)})
+    end.
+
+%% The row of the transaction for a read conflict: a key for a range of
+%% one key, and a range otherwise.
+conflict(_Table, {Key, <<After/binary>>}) when is_binary(Key), After =:= <<Key/binary, 0>> -> {{r, Key}};
+conflict(Table, {Begin, End}) -> {{rr, next(Table)}, Begin, End}.
+
+%% The transaction has written or cleared a key of the range.
+changed(Table, Begin, End) ->
+    Guards = [{'>=', '$1', {const, Begin}}, {'<', '$1', {const, End}}],
+    ets:select_count(Table, [{{{w, '$1'}, '_'}, Guards, [true]}]) > 0 orelse
+        ets:select_count(Table, [{{{cr, '_'}, '$1', '$2'}, [{'<', '$1', {const, End}}, {'<', {const, Begin}, '$2'}], [true]}]) > 0.
 
 %% The key is in a key range that the transaction cleared, and the
 %% transaction has not written the key after that.
@@ -513,14 +648,19 @@ read_direct_each(Table, [Storage | Storages], Query, Version) ->
     end.
 
 %% A direct read. A select needs a StorageServer with the feature
-%% `select'.
-read_handle(Handle, Query, Version) when element(1, Query) =:= select ->
-    case lists:member(select, maps:get(features, Handle, [])) of
-        true -> deadlift_storage:read_direct(Handle, Query, Version);
-        false -> error({unsupported, select})
-    end;
+%% `select', and a mapped range read needs one with the feature
+%% `mapped_range'.
 read_handle(Handle, Query, Version) ->
-    deadlift_storage:read_direct(Handle, Query, Version).
+    Feature =
+        case element(1, Query) of
+            select -> select;
+            mapped -> mapped_range;
+            _KeyOrRange -> none
+        end,
+    case Feature =:= none orelse lists:member(Feature, maps:get(features, Handle, [])) of
+        true -> deadlift_storage:read_direct(Handle, Query, Version);
+        false -> error({unsupported, Feature})
+    end.
 
 handle(Table, Storage) ->
     case ets:lookup(Table, {storage_handle, Storage}) of
@@ -551,11 +691,13 @@ read_by_message([Storage | Storages], Query, Version, Timeout, Code) ->
         case Query of
             {key, Key} -> deadlift_storage:read_with_version(Storage, Key, Version, Timeout);
             {range, Begin, End} -> deadlift_storage:read_range_with_version(Storage, Begin, End, Version, Timeout);
-            {select, Begin, End, MatchSpec, Limit} -> deadlift_storage:select(Storage, Begin, End, MatchSpec, Limit, Version, Timeout)
+            {select, Begin, End, MatchSpec, Limit} -> deadlift_storage:select(Storage, Begin, End, MatchSpec, Limit, Version, Timeout);
+            {mapped, Begin, End, Mapper, Limit} -> deadlift_storage:mapped_range(Storage, Begin, End, Mapper, Limit, Version, Timeout)
         end,
     case Answer of
         {error, transaction_too_old} -> error({erlfdb_error, ?TRANSACTION_TOO_OLD});
         {error, badarg} -> error(badarg);
+        {error, {mapper, _Reason}} -> Answer;
         {error, {timeout, _}} -> read_by_message(Storages, Query, Version, Timeout, ?FUTURE_VERSION);
         {error, _Reason} -> read_by_message(Storages, Query, Version, Timeout, Code);
         Result -> Result
