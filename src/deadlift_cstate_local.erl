@@ -14,6 +14,10 @@
 %% `cas => false' plants a defect for the simulation: the process accepts a
 %% write from a Sequencer whose epoch is not the recovery count. The config
 %% `RecoveryNoCas' of the model has the same defect.
+%%
+%% `elect_cas => false' plants a second defect: the process accepts the
+%% proposal of a candidate for the ClusterController with any term. Two
+%% candidates can then be the leader of one term.
 -module(deadlift_cstate_local).
 
 -behaviour(gen_server).
@@ -25,7 +29,7 @@
 -export([read/2, propose/3]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
--type options() :: #{cas => boolean()}.
+-type options() :: #{cas => boolean(), elect_cas => boolean()}.
 
 -spec start(options()) -> {ok, pid()} | {error, term()}.
 start(Options) ->
@@ -58,9 +62,9 @@ call(Server, Request, Timeout) ->
     end.
 
 %% @private
-%% The state is `{CoordinatedState, Cas}'.
+%% The state is `{CoordinatedState, Cas}'. `Cas' has the two options.
 init(Options) ->
-    {ok, {deadlift_cstate:init([]), maps:get(cas, Options, true)}}.
+    {ok, {deadlift_cstate:init([]), {maps:get(cas, Options, true), maps:get(elect_cas, Options, true)}}}.
 
 %% @private
 handle_call(read, _From, State = {CState, _Cas}) ->
@@ -74,7 +78,10 @@ handle_cast(_Message, State) ->
     {noreply, State}.
 
 %% The planted defect: the write of any Sequencer is accepted.
-without_cas({write, Epoch, Owner, _LogSystem, _EndVersion}, CState, false) ->
+without_cas({write, Epoch, Owner, _LogSystem, _EndVersion}, CState, {false, _ElectCas}) ->
     CState#{count := Epoch, owner := Owner};
+%% The second planted defect: the proposal of any candidate is accepted.
+without_cas({elect, Term, _Pid}, CState, {_Cas, false}) ->
+    CState#{controller := {Term, undefined}};
 without_cas(_Value, CState, _Cas) ->
     CState.

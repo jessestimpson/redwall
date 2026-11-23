@@ -27,6 +27,9 @@
 %%   first. Each has `end_version', the Recovery Version that ended the
 %%   epoch. StorageServers read the records up to that version from these
 %%   LogServers.</li>
+%% <li>`controller' is `{Term, Pid}': the number of elections of a
+%%   ClusterController, and the process that won the last election. See
+%%   {@link deadlift_cluster_controller}.</li>
 %% </ul>
 %%
 %% == Values ==
@@ -41,16 +44,22 @@
 %%   system to `old' with `EndVersion'. The reply is `ok'. If the count is
 %%   not `Epoch', or `Owner' is not the owner, the reply is
 %%   `{error, {count, Actual}}' and the state does not change.</li>
+%% <li>`{elect, Term, Pid}' makes `Pid' the ClusterController and raises
+%%   the term from `Term' to `Term + 1'. The reply is `{ok, Term + 1}'. If
+%%   the term is not `Term', the reply is `{error, {term, Actual, Current}}'
+%%   and the state does not change. This value does not change the
+%%   recovery count. FoundationDB does not store the ClusterController in
+%%   the coordinated state. This part is not in the paper.</li>
 %% </ul>
 %%
-%% Both values are compare-and-set operations on the recovery count. Two
+%% The values `lock' and `write' are compare-and-set operations on the recovery count. Two
 %% Sequencers that recover at the same time cannot both write: the second
 %% lock raises the count, and the write of the first Sequencer then fails.
 %% `formal/Recovery.tla' models these two operations as `LockCState' and
 %% `WriteCState'. The config `RecoveryNoCas' shows that a write without the
 %% comparison lets two epochs acknowledge the same version.
 %%
-%% Both values can be proposed again after a timeout. A value that is
+%% Each value can be proposed again after a timeout. A value that is
 %% applied a second time for the same owner gives the same reply and does
 %% not change the state.
 -module(deadlift_cstate).
@@ -60,7 +69,7 @@
 -include("deadlift_eta.hrl").
 
 -export([machine/0]).
--export([read/1, read/2, lock/3, lock/4, write/5, write/6]).
+-export([read/1, read/2, lock/3, lock/4, write/5, write/6, elect/3, elect/4]).
 -export([init/1, apply/3]).
 
 -export_type([state/0, log_system/0, old_log_system/0, epoch/0, version/0, owner/0]).
@@ -90,7 +99,10 @@
     count := non_neg_integer(),
     owner := owner() | undefined,
     current := log_system() | undefined,
-    old := [old_log_system()]
+    old := [old_log_system()],
+    %% The term and the process of the ClusterController. The term is the
+    %% number of elections.
+    controller := {non_neg_integer(), pid() | undefined}
 }.
 
 %% The servers of a peace cluster, or `{local, Server}' for a
@@ -154,6 +166,21 @@ write(Servers, Epoch, Owner, LogSystem, EndVersion) ->
 write(Servers, Epoch, Owner, LogSystem, EndVersion, Timeout) ->
     propose(Servers, {write, Epoch, Owner, LogSystem, EndVersion}, Timeout).
 
+%% @equiv elect(Servers, Term, Pid, 5000)
+-spec elect(servers(), non_neg_integer(), pid()) ->
+    {ok, pos_integer()} | {error, {term, non_neg_integer(), pid() | undefined}} | {error, term()}.
+elect(Servers, Term, Pid) ->
+    elect(Servers, Term, Pid, ?TIMEOUT_MS).
+
+%% @doc Makes the process `Pid' the ClusterController. `Term' is the term
+%% that the caller read. The result `{ok, Term + 1}' gives the term of the
+%% new ClusterController. The result `{error, {term, Actual, Current}}'
+%% means that another election has changed the term.
+-spec elect(servers(), non_neg_integer(), pid(), timeout()) ->
+    {ok, pos_integer()} | {error, {term, non_neg_integer(), pid() | undefined}} | {error, term()}.
+elect(Servers, Term, Pid, Timeout) ->
+    propose(Servers, {elect, Term, Pid}, Timeout).
+
 propose({local, Server}, Value, Timeout) ->
     deadlift_cstate_local:propose(Server, Value, Timeout);
 propose(Servers, Value, Timeout) ->
@@ -170,7 +197,7 @@ propose(Servers, Value, Timeout) ->
 %% @private
 -spec init(term()) -> state().
 init(_Args) ->
-    #{count => 0, owner => undefined, current => undefined, old => []}.
+    #{count => 0, owner => undefined, current => undefined, old => [], controller => {0, undefined}}.
 
 %% @private
 -spec apply(peace_machine:meta(), term(), state()) -> {state(), term()}.
@@ -199,5 +226,12 @@ apply(_Meta, {write, Epoch, Owner, _LogSystem, _EndVersion}, State = #{count := 
     {State, {error, badarg}};
 apply(_Meta, {write, _Epoch, _Owner, _LogSystem, _EndVersion}, State = #{count := Actual}) ->
     {State, {error, {count, Actual}}};
+apply(_Meta, {elect, Term, Pid}, State = #{controller := {Term, _Previous}}) when is_pid(Pid) ->
+    {State#{controller := {Term + 1, Pid}}, {ok, Term + 1}};
+apply(_Meta, {elect, Term, Pid}, State = #{controller := {Actual, Pid}}) when Actual =:= Term + 1 ->
+    %% The same value, applied a second time.
+    {State, {ok, Actual}};
+apply(_Meta, {elect, _Term, _Pid}, State = #{controller := {Actual, Current}}) ->
+    {State, {error, {term, Actual, Current}}};
 apply(_Meta, _Other, State) ->
     {State, {error, badarg}}.

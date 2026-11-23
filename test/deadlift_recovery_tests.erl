@@ -94,7 +94,7 @@ second_recovery(Ids) ->
     [?assertMatch(#{stopped_by := 2}, deadlift_log:info(deadlift_log:ref(L))) || L <- [L1, L2, L3]],
     ?assertEqual({error, stopped}, deadlift_log:push(deadlift_log:ref(L3), 1, 3, 4, 1, empty)),
     ?assertEqual(
-        {ok, #{count => 2, owner => maps:get(owner, element(2, deadlift_cstate:read(Ids))), current => New, old => [Old#{end_version => 3}]}},
+        {ok, #{count => 2, owner => maps:get(owner, element(2, deadlift_cstate:read(Ids))), current => New, old => [Old#{end_version => 3}], controller => {0, undefined}}},
         deadlift_cstate:read(Ids)
     ),
     %% The new epoch accepts the LSN after the Recovery Version.

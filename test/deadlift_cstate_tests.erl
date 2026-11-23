@@ -18,10 +18,10 @@ apply_all(Values) ->
 %% system of epoch 1.
 first_epoch_test() ->
     S0 = deadlift_cstate:init([]),
-    ?assertEqual(#{count => 0, owner => undefined, current => undefined, old => []}, S0),
+    ?assertEqual(#{count => 0, owner => undefined, current => undefined, old => [], controller => {0, undefined}}, S0),
     {S1, {ok, 1, S1}} = deadlift_cstate:apply(?META, {lock, 0, a}, S0),
     {S2, ok} = deadlift_cstate:apply(?META, {write, 1, a, logs(1), undefined}, S1),
-    ?assertEqual(#{count => 1, owner => a, current => logs(1), old => []}, S2).
+    ?assertEqual(#{count => 1, owner => a, current => logs(1), old => [], controller => {0, undefined}}, S2).
 
 %% A recovery ends the previous epoch at the Recovery Version.
 recovery_test() ->
@@ -32,7 +32,7 @@ recovery_test() ->
         {write, 2, b, logs(2), 7}
     ]),
     ?assertEqual(
-        #{count => 2, owner => b, current => logs(2), old => [(logs(1))#{end_version => 7}]},
+        #{count => 2, owner => b, current => logs(2), old => [(logs(1))#{end_version => 7}], controller => {0, undefined}},
         S
     ).
 
@@ -106,7 +106,7 @@ cluster_test_() ->
                 ?assertEqual({error, {count, 3}}, deadlift_cstate:write(Ids, 2, b, logs(2), 7)),
                 ok = deadlift_cstate:write(Ids, 3, c, logs(3), 5),
                 ?assertEqual(
-                    {ok, #{count => 3, owner => c, current => logs(3), old => [(logs(1))#{end_version => 5}]}},
+                    {ok, #{count => 3, owner => c, current => logs(3), old => [(logs(1))#{end_version => 5}], controller => {0, undefined}}},
                     deadlift_cstate:read(Ids)
                 )
             end}
@@ -123,3 +123,17 @@ await_read(Ids, N) ->
             timer:sleep(100),
             await_read(Ids, N - 1)
     end.
+
+%% Two candidates read the term 0. The second election fails. An election
+%% does not change the recovery count.
+elect_is_compare_and_set_test() ->
+    A = self(),
+    B = spawn(fun() -> ok end),
+    S0 = deadlift_cstate:init([]),
+    {S1, {ok, 1}} = deadlift_cstate:apply(?META, {elect, 0, A}, S0),
+    ?assertMatch(#{controller := {1, A}, count := 0}, S1),
+    ?assertEqual({S1, {error, {term, 1, A}}}, deadlift_cstate:apply(?META, {elect, 0, B}, S1)),
+    %% The same value, applied a second time.
+    ?assertEqual({S1, {ok, 1}}, deadlift_cstate:apply(?META, {elect, 0, A}, S1)),
+    {S2, {ok, 2}} = deadlift_cstate:apply(?META, {elect, 1, B}, S1),
+    ?assertMatch(#{controller := {2, B}}, S2).

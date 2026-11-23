@@ -9,11 +9,12 @@
 -include("deadlift_eta.hrl").
 
 -export([recover/4, transaction/5, join/2, start_log/3, start_resolver/3, start_proxy/3]).
+-export([worker/5, force_recovery/1, worker_node/1]).
 -export([sequencer_node/1, proxy_node/1, log_node/1, resolver_node/1, storage_node/1, keys/0]).
 
 %% Starts a Sequencer, waits for the end of its recovery, and starts a
-%% Proxy for the new epoch. This is the work of a ClusterController, which
-%% deadlift does not have.
+%% Proxy for the new epoch. This is the work of a ClusterController. The
+%% runs without the config key `controller' use this function.
 %%
 %% `N' is the number of the operation. `Mode' selects a planted defect.
 recover(Tab, N, CState, Mode) ->
@@ -97,6 +98,115 @@ recover(Tab, N, CState, Mode) ->
             %% The Sequencer was killed, or did not answer in time.
             true = ets:insert(Tab, {{recovery_failed, N}, {exit, reason(Reason)}})
     end.
+
+%% Starts the worker of the node of the caller. With `Candidate', the
+%% function also starts a candidate for the ClusterController on the node.
+%% The worker starts each role with `start_role/5', which records the role
+%% in the table of the run and applies the planted defect of `Mode'.
+worker(Tab, CState, Mode, Class, Candidate) ->
+    ok = join(Tab, Mode),
+    Node = node(),
+    Coordinators = {local, CState},
+    Roles = fun(Role, Options) -> start_role(Tab, Node, Mode, Role, Options) end,
+    {ok, Worker} = deadlift_worker:start(#{coordinators => Coordinators, class => Class, roles => Roles, poll_ms => 200, cstate_timeout_ms => 500}),
+    true = ets:insert(Tab, {{worker, Node}, Worker, Class}),
+    case Candidate of
+        true ->
+            Sequencer0 = #{lock_timeout_ms => 200},
+            Sequencer =
+                case Mode of
+                    no_gap -> Sequencer0#{epoch_gap => 1};
+                    _ -> Sequencer0
+                end,
+            Ack =
+                case Mode of
+                    ack_replicas -> replicas;
+                    _ -> all
+                end,
+            {ok, Controller} = deadlift_cluster_controller:start(#{
+                coordinators => Coordinators,
+                logs => 3,
+                replication => 2,
+                %% Each LogServer of an epoch is on a node of its own.
+                min_workers => 3,
+                sequencer => Sequencer,
+                proxy => #{ack => Ack, report => Mode =/= no_report, confirm => Mode =/= no_confirm},
+                poll_ms => 200,
+                retry_ms => 50,
+                recovery_timeout_ms => 2000,
+                cstate_timeout_ms => 500,
+                notify => fun(Event) -> event(Tab, Node, Event) end,
+                %% The planted defects of the ClusterController.
+                monitor_roles => Mode =/= no_monitor_roles,
+                step_down => Mode =/= no_step_down
+            }),
+            true = ets:insert(Tab, {{controller, Node}, Controller});
+        false ->
+            true
+    end.
+
+%% Starts a role on the node `Node', for the worker of that node.
+start_role(Tab, Node, Mode, Role, Options0) ->
+    Count = ets:update_counter(Tab, roles, 1, {roles, 0}),
+    Options =
+        case {Role, Mode} of
+            {log, no_copy} -> Options0#{records := []};
+            {resolver, _} -> Options0#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range};
+            {proxy, _} -> Options0#{batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50])};
+            _ -> Options0
+        end,
+    Start =
+        case Role of
+            log -> fun deadlift_log:start/1;
+            resolver -> fun deadlift_resolver:start/1;
+            proxy -> fun deadlift_proxy:start/1;
+            sequencer -> fun deadlift_sequencer:start/1
+        end,
+    case Start(Options) of
+        {ok, Pid} ->
+            Key =
+                case Options of
+                    #{id := Id} when Role =:= log -> {log, Id};
+                    _ -> {Role, Count}
+                end,
+            %% The row of a Proxy has the epoch, so the function `event/3'
+            %% inserts it after the recovery.
+            _ = Role =/= proxy andalso ets:insert(Tab, {Key, Pid}),
+            true = ets:insert(Tab, {{at, Pid}, Node, Role}),
+            {ok, Pid};
+        Error ->
+            Error
+    end.
+
+%% Records an event of a ClusterController in the table of the run.
+event(Tab, Node, {leader, Term}) ->
+    %% A second leader of one term is a violation of `one_leader'.
+    ets:insert_new(Tab, {{leader, Term}, Node}) orelse ets:insert(Tab, {{second_leader, Term}, Node});
+event(Tab, _Node, {recovered, #{epoch := Epoch, recovery_version := RV, previous_epoch_end_version := PEV, proxy := Proxy}}) ->
+    ets:insert(Tab, [{{proxy, {controller, Epoch}}, Proxy, Epoch}, {{recovered, {controller, Epoch}}, Epoch, PEV, RV}]);
+event(Tab, _Node, {recovery_failed, Reason}) ->
+    Count = ets:update_counter(Tab, events, 1, {events, 0}),
+    Short =
+        case Reason of
+            _ when is_tuple(Reason) -> element(1, Reason);
+            _ -> Reason
+        end,
+    ets:insert(Tab, {{recovery_failed, {controller, Count}}, {controller, Short}});
+event(Tab, _Node, {superseded, Epoch, _Count}) ->
+    ets:insert(Tab, {{superseded, Epoch}, true});
+event(Tab, _Node, {role_failed, Role, _Pid}) ->
+    Count = ets:update_counter(Tab, events, 1, {events, 0}),
+    ets:insert(Tab, {{role_failed, Count}, Role});
+event(_Tab, _Node, _Event) ->
+    true.
+
+%% Asks each ClusterController process of the run for a recovery. The
+%% leader recruits, and a candidate ignores the request.
+force_recovery(Tab) ->
+    lists:foreach(
+        fun([Controller]) -> deadlift_cluster_controller:force_recovery(Controller) end,
+        lists:sort(ets:match(Tab, {{controller, '_'}, '$1'}))
+    ).
 
 %% Starts the registry of the node of the caller, and connects the node to
 %% every node of the run that has a registry. The function does nothing if
@@ -335,6 +445,8 @@ keys() -> [k1, k2, k3, k4].
 
 %% The simulated nodes. `N' is the number of the `recover' operation.
 sequencer_node(N) -> list_to_atom("sequencer_" ++ integer_to_list(N)).
+
+worker_node(N) -> list_to_atom("worker_" ++ integer_to_list(N)).
 
 proxy_node(N) -> list_to_atom("proxy_" ++ integer_to_list(N)).
 

@@ -20,7 +20,9 @@
 %%   message.</li>
 %% <li>A `recover' operation starts a Sequencer. When the recovery of the
 %%   Sequencer ends, the operation starts a Proxy for the new epoch. This
-%%   is the work of a ClusterController, which deadlift does not have.</li>
+%%   is the work of a ClusterController. In these runs the harness does
+%%   this work at times that the seed selects, so two recoveries overlap
+%%   more often than with a ClusterController.</li>
 %% <li>A recovery recruits 3 LogServers with a replication degree of
 %%   2.</li>
 %% <li>A run has 1, 2 or 3 StorageServers. Each one sends each request
@@ -31,6 +33,49 @@
 %%   run can lose or delay a message between two nodes.</li>
 %% <li>A LogServer and a Proxy start on their own node, through `erpc'
 %%   from the node of the Sequencer.</li>
+%% </ul>
+%%
+%% == Runs with ClusterControllers ==
+%%
+%% With the config key `controller', ClusterControllers recruit the
+%% Sequencers:
+%%
+%% <ul>
+%% <li>The first `recover' operation starts 8 worker nodes: 4 of the class
+%%   `stateless', of which 3 have a candidate for the ClusterController,
+%%   and 4 of the class `log'. Each worker has `poll_ms' of 200 ms. A
+%%   ClusterController recruits with at least 3 workers.</li>
+%% <li>Each later `recover' operation starts a new worker node for each
+%%   killed worker node, and asks the ClusterController for a recovery
+%%   (`deadlift_cluster_controller:force_recovery/1').</li>
+%% <li>`kill_log', `kill_sequencer', `kill_proxy' and `kill_resolver' kill
+%%   the worker node of one role of that kind that runs. The kill stops
+%%   every role on the node, and the candidate if the node has one.</li>
+%% <li>The harness kills a worker node only if no epoch then has 2 killed
+%%   LogServers.</li>
+%% <li>The ClusterController recruits again after the failure of a role,
+%%   and a candidate wins an election after the failure of the
+%%   leader.</li>
+%% </ul>
+%%
+%% <li>After the last operation, the harness removes every cut, replaces
+%%   every killed worker node, and stops the loss of messages. The run
+%%   continues until the checks of `check_final/2' hold, for at most
+%%   20,000 steps.</li>
+%% </ul>
+%%
+%% The invariants of the other runs hold in these runs. These runs have
+%% one more invariant, `one_leader': no two ClusterController processes
+%% are the leader of one term. `check_final/2' checks at the end of a run:
+%%
+%% <ul>
+%% <li>`leader' - the ClusterController of the coordinated state runs and
+%%   is the leader.</li>
+%% <li>`stale_leader' - no other process is a leader.</li>
+%% <li>`epoch' - the leader has the current epoch of the coordinated
+%%   state, and the Sequencer and the Proxy of the epoch run.</li>
+%% <li>`worker_db_info' - each worker that runs has the information of
+%%   the leader about the database.</li>
 %% </ul>
 %%
 %% == Workload ==
@@ -155,6 +200,14 @@
 %%   clear.</li>
 %% <li>`no_exchange' - a registry sends no name to the registry of another
 %%   node. This defect violates no invariant. It stops the commits.</li>
+%% <li>`no_elect_cas' - the coordinated state accepts the proposal of a
+%%   candidate with any term. This defect violates `one_leader'.</li>
+%% <li>`no_monitor_roles' - a ClusterController does not recruit after
+%%   the failure of a role. `check_final/2' finds a run that ends without
+%%   an epoch.</li>
+%% <li>`no_step_down' - a ClusterController stays the leader when the
+%%   coordinated state has another term. `check_final/2' finds a run that
+%%   ends with two leaders.</li>
 %% <li>`no_check' - the Resolver admits every transaction.</li>
 %% <li>`no_range_check' - the Resolver does not check the read ranges of a
 %%   transaction.</li>
@@ -194,7 +247,7 @@
 
 -behaviour(eta_harness).
 
--export([init/2, processes/1, generate/2, execute/2, check/1, terminate/1]).
+-export([init/2, processes/1, generate/2, execute/2, check/1, check_final/2, settle_done/1, terminate/1]).
 -export([stats/0, reset_stats/0]).
 
 -define(STATS, deadlift_dst_stats).
@@ -221,7 +274,7 @@ init(Seed, Config) ->
     %% `preload => [deadlift]' does not load them.
     {module, _} = code:ensure_loaded(deadlift_dst_client),
     Tab = ets:new(deadlift_dst, [public, ordered_set]),
-    {ok, CState} = deadlift_cstate_local:start(#{cas => Mode =/= no_cas}),
+    {ok, CState} = deadlift_cstate_local:start(#{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas}),
     %% The topology is declared before any process creates a monitor.
     ok = eta_net:place(coordinators, [CState]),
     ok = eta_net:place(clients, []),
@@ -238,6 +291,14 @@ init(Seed, Config) ->
         mode => Mode,
         window => Window,
         faults => maps:get(faults, Config, true),
+        %% Whether ClusterControllers recruit the Sequencers of the run.
+        controller => maps:get(controller, Config, false),
+        %% Whether the workload cuts connections. With `controllers', it
+        %% cuts connections between nodes with a ClusterController
+        %% process only.
+        partitions => maps:get(partitions, Config, true),
+        %% The number of the last operation of the run, or `undefined'.
+        last_op => maps:get(last_op, Config, undefined),
         %% Every process that an operation started, oldest first.
         ops => [],
         %% The number of operations that the run has executed.
@@ -315,10 +376,47 @@ generate(#{faults := Faults}, Rand0) ->
             {Op, Rand2}
     end.
 
-execute(Op, S = #{n := N0}) ->
-    execute(Op, N0 + 1, S#{n := N0 + 1}).
+execute(Op, S0 = #{n := N0}) ->
+    N = N0 + 1,
+    S = execute(Op, N, S0#{n := N}),
+    case S of
+        #{last_op := N, controller := true} -> repair(N, S);
+        _ -> S
+    end.
 
-execute(recover, N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window := Window}) ->
+%% After the last operation of a run with ClusterControllers, the harness
+%% removes every cut, and starts a new worker node for each killed worker
+%% node and a new StorageServer for each place without one. From this
+%% point the network loses no message, because deadlift does not send a
+%% message again and a lost message costs the time limit of a call. The
+%% system then has the nodes for an epoch, and `check_final/2' checks that
+%% it has one.
+repair(N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window := Window}) ->
+    ok = eta_net:heal_all(),
+    ok = eta_net:set_policy((eta_net:policy())#{drop_p => 0.0}),
+    S1 = lists:foldl(
+        fun([Slot, Generation], Acc) ->
+            true = ets:delete(Tab, {storage_down, Slot}),
+            spawn_op(deadlift_dst_client:storage_node({Slot, N * 100}), fun() -> start_storage(Tab, CState, {Mode, Window}, {Slot, N * 100}, Generation + 1) end, Acc)
+        end,
+        S0,
+        lists:sort(ets:match(Tab, {{storage_down, '$1'}, '$2'}))
+    ),
+    replace_workers(N * 100, S1).
+
+%% Starts a new worker node for each killed worker node, with the class of
+%% the killed node, and with a candidate if the killed node had one.
+replace_workers(Base, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
+    lists:foldl(
+        fun({K, [Node, {Class, Candidate}]}, Acc) ->
+            true = ets:delete(Tab, {worker_down, Node}),
+            spawn_op(deadlift_dst_client:worker_node(Base + K), fun() -> deadlift_dst_client:worker(Tab, CState, Mode, Class, Candidate) end, Acc)
+        end,
+        S,
+        lists:enumerate(lists:sort(ets:match(Tab, {{worker_down, '$1'}, '$2'})))
+    ).
+
+execute(recover, N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window := Window, controller := Controller}) ->
     %% The operation also starts a new StorageServer for each place whose
     %% StorageServer was killed without a new one.
     S = lists:foldl(
@@ -329,7 +427,31 @@ execute(recover, N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window :=
         S0,
         lists:sort(ets:match(Tab, {{storage_down, '$1'}, '$2'}))
     ),
-    spawn_op(deadlift_dst_client:sequencer_node(N), fun() -> deadlift_dst_client:recover(Tab, N, CState, Mode) end, S);
+    case Controller of
+        false ->
+            spawn_op(deadlift_dst_client:sequencer_node(N), fun() -> deadlift_dst_client:recover(Tab, N, CState, Mode) end, S);
+        true when N =:= 1 ->
+            %% 4 worker nodes of the class `stateless', of which 3 have a
+            %% candidate for the ClusterController, and 4 worker nodes of
+            %% the class `log'.
+            lists:foldl(
+                fun(K, Acc) ->
+                    Class =
+                        case K =< 4 of
+                            true -> stateless;
+                            false -> log
+                        end,
+                    spawn_op(deadlift_dst_client:worker_node(K), fun() -> deadlift_dst_client:worker(Tab, CState, Mode, Class, K =< 3) end, Acc)
+                end,
+                S,
+                lists:seq(1, 8)
+            );
+        true ->
+            %% A new worker node for each killed worker node. Then the
+            %% operation asks the ClusterController for a recovery.
+            S1 = replace_workers(N * 10, S),
+            spawn_op(clients, fun() -> deadlift_dst_client:force_recovery(Tab) end, S1)
+    end;
 execute({transaction, R1, R2}, N, S = #{tab := Tab}) ->
     Proxies = lists:keysort(2, [{Proxy, Epoch} || [Proxy, Epoch] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'}), is_process_alive(Proxy)]),
     %% The Proxy of the highest epoch in 3 of 4 cases, and any Proxy that
@@ -353,6 +475,21 @@ execute({transaction, R1, R2}, N, S = #{tab := Tab}) ->
                     _ -> clients
                 end,
             spawn_op(Node, fun() -> deadlift_dst_client:transaction(Tab, N, Reader, Proxy, R1 + R2) end, S)
+    end;
+execute({Kill, R}, _N, S = #{tab := Tab, controller := true}) when Kill =:= kill_log; Kill =:= kill_sequencer; Kill =:= kill_proxy; Kill =:= kill_resolver ->
+    %% With ClusterControllers, a kill stops the worker node of a role
+    %% that runs, with every role on the node.
+    Role =
+        case Kill of
+            kill_log -> log;
+            kill_sequencer -> sequencer;
+            kill_proxy -> proxy;
+            kill_resolver -> resolver
+        end,
+    Nodes = lists:usort([Node || [Pid, Node] <- ets:match(Tab, {{at, '$1'}, '$2', Role}), is_process_alive(Pid)]),
+    case pick(R, Nodes) of
+        none -> S;
+        Node -> kill_worker(Node, Role, S)
     end;
 execute({kill_log, R}, _N, S = #{tab := Tab, cstate := CState}) ->
     case current(CState) of
@@ -419,8 +556,17 @@ execute({kill_storage, R}, N, S = #{tab := Tab, cstate := CState, mode := Mode, 
             %% The StorageServer of the place has not started.
             S
     end;
-execute({partition, R1, R2}, _N, S = #{tab := Tab}) ->
-    Nodes = [Node || [Node] <- ets:match(Tab, {{node, '$1'}, '_'})],
+execute({partition, _R1, _R2}, _N, S = #{partitions := false}) ->
+    S;
+execute({partition, R1, R2}, _N, S = #{tab := Tab, partitions := Partitions}) ->
+    Nodes =
+        case Partitions of
+            %% A cut between two nodes with a ClusterController process
+            %% that runs. A candidate then proposes itself while the
+            %% leader runs.
+            controllers -> lists:sort([Node || [Node, Pid] <- ets:match(Tab, {{controller, '$1'}, '$2'}), is_process_alive(Pid)]);
+            _ -> [Node || [Node] <- ets:match(Tab, {{node, '$1'}, '_'})]
+        end,
     case {pick(R1, Nodes), pick(R2, Nodes)} of
         {A, A} ->
             S;
@@ -446,8 +592,100 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> transactions(Tab, Acks, Logs) end,
         fun() -> storage_rollback(Tab, Storages, CState) end,
         fun() -> kcv_below_dv(Logs) end,
-        fun() -> chain(Logs) end
+        fun() -> chain(Logs) end,
+        fun() -> one_leader(Tab) end
     ]).
+
+%% The ClusterController processes that run and are the leader, each with
+%% its term and its information about the database.
+leaders(Tab) ->
+    [
+        {Term, Pid, Info}
+     || [Pid] <- lists:sort(ets:match(Tab, {{controller, '_'}, '$1'})),
+        is_process_alive(Pid),
+        #{role := leader, term := Term, db_info := Info} <- [eta_observe:read(Pid)]
+    ].
+
+%% No two ClusterController processes are the leader of one term. Two
+%% leaders of two terms can run at the same time. The harness counts the
+%% runs with that state.
+one_leader(Tab) ->
+    Terms = [Term || {Term, _Pid, _Info} <- leaders(Tab)],
+    _ = length(Terms) > 1 andalso ets:insert(Tab, {two_leaders, true}),
+    case {Terms -- lists:usort(Terms), ets:match(Tab, {{second_leader, '$1'}, '_'})} of
+        {[], []} -> ok;
+        {[Term | _], _} -> violation(one_leader, #{term => Term});
+        {_, [[Term] | _]} -> violation(one_leader, #{term => Term})
+    end.
+
+%% The checks at the end of a run with ClusterControllers. Before the end,
+%% the harness has removed every cut and has replaced every killed worker
+%% node (`repair/2').
+%%
+%% <ul>
+%% <li>`leader' - the ClusterController of the coordinated state runs and
+%%   is the leader of the term of the coordinated state.</li>
+%% <li>`stale_leader' - no other process is a leader.</li>
+%% <li>`epoch' - the leader has an epoch, which is the current epoch of
+%%   the coordinated state, and the Sequencer and the Proxy of the epoch
+%%   run.</li>
+%% <li>`worker_db_info' - each worker that runs has the information of
+%%   the leader about the database.</li>
+%% </ul>
+check_final(_Settled, #{tab := Tab, cstate := CState, controller := true, last_op := Last}) when is_integer(Last) ->
+    {Term, Controller} = maps:get(controller, cstate(CState), {0, undefined}),
+    Leaders = leaders(Tab),
+    Workers = [
+        {Node, eta_observe:read(Pid)}
+     || [Node, Pid] <- lists:sort(ets:match(Tab, {{worker, '$1'}, '$2', '_'})), is_process_alive(Pid)
+    ],
+    case lists:keyfind(Controller, 2, Leaders) of
+        {Term, Controller, Info} ->
+            Epoch =
+                case current(CState) of
+                    #{epoch := E} -> E;
+                    undefined -> 0
+                end,
+            Alive = fun(Pid) -> is_pid(Pid) andalso is_process_alive(Pid) end,
+            first_violation([
+                fun() ->
+                    case [T || {T, Pid, _} <- Leaders, Pid =/= Controller] of
+                        [] -> ok;
+                        Stale -> violation(stale_leader, #{terms => Stale, term => Term})
+                    end
+                end,
+                fun() ->
+                    case Info of
+                        #{epoch := Epoch, sequencer := Sequencer, proxies := [Proxy]} ->
+                            case Alive(Sequencer) andalso Alive(Proxy) of
+                                true -> ok;
+                                false -> violation(epoch, #{epoch => Epoch, reason => role_down})
+                            end;
+                        #{epoch := Other} ->
+                            violation(epoch, #{epoch => Other, current => Epoch})
+                    end
+                end,
+                fun() ->
+                    case [Node || {Node, Observed} <- Workers, not is_map(Observed) orelse maps:get(db_info, Observed, undefined) =/= Info] of
+                        [] -> ok;
+                        Nodes -> violation(worker_db_info, #{nodes => Nodes, workers => length(Workers)})
+                    end
+                end
+            ]);
+        _ ->
+            violation(leader, #{term => Term, leaders => [T || {T, _, _} <- Leaders]})
+    end;
+check_final(_Settled, _State) ->
+    ok.
+
+%% Ends a run with ClusterControllers when the checks of `check_final/2'
+%% hold. Such a run has a large number of settle steps, because a call
+%% that was in progress at the last operation can wait for its time
+%% limit.
+settle_done(State = #{controller := true, last_op := Last}) when is_integer(Last) ->
+    check_final(settle_done, State) =:= ok;
+settle_done(_State) ->
+    false.
 
 terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
     ok = record_stats(Tab),
@@ -460,8 +698,13 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
         end,
         storages(Tab)
     ),
+    %% The ClusterControllers and the workers are killed first, so that
+    %% no ClusterController recruits after this point.
+    ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{controller, '_'}, '$1'})]),
+    ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{worker, '_'}, '$1', '_'})]),
     Started =
         [Pid || [Pid] <- ets:match(Tab, {{sequencer, '_'}, '$1'})] ++
+            [Pid || [Pid] <- ets:match(Tab, {{resolver, '_'}, '$1'})] ++
             [Pid || [Pid, _] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'})],
     %% The Sequencers are killed first, so that no recovery recruits a
     %% LogServer after the harness has read the registry.
@@ -512,6 +755,10 @@ bump(Key, N) ->
 record_stats(Tab) ->
     Epochs = [Epoch || [Epoch] <- ets:match(Tab, {{recovered, '_'}, '$1', '_', '_'})],
     bump(runs),
+    bump(runs_with_two_leaders, length(ets:lookup(Tab, two_leaders))),
+    bump(leaders, length(ets:match(Tab, {{leader, '_'}, '_'}))),
+    bump(role_failures, length(ets:match(Tab, {{role_failed, '_'}, '_'}))),
+    bump(superseded, length(ets:match(Tab, {{superseded, '_'}, '_'}))),
     bump(acks, length(ets:match(Tab, {{ack, '_'}, '_', '_'}))),
     bump(unknown, length(ets:match(Tab, {{unknown, '_'}, '_'}))),
     bump(not_committed, length(ets:match(Tab, {{rejected, '_'}, not_committed}))),
@@ -983,6 +1230,28 @@ log_pids(Tab) ->
 %% one event.
 logs(Tab) ->
     [{Id, State} || {Id, Pid} <- log_pids(Tab), State <- [eta_observe:read(Pid)], is_map(State), is_map_key(records, State)].
+
+%% Kills a worker node, if the kill leaves every epoch with at most one
+%% killed LogServer. An epoch keeps a record on 2 of its 3 LogServers, so
+%% a second kill can remove an acknowledged record.
+kill_worker(Node, Role, S = #{tab := Tab}) ->
+    Epochs = lists:usort([Epoch || [{Epoch, _Index}, Pid] <- ets:match(Tab, {{log, '$1'}, '$2'}), [] =/= ets:match(Tab, {{at, Pid}, Node, log})]),
+    case lists:any(fun(Epoch) -> ets:member(Tab, {killed_log, Epoch}) end, Epochs) of
+        true ->
+            S;
+        false ->
+            true = ets:insert(Tab, [{{killed_log, Epoch}, true} || Epoch <- Epochs]),
+            Candidate =
+                case ets:lookup(Tab, {controller, Node}) of
+                    [{_, Controller}] -> is_process_alive(Controller);
+                    [] -> false
+                end,
+            _ = Candidate andalso bump(kills_controller),
+            [{_, _Worker, Class}] = ets:lookup(Tab, {worker, Node}),
+            true = ets:insert(Tab, {{worker_down, Node}, {Class, Candidate}}),
+            bump(kills_worker),
+            kill(Node, list_to_atom("kills_" ++ atom_to_list(Role)), S)
+    end.
 
 %% Kills every process on a simulated node, between steps.
 kill(Node, Stat, S) ->

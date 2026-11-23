@@ -40,6 +40,8 @@ deadlift is at the start. The repository contains:
 - a StorageServer that reads the records from the LogServers and answers
   reads at a version, with tests;
 - a client with the function names of erlfdb, with tests;
+- a ClusterController that is elected through the coordinated state,
+  and a worker on each node, with tests;
 - a deterministic simulation of these parts with
   [eta](https://github.com/jessestimpson/eta), with kills, partitions,
   and lost and delayed messages.
@@ -61,7 +63,7 @@ deadlift keeps this design.
 | Role in the paper | Function | In deadlift |
 |---|---|---|
 | Coordinators | Store the coordinated state | A peace cluster that runs [deadlift_cstate](src/deadlift_cstate.erl) |
-| ClusterController | Recruits the Sequencer | Not implemented |
+| ClusterController | Monitors the roles and recruits the Sequencer | [deadlift_cluster_controller](src/deadlift_cluster_controller.erl) and [deadlift_worker](src/deadlift_worker.erl). Not modelled |
 | Sequencer | Assigns read versions and commit versions, and performs the recovery | [deadlift_sequencer](src/deadlift_sequencer.erl) and [deadlift_recovery](src/deadlift_recovery.erl). The recovery, the recovery transaction and the versions are modelled in [formal/Recovery.tla](formal/Recovery.tla) |
 | Proxy | Gives read versions to clients and commits transactions | [deadlift_proxy](src/deadlift_proxy.erl). The commit to the LogServers and the read version are modelled |
 | Resolver | Checks a transaction for conflicts | [deadlift_resolver](src/deadlift_resolver.erl). Modelled in [formal/Resolver.tla](formal/Resolver.tla) |
@@ -471,6 +473,65 @@ the local node and sends no message. The registries exchange the names:
 The simulation found the need for the three parts: with one registry on
 each simulated node and without them, no transaction was acknowledged.
 
+### The ClusterController
+
+A node that can run roles has one worker
+([deadlift_worker](src/deadlift_worker.erl)). A node can also run one
+candidate for the ClusterController
+([deadlift_cluster_controller](src/deadlift_cluster_controller.erl)).
+
+Election:
+
+1. The coordinated state has the term and the process of the
+   ClusterController.
+2. A candidate reads the coordinated state every `poll_ms` (default
+   1,000 ms) and monitors the ClusterController of the term.
+3. If the term has no ClusterController, or the monitor of the
+   ClusterController has ended, the candidate proposes itself with the
+   term that it read.
+4. The coordinated state accepts one proposal for a term. The candidate
+   of that proposal is the leader of the next term.
+5. The leader reads the coordinated state every `poll_ms`. If the
+   coordinated state has another term, the leader is a candidate again.
+
+Two processes can be the leader at the same time, for at most `poll_ms`
+plus the time of a read. Each of them can recruit a Sequencer. The
+recovery count of the coordinated state then lets one Sequencer write, as
+for any two recoveries at the same time. FoundationDB has the same
+property (`design/recovery-internals.md`).
+
+Recruitment:
+
+1. Each worker reads the ClusterController from the coordinated state
+   and registers with it. A worker has the class `log`, `stateless` or
+   `unset`.
+2. The leader recruits when it has no epoch and at least `min_workers`
+   workers (default 1).
+3. The leader chooses a worker for each of the `logs` LogServers, and
+   prefers the class `log`. It chooses a worker for the Sequencer, for
+   the Resolver and for the Proxy, and prefers the class `stateless`.
+   Each attempt starts at a different worker.
+4. The leader starts the Sequencer on its worker. The Sequencer performs
+   the recovery, and starts the LogServers and the Resolver on their
+   workers.
+5. After the recovery, the leader starts the Proxy.
+6. The leader sends the epoch, the Sequencer and the Proxy to every
+   worker. `deadlift_worker:db_info/0` returns them on each node with a
+   worker.
+
+The leader monitors the Sequencer, the LogServers, the Resolver and the
+Proxy. When one of them stops, or the connection to its node ends, or the
+recovery fails, the leader recruits again after `retry_ms` (default
+500 ms). The leader also recruits again when the recovery count of the
+coordinated state is above its epoch, because another Sequencer has then
+started a recovery.
+
+A worker sends its registration every `poll_ms`, and the leader answers
+with the epoch, the Sequencer and the Proxy. A worker that missed a
+message receives them within `poll_ms`. A worker, a candidate and the
+leader read the coordinated state in a separate process, so each of them
+answers its requests while a read waits.
+
 ### Departures from the paper
 
 - FoundationDB stores the coordinated state with Active Disk Paxos on the
@@ -518,6 +579,16 @@ each simulated node and without them, no transaction was acknowledged.
 - A registry on each node finds the process of a LogServer. In
   FoundationDB the ClusterController has this function. This part is not
   in the paper.
+- The coordinated state stores the ClusterController, and a candidate
+  detects the failure of the ClusterController with an Erlang monitor.
+  FoundationDB elects the ClusterController with a register on each
+  coordinator, which is not a consensus operation, and the
+  ClusterController sends a heartbeat to the coordinators
+  (`fdbserver/LeaderElection.actor.cpp`). This part is not in the paper.
+- The ClusterController starts the Proxy after the recovery. In the
+  paper, the Sequencer recruits the Proxies.
+- The Sequencer performs the recovery, as in the paper. In FoundationDB
+  7.3 the recovery runs in the process of the ClusterController.
 - The time of a batch is fixed, and a batch has no limit in bytes. The
   time of a batch of FoundationDB changes with the load.
 - The Proxy chooses the LogServers that receive the body of a record from
@@ -573,6 +644,34 @@ The workload has these operations:
   StorageServer. The other clients read by message;
 - cut the connection between two nodes, and remove every cut.
 
+In the runs with ClusterControllers, the harness starts no Sequencer:
+
+- A run has 8 worker nodes: 4 of the class `stateless`, of which 3 have
+  a candidate for the ClusterController, and 4 of the class `log`.
+- The ClusterController recruits the Sequencer of each epoch.
+- The first operation of the list above asks the ClusterController for a
+  recovery, and starts a new worker node for each killed worker node.
+- A kill of a LogServer, a Sequencer, a Proxy or a Resolver kills the
+  worker node of the role, with every role on the node and with the
+  candidate of the node.
+- The harness kills a worker node only if no epoch then has 2 killed
+  LogServers.
+- After the last operation, the harness removes every cut, replaces
+  every killed worker node, and stops the loss of messages. The run
+  continues until the checks at the end of a run hold, for at most
+  20,000 steps.
+
+These runs have one more invariant after every step, `one_leader`: no
+two ClusterController processes are the leader of one term. The harness
+checks at the end of each of these runs:
+
+| Check | Statement |
+|---|---|
+| `leader` | The ClusterController of the coordinated state runs and is the leader |
+| `stale_leader` | No other process is a leader |
+| `epoch` | The leader has the current epoch of the coordinated state, and the Sequencer and the Proxy of the epoch run |
+| `worker_db_info` | Each worker that runs has the information of the leader about the database |
+
 The harness checks these invariants after every step:
 
 | Invariant | Statement |
@@ -597,6 +696,12 @@ Results of `make dst` on 2026-11-22:
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
 | No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 5,540 acknowledged transactions, of which 1,474 with a read range, 679 with a clear of keys and 784 in a batch with another acknowledged transaction, 3,227 rejected for a conflict, 455 too old, 9,436 transactions with reads, of which 3,783 with direct reads on the node of a StorageServer and 1,888 by message only, 0 reads below the MVCC window of the StorageServer, 1,127 recoveries, 344 failed recoveries |
 | Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 1,067 acknowledged transactions, of which 227 with a read range, 134 with a clear of keys and 205 in a batch with another acknowledged transaction, 1,623 rejected for a conflict, 742 too old, 6,882 transactions with reads, of which 1,067 after the start of a new StorageServer, 217 while one of several StorageServers was not alive, 2,741 with direct reads on the node of a StorageServer and 1,362 by message only, 42 reads below the MVCC window of the StorageServer, 245 rollbacks of StorageServers, 2,300 recoveries, 2,838 failed recoveries, 1,560 kills, of which 203 of a StorageServer, 272 partitions |
+| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,461 acknowledged transactions, 270 recoveries, 2 failed recoveries, 50 elections |
+| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 459 acknowledged transactions, 1,006 recoveries, 140 failed recoveries, 476 kills of a worker node, of which 245 with a ClusterController process, 289 elections, 219 recoveries after the failure of a role, 86 rollbacks of StorageServers, 118 partitions |
+| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 28 runs with two leaders at the same time, 222 elections, 3 epochs that the leader found superseded, 249 acknowledged transactions, 523 recoveries, 237 kills of a worker node, 41 cuts |
+| Planted defect: the coordinated state accepts the proposal of a candidate for the ClusterController with any term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 2, `one_leader`: two processes are the leader of term 1 |
+| Planted defect: a ClusterController does not recruit after the failure of a role | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 2, `epoch`: the run ends with an epoch whose Sequencer or Proxy does not run |
+| Planted defect: a ClusterController stays the leader when the coordinated state has another term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 7, `stale_leader`: the run ends with the leaders of term 1 and term 2 |
 | Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 15, `kcv_below_dv`. In 120 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
 | Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
@@ -622,7 +727,7 @@ seeds. `dst/run.sh` prints the sums of the statistics of these tests.
 | Command | Nodes at the same time | Time |
 |---|---|---|
 | `make dst-serial` | 1 | 10 min 38 s |
-| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80 |
+| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total |
 | `dst/run.sh -j 5` | 5 | 4 min 6 s |
 
 The machine has 4 performance cores and 6 efficiency cores. The
@@ -666,6 +771,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/deadlift_proxy.erl](src/deadlift_proxy.erl) | The Proxy |
 | [src/deadlift_storage.erl](src/deadlift_storage.erl) | The StorageServer |
 | [src/deadlift.erl](src/deadlift.erl) | The client, with the function names of erlfdb |
+| [src/deadlift_cluster_controller.erl](src/deadlift_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |
+| [src/deadlift_worker.erl](src/deadlift_worker.erl) | The worker of one node, which starts roles for the ClusterController |
 | [src/deadlift_registry.erl](src/deadlift_registry.erl) | The registry of the processes of one node |
 | [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
 | [include/deadlift_eta.hrl](include/deadlift_eta.hrl) | The header that puts a module under the parse transform of eta in the `dst` profile |
@@ -675,6 +782,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
 | [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which starts the registry |
 | [test/deadlift_cstate_tests.erl](test/deadlift_cstate_tests.erl) | Tests for `deadlift_cstate` |
+| [test/deadlift_cluster_controller_tests.erl](test/deadlift_cluster_controller_tests.erl) | Tests for `deadlift_cluster_controller` and `deadlift_worker` |
 | [test/deadlift_log_tests.erl](test/deadlift_log_tests.erl) | Tests for `deadlift_log` |
 | [test/deadlift_recovery_tests.erl](test/deadlift_recovery_tests.erl) | Tests for `deadlift_recovery` and `deadlift_sequencer` |
 | [test/deadlift_proxy_tests.erl](test/deadlift_proxy_tests.erl) | Tests for `deadlift_proxy` |
@@ -710,9 +818,11 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - A process cannot tell a LogServer whose name has not arrived from a
   LogServer that does not run.
 - The registry keeps the name of a process on a node that has stopped.
-- One unit test,
-  [test/deadlift_nodes_tests.erl](test/deadlift_nodes_tests.erl), uses two
-  Erlang nodes on one computer. The test starts Erlang distribution and
+- Two unit tests, in
+  [test/deadlift_nodes_tests.erl](test/deadlift_nodes_tests.erl), use two
+  Erlang nodes on one computer. One of them has a worker and a candidate
+  for the ClusterController on each node. Each test starts Erlang
+  distribution and
   needs `epmd`. No test cuts the connection between two Erlang nodes.
   The simulation cuts the connection between simulated nodes.
 - Two processes on two nodes can register one name at the same time.
@@ -757,10 +867,31 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   the timeout of the client. The Proxy does not stop in this case.
 - A LogServer that has stopped must not start again with the same
   identifier, because it has lost its records.
-- No process starts a Sequencer when a Sequencer or a LogServer fails.
-  deadlift has no ClusterController.
-- Every LogServer runs on the node of the Sequencer that recruits it. The
-  registry finds processes of the local node only.
+- A candidate for the ClusterController proposes itself when the
+  connection to the node of the ClusterController ends. If two candidates
+  cannot connect to each other and both can connect to the coordinators,
+  each election replaces the ClusterController, and each new
+  ClusterController starts a recovery.
+- A leader that abandons an attempt stops the Sequencer of the attempt
+  when it learns the Sequencer. If that Sequencer has raised the recovery
+  count, the recovery of the next attempt can fail, and the leader
+  recruits again. In 50 simulation runs without faults, 2 of 270
+  recoveries failed in this way.
+- A new ClusterController starts a recovery, also when the roles of the
+  current epoch run. FoundationDB has the same property.
+- The ClusterController does not stop the roles of an ended epoch. A
+  Sequencer and a Proxy of an ended epoch continue to run.
+- The ClusterController does not start StorageServers.
+- The roles do not read the information of the ClusterController about
+  the database. They find each other through the registry.
+- The client does not find the Proxy from the coordinators. A caller
+  reads the Proxy with `deadlift_worker:db_info/0` on a node with a
+  worker.
+- A worker and a candidate read the coordinated state every `poll_ms`. A
+  process of FoundationDB waits for a change with one request.
+- The application does not start the worker or the candidate. A caller
+  starts them with `deadlift_worker:start/1` and
+  `deadlift_cluster_controller:start/1`.
 - The recovery waits up to `lock_timeout_ms` (default 1,000 ms) for an old
   LogServer that does not answer.
 - The tests of the recovery stop LogServers between steps. No test stops a

@@ -146,6 +146,104 @@ faults_shard(Shard) ->
         ?assert(maps:get(runs_with_three_epochs, Stats, 0) > 15, Stats)
     end}.
 
+%% Runs in which ClusterControllers recruit the Sequencers. A run has 8
+%% worker nodes: 4 of the class `stateless', of which 3 have a candidate
+%% for the ClusterController, and 4 of the class `log'. A `recover'
+%% operation asks the ClusterController for a recovery.
+%%
+%% Runs without kills. 50 seeds.
+controller_calm_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(lists:seq(1, 50), fun(Seed) -> (opts(Seed, #{faults => false, controller => true, last_op => 80}))#{net => true, settle_steps => 20000} end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("controller calm: ~p", [Stats]),
+        ok = write_stats({controller_calm, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 200, Stats),
+        %% Each run has one election.
+        ?assertEqual(50, maps:get(leaders, Stats, 0), Stats),
+        %% A recovery fails when a Sequencer of an abandoned attempt still
+        %% runs and raises the recovery count.
+        ?assert(maps:get(recoveries_failed, Stats, 0) < 5, Stats)
+    end}.
+
+%% Runs with kills of worker nodes, partitions, and lost and delayed
+%% messages. A kill stops every role on the node, and a ClusterController
+%% if the node has one. 200 seeds in 2 shards.
+controller_faults_1_test_() -> controller_faults_shard(1).
+controller_faults_2_test_() -> controller_faults_shard(2).
+
+controller_faults_shard(Shard) ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(shard_seeds(Shard, 100), fun(Seed) -> (opts(Seed, #{controller => true, last_op => 80}))#{settle_steps => 20000} end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("controller faults ~p: ~p", [Shard, Stats]),
+        ok = write_stats({controller_faults, Shard}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 150, Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 300, Stats),
+        %% The harness killed worker nodes with each role and with the
+        %% leader, and another candidate won an election.
+        ?assert(maps:get(kills_log, Stats, 0) > 30, Stats),
+        ?assert(maps:get(kills_sequencer, Stats, 0) > 30, Stats),
+        ?assert(maps:get(kills_proxy, Stats, 0) > 10, Stats),
+        ?assert(maps:get(kills_resolver, Stats, 0) > 15, Stats),
+        ?assert(maps:get(kills_controller, Stats, 0) > 30, Stats),
+        ?assert(maps:get(leaders, Stats, 0) > 120, Stats),
+        %% A ClusterController started a recovery after the failure of a
+        %% role.
+        ?assert(maps:get(role_failures, Stats, 0) > 80, Stats),
+        ?assert(maps:get(partitions, Stats, 0) > 15, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 20, Stats)
+    end}.
+
+%% Runs with kills, in which each cut is between two nodes with a
+%% ClusterController process. A candidate then proposes itself while the
+%% leader runs, and two processes are the leader for a time. 100 seeds.
+controller_partitions_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(lists:seq(1, 100), fun(Seed) -> controller_partitions(Seed, correct) end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("controller partitions: ~p", [Stats]),
+        ok = write_stats({controller_partitions, 1}, Stats),
+        ?assert(maps:get(partitions, Stats, 0) > 30, Stats),
+        ?assert(maps:get(runs_with_two_leaders, Stats, 0) > 10, Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 300, Stats)
+    end}.
+
+controller_partitions(Seed, Mode) ->
+    (opts(Seed, #{controller => true, last_op => 80, partitions => controllers, mode => Mode}))#{settle_steps => 20000}.
+
+%% A planted defect: the coordinated state accepts the proposal of a
+%% candidate with any term. Two candidates are the leader of one term.
+no_elect_cas_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> controller_partitions(Seed, no_elect_cas) end),
+        ?debugFmt("no_elect_cas: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := one_leader}, Violation)
+    end}.
+
+%% A planted defect: a ClusterController does not recruit after the
+%% failure of a role. A run ends without an epoch whose Sequencer and
+%% Proxy run.
+no_monitor_roles_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> controller_partitions(Seed, no_monitor_roles) end),
+        ?debugFmt("no_monitor_roles: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := epoch}, Violation)
+    end}.
+
+%% A planted defect: a ClusterController stays the leader when the
+%% coordinated state has another term. A run ends with two leaders.
+no_step_down_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> controller_partitions(Seed, no_step_down) end),
+        ?debugFmt("no_step_down: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := stale_leader}, Violation)
+    end}.
+
 %% The seeds of the shard `Shard', with `Size' seeds in each shard.
 shard_seeds(Shard, Size) ->
     lists:seq((Shard - 1) * Size + 1, Shard * Size).

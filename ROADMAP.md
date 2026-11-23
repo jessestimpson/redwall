@@ -129,10 +129,30 @@ has the basic functions. The remaining parts, in the planned order:
 
 ### Milestone 3: Scale and operations
 
-- [ ] Elect a ClusterController through the peace cluster. The
-      ClusterController starts a Sequencer when a Sequencer or a LogServer
-      fails.
-- [ ] Recruit LogServers on other nodes.
+- [x] Elect a ClusterController through the coordinated state. The
+      ClusterController starts a Sequencer when a Sequencer, a LogServer,
+      the Resolver or the Proxy fails.
+- [x] Recruit LogServers on other nodes, through a worker on each node.
+- [ ] Send the processes of the LogServers and of the Resolver in the
+      information of the ClusterController about the database, and read
+      them in the Proxy, the Sequencer and the StorageServer. This step
+      replaces the registry and its three waits.
+- [ ] Decide whether a candidate replaces the ClusterController only
+      after a majority of the coordinators has no heartbeat, as in
+      FoundationDB. Today one candidate without a connection to the
+      ClusterController replaces it.
+- [ ] Wait for the stop of the Sequencer of an abandoned attempt before
+      the next attempt, so that the recovery of the next attempt does not
+      fail on the recovery count.
+- [ ] Send a message again after a lost message, or treat a lost message
+      as a failed connection. Today a lost message costs the time limit
+      of a call, and the simulation stops the loss of messages before its
+      checks at the end of a run.
+- [ ] Stop the Sequencer, the Resolver and the Proxy of an ended epoch.
+- [ ] Start the worker and the candidate in the application, and start
+      StorageServers through the ClusterController.
+- [ ] Model the election and the recruitment in TLA+, or state why the
+      recovery count makes a model unnecessary.
 - [ ] Shard the key space over StorageServers, with tags on log records:
   - [ ] A shard map from a key range to a team of StorageServers, fixed
         at the start of the cluster.
