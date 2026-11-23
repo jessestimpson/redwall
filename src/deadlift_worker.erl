@@ -85,8 +85,8 @@
 -include("deadlift_eta.hrl").
 -eta_observe({state, [controller, registered, db_info]}).
 
--export([start/1, start_link/1, stop/0]).
--export([start_role/3, db_info/0, info/0]).
+-export([start/1, start_link/1, stop/0, stop/1]).
+-export([start_role/3, db_info/0, db_info/1, info/0, info/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, role/0, class/0, db_info/0]).
@@ -105,6 +105,10 @@
 %% the roles.
 -type options() :: #{
     coordinators := deadlift_cstate:servers(),
+    %% The registered name of the worker and the name of its ETS table.
+    %% The default is `deadlift_worker'. A node that runs the workers of
+    %% several clusters gives each worker a name.
+    name => atom(),
     class => class(),
     %% Further options of a candidate for the ClusterController on this
     %% node. Without the option, the node has no candidate.
@@ -120,7 +124,6 @@
     proxies := [pid()]
 }.
 
--define(TABLE, ?MODULE).
 -define(ROLE_TIMEOUT_MS, 5000).
 %% The first time between two polls while no ClusterController has
 %% answered. The time doubles with each poll, up to `poll_ms'.
@@ -152,16 +155,21 @@
 %% @doc Starts the worker of this node without a link to the caller.
 -spec start(options()) -> {ok, pid()} | {error, term()}.
 start(Options) ->
-    gen_server:start({local, ?MODULE}, ?MODULE, Options, []).
+    gen_server:start({local, maps:get(name, Options, ?MODULE)}, ?MODULE, Options, []).
 
 -spec start_link(options()) -> {ok, pid()} | {error, term()}.
 start_link(Options) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, Options, []).
+    gen_server:start_link({local, maps:get(name, Options, ?MODULE)}, ?MODULE, Options, []).
 
 %% @doc Stops the worker of this node. The roles of the node continue.
 -spec stop() -> ok.
 stop() ->
-    gen_server:stop(?MODULE).
+    stop(?MODULE).
+
+%% @doc Stops the worker with the name `Name' of this node.
+-spec stop(atom()) -> ok.
+stop(Name) ->
+    gen_server:stop(Name).
 
 %% @doc Starts a role on the node of the worker `Worker'. The result is
 %% `{error, Reason}' if the worker does not answer in 5 seconds.
@@ -178,7 +186,13 @@ start_role(Worker, Role, Options) ->
 %% node received last, or `undefined'. The function sends no message.
 -spec db_info() -> db_info() | undefined.
 db_info() ->
-    try ets:lookup(?TABLE, db_info) of
+    db_info(?MODULE).
+
+%% @doc Returns the information about the database of the worker with the
+%% name `Name' of this node.
+-spec db_info(atom()) -> db_info() | undefined.
+db_info(Name) ->
+    try ets:lookup(Name, db_info) of
         [{db_info, Info}] -> Info;
         [] -> undefined
     catch
@@ -190,7 +204,12 @@ db_info() ->
 %% the registration, and the candidate that the worker started.
 -spec info() -> #{controller := {non_neg_integer(), pid() | undefined}, registered := boolean(), candidate := pid() | undefined}.
 info() ->
-    gen_server:call(?MODULE, info).
+    info(?MODULE).
+
+%% @doc `info/0' for the worker with the name `Name' of this node.
+-spec info(atom()) -> #{controller := {non_neg_integer(), pid() | undefined}, registered := boolean(), candidate := pid() | undefined}.
+info(Name) ->
+    gen_server:call(Name, info).
 
 %% ---------------------------------------------------------------------------
 %% Server
@@ -198,7 +217,8 @@ info() ->
 
 %% @private
 init(Options = #{coordinators := Coordinators}) ->
-    ?TABLE = ets:new(?TABLE, [named_table, protected, {read_concurrency, true}]),
+    Name = maps:get(name, Options, ?MODULE),
+    Name = ets:new(Name, [named_table, protected, {read_concurrency, true}]),
     %% The worker handles the stop of the candidate, and stops the
     %% candidate in `terminate/2'.
     process_flag(trap_exit, true),
@@ -235,7 +255,7 @@ handle_call(info, _From, State = #state{controller = Controller, registered = Re
 %% The information about the database, from the ClusterController of
 %% `Term'. It is also the answer to a registration.
 handle_cast({db_info, Info = #{term := Term}}, State = #state{controller = {Term, _Pid}}) ->
-    true = ets:insert(?TABLE, {db_info, Info}),
+    true = ets:insert(maps:get(name, State#state.options, ?MODULE), {db_info, Info}),
     {noreply, State#state{registered = true, db_info = Info}};
 handle_cast(_Message, State) ->
     {noreply, State}.

@@ -785,7 +785,7 @@ their options.
 
 | Key of the environment | Value | Process |
 |---|---|---|
-| `worker` | The options of `deadlift_worker:start_link/1`: `coordinators`, `class`, and `candidate` for a candidate for the ClusterController on the node | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
+| `worker` | The options of `deadlift_worker:start_link/1`: `coordinators`, `class`, `candidate` for a candidate for the ClusterController on the node, and `name` for a node that runs the workers of several clusters | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
 | `storage` | The options of `deadlift_storage:start_link/1`: `coordinators` | The StorageServer of the node |
 | `coordinator` | The options of `deadlift_coordinator:start_link/1`: `id` and `dir`, both required | The coordinator of the node: one server of the peace cluster with the coordinated state. The supervisor starts it before the worker and the StorageServer |
 
