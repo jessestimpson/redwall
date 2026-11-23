@@ -120,7 +120,8 @@
 %% <ul>
 %% <li>For 1020, 1021 and 1037 it resets the transaction and waits for a
 %%   random part of the backoff. The backoff starts at 10 ms, doubles with
-%%   each error and is at most 1 s.</li>
+%%   each error and is at most 1 s. The options `retry_delay_ms' and
+%%   `max_retry_delay_ms' of `open/1' change the two values.</li>
 %% <li>For 1007 and 1009 it resets the transaction and waits for 10
 %%   ms.</li>
 %% <li>For another code it raises the error again.</li>
@@ -176,7 +177,13 @@
     | [gen_server:server_ref()]
     | fun(() -> gen_server:server_ref() | [gen_server:server_ref()] | undefined).
 
--type servers() :: #{proxy := server(), storage := storage(), direct => boolean()}.
+-type servers() :: #{
+    proxy := server(),
+    storage := storage(),
+    direct => boolean(),
+    retry_delay_ms => number(),
+    max_retry_delay_ms => number()
+}.
 
 -type database() :: {deadlift_database, servers()}.
 -type transaction() :: {deadlift_transaction, ets:tid()}.
@@ -209,14 +216,20 @@
 %% that runs now. `storage' is a process, a list of processes, or a
 %% function that returns one of the two. With `direct => false', no read
 %% uses the ETS table of a StorageServer.
+%%
+%% `retry_delay_ms' is the first backoff of `on_error/2' after a conflict,
+%% in milliseconds. The default is 10, which is `DEFAULT_BACKOFF' of
+%% FoundationDB. `max_retry_delay_ms' is the highest backoff. The default
+%% is 1,000. FoundationDB has the transaction option `max_retry_delay' for
+%% it. FoundationDB has no option for the first backoff.
 -spec open(servers()) -> database().
 open(Servers = #{proxy := _, storage := _}) ->
-    {deadlift_database, maps:with([proxy, storage, direct], Servers)}.
+    {deadlift_database, maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms], Servers)}.
 
 -spec create_transaction(database()) -> transaction().
 create_transaction({deadlift_database, Servers}) ->
     Table = ets:new(deadlift_transaction, [ordered_set, public]),
-    true = ets:insert(Table, [{db, Servers}, {state, open}, {seq, 0}, {backoff, ?BACKOFF_MS}]),
+    true = ets:insert(Table, [{db, Servers}, {state, open}, {seq, 0}, {backoff, maps:get(retry_delay_ms, Servers, ?BACKOFF_MS)}]),
     {deadlift_transaction, Table}.
 
 %% @doc Runs `Fun' in a transaction, and commits the transaction. After an
@@ -498,7 +511,8 @@ on_error({deadlift_transaction, Table} = Tx, Code) when
     Code =:= ?NOT_COMMITTED; Code =:= ?COMMIT_UNKNOWN_RESULT; Code =:= ?PROCESS_BEHIND
 ->
     [{backoff, Backoff}] = ets:lookup(Table, backoff),
-    true = ets:insert(Table, {backoff, min(?MAX_BACKOFF_MS, Backoff * 2)}),
+    [{db, Servers}] = ets:lookup(Table, db),
+    true = ets:insert(Table, {backoff, min(maps:get(max_retry_delay_ms, Servers, ?MAX_BACKOFF_MS), Backoff * 2)}),
     ok = reset(Tx),
     timer:sleep(round(Backoff * rand:uniform()));
 on_error(Tx, Code) when Code =:= ?TRANSACTION_TOO_OLD; Code =:= ?FUTURE_VERSION ->

@@ -333,3 +333,25 @@ replica_behind({deadlift_database, Servers = #{storage := First}}) ->
 %% The coordinators of a StorageServer.
 coordinators(Storage) ->
     element(2, sys:get_state(Storage)).
+
+%% The options `retry_delay_ms' and `max_retry_delay_ms' of `open/1' set
+%% the first backoff and the highest backoff of `on_error/2'. The test
+%% needs no cluster, because `on_error/2' sends no message.
+retry_delay_test() ->
+    Elapsed = fun(Options, Errors) ->
+        Db = deadlift:open(Options#{proxy => self(), storage => self()}),
+        Tx = deadlift:create_transaction(Db),
+        Start = erlang:monotonic_time(millisecond),
+        [ok = deadlift:on_error(Tx, 1020) || _ <- lists:seq(1, Errors)],
+        erlang:monotonic_time(millisecond) - Start
+    end,
+    %% Without a backoff, 50 errors take no wait.
+    ?assert(Elapsed(#{retry_delay_ms => 0}, 50) < 50),
+    %% The backoff starts at 1 ms and stays at or below 2 ms. With the
+    %% default of 1,000 ms for the highest backoff, 30 errors wait for
+    %% several seconds.
+    ?assert(Elapsed(#{retry_delay_ms => 1, max_retry_delay_ms => 2}, 30) < 150),
+    %% The default of the first backoff is 10 ms. 6 errors have backoffs of
+    %% 10 ms to 320 ms, and the client waits for a random part of each.
+    Default = Elapsed(#{}, 6),
+    ?assert(Default > 20, Default).

@@ -47,7 +47,7 @@
 %%
 %% The latency of an operation is the time of the whole call in the
 %% client. The benchmark leaves out the operations of the first 500 ms of
-%% each run.
+%% each run. A latency of 4,096 us or more is rounded down to 100 us.
 %%
 %% == Limitations ==
 %%
@@ -63,11 +63,12 @@
 %% </ul>
 -module(deadlift_bench).
 
--export([main/0, main/1, depth/1]).
+-export([main/0, main/1, depth/1, conflicts/1]).
 -export([run/4, client/5, watch/0]).
 
 -define(KEYS, 1000000).
 -define(WARMUP_US, 500000).
+-define(BUCKETS, 14056).
 -define(PROXY, {?MODULE, proxy}).
 
 %% @doc Runs the benchmark with a run time of 3 seconds for each row.
@@ -144,6 +145,38 @@ depth(Options) ->
         [{Stateless, Depth} || Stateless <- maps:get(stateless, Options, [together, spread]), Depth <- maps:get(depths, Options, [1, 2, 4, 8])]
     ).
 
+%% @doc Measures `conflict' for several values of the option
+%% `retry_delay_ms' of the client, with 16 and 64 clients.
+conflicts(Options) ->
+    Ms = round(1000 * maps:get(seconds, Options, 3)),
+    Cluster = #{storage := Storage} = start_cluster(#{}),
+    try
+        #{proxies := [Proxy]} = db_info(Cluster),
+        lists:foreach(
+            fun(Delay) ->
+                Db = deadlift:open(#{proxy => Proxy, storage => Storage, direct => false, retry_delay_ms => Delay}),
+                io:format("~n`retry_delay_ms` ~p:~n~n", [Delay]),
+                Errors = counters:new(6, [write_concurrency]),
+                ok = persistent_term:put({?MODULE, errors}, Errors),
+                header(),
+                Rows = [
+                    begin
+                        Before = [counters:get(Errors, I) || I <- lists:seq(1, 6)],
+                        Stats = with_stats(Proxy, N, fun() -> row(conflict, N, run(conflict, Db, N, Ms)) end),
+                        {Stats, [counters:get(Errors, I) - B || {I, B} <- lists:enumerate(Before)]}
+                    end
+                 || N <- maps:get(clients, Options, [16, 64, 256])
+                ],
+                io:format("~n| Clients | 1020 not committed | 1007 too old | 1009 future version | 1021 unknown result | 1037 process behind | Other |~n|---|---|---|---|---|---|---|~n"),
+                [io:format("| ~b | ~b | ~b | ~b | ~b | ~b | ~b |~n", [N | Counts]) || {{N, _}, Counts} <- Rows],
+                breakdown([Stats || {Stats, _} <- Rows], [])
+            end,
+            maps:get(delays, Options, [10, 2, 1, 0])
+        )
+    after
+        stop_cluster(Cluster)
+    end.
+
 %% ---------------------------------------------------------------------------
 %% Runs
 %% ---------------------------------------------------------------------------
@@ -154,25 +187,37 @@ depth(Options) ->
 %% in microseconds, the sorted latencies in microseconds, and the number of
 %% attempts.
 run(Op, Db, Clients, Ms) ->
+    %% The clients count each latency in a shared array of counters. A
+    %% list of the latencies would grow the heap of each client, and the
+    %% garbage collections of the clients would be part of the result.
+    Histogram = counters:new(?BUCKETS, [write_concurrency]),
     Start = erlang:monotonic_time(microsecond),
     End = Start + Ms * 1000,
-    Pids = [spawn_link(?MODULE, client, [self(), Op, Db, Start + ?WARMUP_US, End]) || _ <- lists:seq(1, Clients)],
-    Results = [
+    Pids = [spawn_link(?MODULE, client, [self(), Op, {Db, Histogram}, Start + ?WARMUP_US, End]) || _ <- lists:seq(1, Clients)],
+    Attempts = lists:sum([
         receive
             {Pid, Result} -> Result
         end
      || Pid <- Pids
-    ],
-    Latencies = lists:sort(lists:append([L || {L, _Attempts} <- Results])),
+    ]),
+    Latencies = [{value(Bucket), Count} || Bucket <- lists:seq(1, ?BUCKETS), Count <- [counters:get(Histogram, Bucket)], Count > 0],
     #{
-        count => length(Latencies),
+        count => lists:sum([Count || {_Us, Count} <- Latencies]),
         us => Ms * 1000 - ?WARMUP_US,
         latencies => Latencies,
-        attempts => lists:sum([A || {_L, A} <- Results])
+        attempts => Attempts
     }.
 
+%% The bucket of a latency: one bucket for each microsecond below 4,096 us,
+%% and one bucket for each 100 us from there to 1 s.
+bucket(Us) when Us < 4096 -> max(0, Us) + 1;
+bucket(Us) -> min(?BUCKETS, 4097 + (Us - 4096) div 100).
+
+value(Bucket) when Bucket =< 4096 -> Bucket - 1;
+value(Bucket) -> 4096 + (Bucket - 4097) * 100.
+
 %% @private
-client(Parent, Op, Db, Measure, End) ->
+client(Parent, Op, {Db, Histogram}, Measure, End) ->
     Context =
         case Op of
             read ->
@@ -183,13 +228,13 @@ client(Parent, Op, Db, Measure, End) ->
             _ ->
                 Db
         end,
-    Parent ! {self(), loop(Op, Context, Measure, End, [], 0)}.
+    Parent ! {self(), loop(Op, Context, Measure, End, Histogram, 0)}.
 
-loop(Op, Context, Measure, End, Latencies, Attempts) ->
+loop(Op, Context, Measure, End, Histogram, Attempts) ->
     T0 = erlang:monotonic_time(microsecond),
     case T0 >= End of
         true ->
-            {Latencies, Attempts};
+            Attempts;
         false ->
             {Us, Tried} =
                 case op(Op, Context) of
@@ -197,8 +242,11 @@ loop(Op, Context, Measure, End, Latencies, Attempts) ->
                     Count -> {erlang:monotonic_time(microsecond) - T0, Count}
                 end,
             case T0 >= Measure of
-                true -> loop(Op, Context, Measure, End, [Us | Latencies], Attempts + Tried);
-                false -> loop(Op, Context, Measure, End, Latencies, Attempts)
+                true ->
+                    ok = counters:add(Histogram, bucket(Us), 1),
+                    loop(Op, Context, Measure, End, Histogram, Attempts + Tried);
+                false ->
+                    loop(Op, Context, Measure, End, Histogram, Attempts)
             end
     end.
 
@@ -225,13 +273,37 @@ op(read, Tx) ->
 read_write(Db, Keys) ->
     Read = rand:uniform(Keys),
     Write = rand:uniform(Keys),
-    Counter = counters:new(1, []),
-    ok = deadlift:transactional(Db, fun(Tx) ->
-        ok = counters:add(Counter, 1, 1),
+    Tx = deadlift:create_transaction(Db),
+    attempt(Tx, Read, Write, 1).
+
+%% One attempt of the transaction, as `deadlift:transactional/2' runs it.
+%% The function counts the error code of a failed attempt, for
+%% `conflicts/1'.
+attempt(Tx, Read, Write, Attempt) ->
+    try
         _ = deadlift:wait(deadlift:get(Tx, Read)),
-        deadlift:set(Tx, Write, value())
-    end),
-    counters:get(Counter, 1).
+        ok = deadlift:set(Tx, Write, value()),
+        ok = deadlift:wait(deadlift:commit(Tx)),
+        {deadlift_transaction, Table} = Tx,
+        true = ets:delete(Table),
+        Attempt
+    catch
+        error:{erlfdb_error, Code} ->
+            _ =
+                case persistent_term:get({?MODULE, errors}, undefined) of
+                    undefined -> ok;
+                    Errors -> counters:add(Errors, error_index(Code), 1)
+                end,
+            ok = deadlift:wait(deadlift:on_error(Tx, Code)),
+            attempt(Tx, Read, Write, Attempt + 1)
+    end.
+
+error_index(1020) -> 1;
+error_index(1007) -> 2;
+error_index(1009) -> 3;
+error_index(1021) -> 4;
+error_index(1037) -> 5;
+error_index(_Code) -> 6.
 
 %% Commits a write, and reads the key at the commit version. The read
 %% returns when the StorageServer has applied the record. The result is
@@ -327,10 +399,14 @@ breakdown(Writes, Versions) ->
         Versions
     ).
 
+%% `Latencies' has `{Us, Count}' in the order of `Us'.
 percentile(_Latencies, 0, _P) ->
     0;
 percentile(Latencies, Count, P) ->
-    lists:nth(max(1, min(Count, round(P * Count + 0.5))), Latencies).
+    rank(Latencies, max(1, min(Count, round(P * Count + 0.5)))).
+
+rank([{Us, Count} | _], Rank) when Rank =< Count -> Us;
+rank([{_Us, Count} | Rest], Rank) -> rank(Rest, Rank - Count).
 
 %% ---------------------------------------------------------------------------
 %% Pauses

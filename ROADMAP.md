@@ -76,6 +76,12 @@ commits and recoveries, and no run violates an invariant.
       an ETS table now.
 - [x] Keep the history of the Resolver in two ETS tables, chosen from a
       benchmark of three structures in the README.
+- [x] Keep the newest version of a key in the row of the key, and the
+      older versions in a second table of the StorageServer, chosen from
+      a benchmark of three layouts in the README.
+- [ ] Decide the default of the client option `retry_delay_ms` (10 ms
+      today, as in FoundationDB). A commit takes 0.2 ms, so the first
+      wait after a conflict is 50 times a commit.
 - [ ] Decide the defaults of `retry_ms` (500 ms today, 35 ms in
       FoundationDB) and of the placement of the Sequencer, the Resolver
       and the Proxy (`spread` today) from the benchmark.

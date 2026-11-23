@@ -97,10 +97,16 @@
 %%
 %% <ul>
 %% <li>The data is an ETS table of type `ordered_set' with one row for each
-%%   key: `{Key, Versions}'. `Versions' is a list of `{Version, Change}'
-%%   with the highest version first. `Change' is `{set, Value}', or
-%%   `clear' for a version without a value. The table is `protected', so
-%%   another process can read it. `info/1' returns the table.</li>
+%%   key: `{Key, Version, Change}', the newest version of the key.
+%%   `Change' is `{set, Value}', or `clear' for a version without a
+%%   value. The table is `protected', so another process can read it.
+%%   `info/1' returns the table.</li>
+%% <li>A second ETS table of type `ordered_set' has one row
+%%   `{{Key, -Version}, Change}' for each older version of a key. The
+%%   rows of a key are in the order from the highest version to the
+%%   lowest one, so the first row at or after `{Key, -V}' is the last
+%%   version of the key at or below `V'. A read or a write of a key
+%%   therefore does not depend on the number of versions of the key.</li>
 %% <li>A second ETS table of type `ordered_set' has one row
 %%   `{{Version, Key}}' for each version above the oldest version. With
 %%   this table, a rollback examines only the versions that it removes,
@@ -127,11 +133,16 @@
 %% <li>A read at a read version returns only versions at or below the read
 %%   version, so a record that the StorageServer applies during the read
 %%   does not change the result.</li>
+%% <li>A write of a key adds the row of the older version before it
+%%   changes the row of the key. A rollback changes the row of the key
+%%   before it removes the row of the older version. A direct read that
+%%   uses the table of the older versions reads the row of the key again
+%%   afterwards, and starts again if that row has changed.</li>
 %% </ul>
 %%
-%% A benchmark compared this layout with `gb_trees', with an ETS table with
-%% one row for each version, and with a NIF. The benchmark is not part of
-%% this repository. See "The store of the StorageServer" in README.md.
+%% Two benchmarks compared layouts of the store. The benchmarks are not
+%% part of this repository. See "The store of the StorageServer" and "The
+%% versions of a hot key" in README.md.
 %%
 %% == Replicas ==
 %%
@@ -192,12 +203,12 @@
 -behaviour(gen_server).
 
 -include("deadlift_eta.hrl").
--eta_observe({state, [version, oldest, data, rollbacks]}).
+-eta_observe({state, [version, oldest, data, history, rollbacks]}).
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
--export([handle/1, read_direct/3]).
+-export([handle/1, read_direct/3, versions/1]).
 -export_type([handle/0, query/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -228,7 +239,7 @@
 %% The table of the data and the published versions of a StorageServer.
 %% Element 1 of `published' is the version, and element 2 is the oldest
 %% version. `wait' is `false' only with the planted defect `wait => false'.
--type handle() :: #{data := ets:tid(), published := atomics:atomics_ref(), wait => boolean()}.
+-type handle() :: #{data := ets:tid(), history := ets:tid(), published := atomics:atomics_ref(), wait => boolean()}.
 
 -type query() :: {key, term()} | {range, term(), term()}.
 
@@ -250,6 +261,7 @@
     %% The ETS table of the data, with the rows `{Key, Versions}'. See
     %% "Store" above.
     data :: ets:tid(),
+    history :: ets:tid(),
     %% The ETS table with a row `{{Version, Key}}' for each version above
     %% the oldest version.
     changes :: ets:tid(),
@@ -386,7 +398,8 @@ handle(Storage) ->
 %% <li>`gone': the table does not exist. The StorageServer has stopped.</li>
 %% </ul>
 -spec read_direct(handle(), query(), version()) -> {ok, term()} | behind | too_old | gone.
-read_direct(Handle = #{data := Data, published := Published}, Query, Version) ->
+read_direct(Handle = #{data := Data0, history := History, published := Published}, Query, Version) ->
+    Data = {Data0, History},
     case atomics:get(Published, 1) >= Version orelse not maps:get(wait, Handle, true) of
         false ->
             behind;
@@ -410,7 +423,8 @@ read_direct(Handle = #{data := Data, published := Published}, Query, Version) ->
         rollbacks := non_neg_integer(),
         %% The ETS table of the data. See "Store" in the module
         %% documentation.
-        data := ets:tid()
+        data := ets:tid(),
+        history := ets:tid()
     }.
 info(Storage) ->
     gen_server:call(Storage, info).
@@ -431,6 +445,7 @@ init(Options = #{coordinators := Coordinators}) ->
         clear = maps:get(clear, Options, true),
         wait = maps:get(wait, Options, true),
         data = ets:new(deadlift_storage_data, [ordered_set, protected, {read_concurrency, true}]),
+        history = ets:new(deadlift_storage_history, [ordered_set, protected, {read_concurrency, true}]),
         changes = ets:new(deadlift_storage_changes, [ordered_set, private]),
         buffer = gb_trees:empty(),
         published = atomics:new(2, [{signed, true}]),
@@ -444,15 +459,22 @@ handle_call({read, Key, Version}, From, State) ->
     read_at({key, Key}, Version, From, State);
 handle_call({read_range, Begin, End, Version}, From, State) ->
     read_at({range, Begin, End}, Version, From, State);
-handle_call(handle, _From, State = #state{data = Data, published = Published}) ->
-    {reply, #{data => Data, published => Published, wait => State#state.wait}, State};
+handle_call(handle, _From, State = #state{data = Data, history = History, published = Published}) ->
+    {reply, #{data => Data, history => History, published => Published, wait => State#state.wait}, State};
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
     Epoch =
         case System of
             #{epoch := E} -> E;
             undefined -> undefined
         end,
-    Info = #{version => Version, oldest => State#state.oldest, epoch => Epoch, rollbacks => Rollbacks, data => State#state.data},
+    Info = #{
+        version => Version,
+        oldest => State#state.oldest,
+        epoch => Epoch,
+        rollbacks => Rollbacks,
+        data => State#state.data,
+        history => State#state.history
+    },
     {reply, Info, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State}.
@@ -534,28 +556,36 @@ start(System, State) ->
 rollback(End, State = #state{rollback = false}) ->
     %% The planted defect `rollback => false'.
     State#state{version = End, buffer = gb_trees:empty()};
-rollback(End, State = #state{data = Data, changes = Changes, rollbacks = Rollbacks}) ->
+rollback(End, State = #state{changes = Changes, rollbacks = Rollbacks}) ->
     ok = atomics:put(State#state.published, 1, End),
-    ok = remove_above(End, ets:last(Changes), Data, Changes),
+    ok = remove_above(End, ets:last(Changes), State),
     State#state{version = End, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1}.
 
 %% Removes the versions above `End', from the highest version down. The
 %% oldest version is at or below `End', so the table of the versions has a
-%% row for each of them.
-remove_above(End, {Version, Key} = Row, Data, Changes) when Version > End ->
+%% row for each of them. The highest version of a key is in the row of the
+%% key. After its removal, the next version of the key moves from the
+%% table of the older versions to the row of the key.
+remove_above(End, {Version, Key} = Row, State = #state{data = Data, history = History, changes = Changes}) when Version > End ->
     Previous = ets:prev(Changes, Row),
     true = ets:delete(Changes, Row),
     case ets:lookup(Data, Key) of
-        [{Key, Versions}] ->
-            case [W || W = {Written, _Change} <- Versions, Written =< End] of
-                [] -> true = ets:delete(Data, Key);
-                Kept -> true = ets:insert(Data, {Key, Kept})
+        [{Key, Version, _Change}] ->
+            case ets:next_lookup(History, {Key, -Version}) of
+                {{Key, Negative} = Older, [{Older, Change}]} ->
+                    %% The row of the key changes before the older version
+                    %% leaves its table, so a direct read finds the
+                    %% version in one of the two.
+                    true = ets:insert(Data, {Key, -Negative, Change}),
+                    true = ets:delete(History, Older);
+                _NoOlderVersionOfTheKey ->
+                    true = ets:delete(Data, Key)
             end;
-        [] ->
+        _ ->
             true
     end,
-    remove_above(End, Previous, Data, Changes);
-remove_above(_End, _RowAtOrBelowEndOrNoRow, _Data, _Changes) ->
+    remove_above(End, Previous, State);
+remove_above(_End, _RowAtOrBelowEndOrNoRow, _State) ->
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -668,7 +698,7 @@ write_entry(Entry, LSN, State = #state{data = Data}) when is_list(Entry) ->
                 clear_key(Key, LSN, ets:lookup(Data, Key), State);
             ({clear_range, Begin, End}) ->
                 %% The rows of the range are read before the first change.
-                lists:foreach(fun(Row = {Key, _Versions}) -> clear_key(Key, LSN, [Row], State) end, rows(Begin, End, Data));
+                lists:foreach(fun(Row = {Key, _Version, _Change}) -> clear_key(Key, LSN, [Row], State) end, rows(Begin, End, Data));
             (_Other) ->
                 ok
         end,
@@ -680,19 +710,20 @@ write_entry(_NoTransaction, _LSN, _State) ->
 %% Adds the version `LSN' of `Key'. `Change' is `{set, Value}' or `clear'.
 %% `Row' is the result of the lookup of the key. If a mutation of the same
 %% record changed the key before, the new change replaces that one.
-put_version(Key, LSN, Change, Row, #state{data = Data, changes = Changes}) ->
-    Versions =
-        case Row of
-            [{Key, [{LSN, _Earlier} | Older]}] -> [{LSN, Change} | Older];
-            [{Key, Older}] -> [{LSN, Change} | Older];
-            [] -> [{LSN, Change}]
-        end,
-    true = ets:insert(Data, {Key, Versions}),
+%% Otherwise the version of the row moves to the table of the older
+%% versions. That table gets its row first, so a direct read finds the
+%% version in one of the two tables.
+put_version(Key, LSN, Change, Row, #state{data = Data, history = History, changes = Changes}) ->
+    case Row of
+        [{Key, Version, Earlier}] when Version < LSN -> true = ets:insert(History, {{Key, -Version}, Earlier});
+        _SameRecordOrNoRow -> true
+    end,
+    true = ets:insert(Data, {Key, LSN, Change}),
     true = ets:insert(Changes, {{LSN, Key}}),
     ok.
 
 %% A clear of a key without a value adds no version.
-clear_key(Key, LSN, Row = [{Key, [{_Version, {set, _Value}} | _]}], State) ->
+clear_key(Key, LSN, Row = [{Key, _Version, {set, _Value}}], State) ->
     put_version(Key, LSN, clear, Row, State);
 clear_key(_Key, _LSN, _NoRowOrNoValue, _State) ->
     ok.
@@ -740,34 +771,36 @@ advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, win
 %% the table of the versions. The last version of a key at or below
 %% `Oldest' stays in the data without such a row, until a later version of
 %% the key is at or below a later oldest version.
-remove_old(Oldest, {Version, Key} = Row, State = #state{data = Data, changes = Changes}) when Version =< Oldest ->
+remove_old(Oldest, {Version, Key} = Row, State = #state{data = Data, history = History, changes = Changes}) when Version =< Oldest ->
     Next = ets:next(Changes, Row),
     true = ets:delete(Changes, Row),
+    %% No read at or above `Oldest' returns a version of the key below
+    %% `Version'.
+    ok = delete_older(ets:next(History, {Key, -Version}), Key, History),
+    %% `Version' is the last version of the key at or below `Oldest', or a
+    %% later row of this pass removes it. If it is a clear, the key has no
+    %% value at `Version', and the row is not needed.
     case ets:lookup(Data, Key) of
-        [{Key, Versions}] ->
-            case prune(Versions, Oldest) of
-                [] -> true = ets:delete(Data, Key);
-                Versions -> true;
-                Kept -> true = ets:insert(Data, {Key, Kept})
+        [{Key, Version, clear}] ->
+            true = ets:delete(Data, Key);
+        [{Key, Newest, _Change}] when Newest > Version ->
+            case ets:lookup(History, {Key, -Version}) of
+                [{Older, clear}] -> true = ets:delete(History, Older);
+                _ -> true
             end;
-        [] ->
+        _ ->
             true
     end,
     remove_old(Oldest, Next, State);
 remove_old(_Oldest, _RowAboveOldestOrNoRow, _State) ->
     ok.
 
-%% The versions above `Oldest', and the last version at or below `Oldest'.
-%% The list has the highest version first.
-prune([Write = {Version, _Value} | Versions], Oldest) when Version > Oldest ->
-    [Write | prune(Versions, Oldest)];
-prune([{_Version, clear} | _Older], _Oldest) ->
-    %% The key has no value at the oldest version.
-    [];
-prune([Write | _Older], _Oldest) ->
-    [Write];
-prune([], _Oldest) ->
-    [].
+delete_older({Key, _Negative} = Older, Key, History) ->
+    Next = ets:next(History, Older),
+    true = ets:delete(History, Older),
+    delete_older(Next, Key, History);
+delete_older(_RowOfAnotherKeyOrEndOfTable, _Key, _History) ->
+    ok.
 
 %% ---------------------------------------------------------------------------
 %% Reads
@@ -778,28 +811,69 @@ prune([], _Oldest) ->
 read_at(_Query, Version, _From, State = #state{oldest = Oldest, check_window = true}) when Version < Oldest ->
     {reply, {error, transaction_too_old}, State};
 read_at(Query, Version, _From, State = #state{version = Mine, wait = Wait}) when Version =< Mine; not Wait ->
-    {reply, lookup(Query, Version, State#state.data), State};
+    {reply, lookup(Query, Version, {State#state.data, State#state.history}), State};
 read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
     {noreply, State#state{waiting = [{From, Query, Version} | Waiting]}}.
 
 answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
     {Ready, Later} = lists:partition(fun({_From, _Query, V}) -> V =< Version end, Waiting),
-    lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, State#state.data)) end, Ready),
+    Tables = {State#state.data, State#state.history},
+    lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, Tables)) end, Ready),
     State#state{waiting = Later}.
 
-lookup({key, Key}, Version, Data) ->
+lookup({key, Key}, Version, {Data, History}) ->
     case ets:lookup(Data, Key) of
-        [{Key, Versions}] -> visible(Versions, Version);
+        [Row] -> visible(Row, Version, Data, History);
         [] -> not_found
     end;
-lookup({range, Begin, End}, Version, Data) ->
+lookup({range, Begin, End}, Version, {Data, History}) ->
     {ok, [
         {Key, Value, Written}
-     || {Key, Versions} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Versions, Version)]
+     || Row = {Key, _Newest, _Change} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Row, Version, Data, History)]
     ]}.
 
-%% The value of the last version at or below `Version'.
-visible([{Written, {set, Value}} | _], Version) when Written =< Version -> {ok, Value, Written};
-visible([{Written, clear} | _], Version) when Written =< Version -> not_found;
-visible([_Later | Older], Version) -> visible(Older, Version);
-visible([], _Version) -> not_found.
+%% The value of the last version of the key at or below `Version'. `Row'
+%% is the row of the key, which has the newest version. An older version
+%% is in the table of the older versions, with the key `{Key, -Version}',
+%% so the first row at or after `{Key, -Version}' is the last version at
+%% or below `Version'.
+%%
+%% A direct read runs in another process while the StorageServer changes
+%% the tables. A rollback moves a version from the table of the older
+%% versions to the row of the key. The read therefore reads the row of the
+%% key again after the table of the older versions, and starts again if
+%% the row has changed.
+visible({_Key, Written, Change}, Version, _Data, _History) when Written =< Version ->
+    value(Written, Change);
+visible(Row = {Key, _Newest, _Change}, Version, Data, History) ->
+    Older =
+        case ets:lookup(History, {Key, -Version}) of
+            [{_, Change}] ->
+                value(Version, Change);
+            [] ->
+                case ets:next_lookup(History, {Key, -Version}) of
+                    {{Key, Negative}, [{_, Change}]} -> value(-Negative, Change);
+                    _NoVersionAtOrBelow -> not_found
+                end
+        end,
+    case ets:lookup(Data, Key) of
+        [Row] -> Older;
+        [Changed] -> visible(Changed, Version, Data, History);
+        [] -> not_found
+    end.
+
+value(Written, {set, Value}) -> {ok, Value, Written};
+value(_Written, clear) -> not_found.
+
+%% @doc Returns every version of every key, from the tables of `info/1' or
+%% of `handle/1': a map from the key to the list of `{Version, Change}'
+%% with the highest version first. `Change' is `{set, Value}' or `clear'.
+%% The function is for tests and for the simulation. It reads every row.
+-spec versions(#{data := ets:tid(), history := ets:tid(), _ => _}) -> #{term() => [{version(), {set, term()} | clear}]}.
+versions(#{data := Data, history := History}) ->
+    Older = lists:foldr(
+        fun({{Key, Negative}, Change}, Acc) -> maps:update_with(Key, fun(List) -> [{-Negative, Change} | List] end, [{-Negative, Change}], Acc) end,
+        #{},
+        ets:tab2list(History)
+    ),
+    maps:from_list([{Key, [{Version, Change} | maps:get(Key, Older, [])]} || {Key, Version, Change} <- ets:tab2list(Data)]).

@@ -14,7 +14,8 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> key_order(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> epochs(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> rollback(Ids) end} end,
-        fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end
+        fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> many_versions(Ids) end} end
     ]}.
 
 setup() ->
@@ -129,6 +130,51 @@ clears(Ids) ->
     Data = all_data(Storage),
     ?assertEqual([c], maps:keys(Data)).
 
+%% One key has 300 versions, with a clear at each tenth version, and a
+%% second key has one version. The row of a key has its newest version,
+%% and the older versions are in a second table. A read at each version
+%% returns the value of that version, by message and in the process of the
+%% caller, for a key and for a range.
+many_versions(Ids) ->
+    {Proxy, _Logs} = epoch(Ids),
+    Storage = storage(Ids),
+    {ok, 2} = deadlift_proxy:commit(Proxy, #{writes => [{a, first}]}),
+    Last = lists:foldl(
+        fun
+            (N, _) when N rem 10 =:= 0 ->
+                {ok, LSN} = deadlift_proxy:commit(Proxy, #{mutations => [{clear, x}]}),
+                LSN;
+            (N, _) ->
+                {ok, LSN} = deadlift_proxy:commit(Proxy, #{writes => [{x, N}]}),
+                LSN
+        end,
+        0,
+        lists:seq(3, 302)
+    ),
+    ?assertEqual(302, Last),
+    ok = await_version(Storage, 302),
+    Info = #{data := Data, history := History} = deadlift_storage:info(Storage),
+    ?assertEqual([{a, 2, {set, first}}, {x, 302, {set, 302}}], ets:tab2list(Data)),
+    ?assertEqual(299, ets:info(History, size)),
+    ?assertEqual([{V, case V rem 10 of 0 -> clear; _ -> {set, V} end} || V <- lists:seq(302, 3, -1)], maps:get(x, deadlift_storage:versions(Info))),
+    {ok, Handle} = deadlift_storage:handle(Storage),
+    lists:foreach(
+        fun(Version) ->
+            Expected =
+                case Version of
+                    2 -> not_found;
+                    _ when Version rem 10 =:= 0 -> not_found;
+                    _ -> {ok, Version, Version}
+                end,
+            ?assertEqual(Expected, deadlift_storage:read_with_version(Storage, x, Version, 5000)),
+            ?assertEqual({ok, Expected}, deadlift_storage:read_direct(Handle, {key, x}, Version)),
+            Range = [{a, first, 2} | [{x, Version, Version} || Expected =/= not_found]],
+            ?assertEqual({ok, Range}, deadlift_storage:read_range_with_version(Storage, a, z, Version, 5000)),
+            ?assertEqual({ok, {ok, Range}}, deadlift_storage:read_direct(Handle, {range, a, z}, Version))
+        end,
+        lists:seq(2, 302)
+    ).
+
 %% The order of the keys is the order of Erlang terms: a number is below an
 %% atom, an atom is below a tuple, and a tuple is below a binary. A read of
 %% a range returns the keys in this order.
@@ -177,8 +223,7 @@ sys_state(Storage) ->
 
 %% The rows of the ETS table of the data, as a map.
 all_data(Storage) ->
-    #{data := Table} = deadlift_storage:info(Storage),
-    maps:from_list(ets:tab2list(Table)).
+    deadlift_storage:versions(deadlift_storage:info(Storage)).
 
 %% Two transactions of one batch write the key `x'. A read returns the
 %% write of the transaction with the higher index.

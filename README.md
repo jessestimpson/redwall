@@ -209,8 +209,11 @@ FoundationDB has an ordered keyspace. Every structure of deadlift that
 holds keys keeps the keys in their order.
 
 - The data of the StorageServer is an ETS table of type `ordered_set`
-  with one row for each key. The row has the versions of the key, with
-  the highest version first.
+  with one row for each key. The row has the newest version of the key.
+- A second ETS table of type `ordered_set` has one row for each older
+  version of a key, with the key and the version as its key. A read at a
+  version below the newest version of a key reads one row of this
+  table.
 - A second ETS table of type `ordered_set` has one row for each version
   above the oldest version. A rollback examines only the versions that it
   removes. A rise of the oldest version examines only the versions that
@@ -234,6 +237,12 @@ repository.
 | Reads by 8 processes at the same time | million per second | Not possible | 5.13 | 2.99 | 5.04 |
 
 The owner of the project chose the ETS table with one row for each key.
+In that benchmark each key had about one version. On 2026-11-23 a
+benchmark with many versions of each key showed that a row with every
+version of a key costs a copy of every version for each read and each
+write. The owner then chose the row with the newest version and the
+second table for the older versions. See "The versions of a hot key"
+under "Benchmark".
 
 ### The client
 
@@ -289,7 +298,11 @@ end).
 - `on_error/2` follows `Transaction::onError` of
   `fdbclient/NativeAPI.actor.cpp`. After 1020, 1021 and 1037 it waits for a
   random part of a backoff that starts at 10 ms, doubles with each error
-  and is at most 1 s. After 1007 and 1009 it waits for 10 ms.
+  and is at most 1 s. After 1007 and 1009 it waits for 10 ms. The options
+  `retry_delay_ms` and `max_retry_delay_ms` of `deadlift:open/1` set the
+  first backoff and the highest backoff. FoundationDB has the
+  transaction option `max_retry_delay` for the highest backoff, and no
+  option for the first one.
   `transactional/2` then runs the function again.
 
 ### The Proxy
@@ -779,132 +792,132 @@ A value has 100 bytes.
 |---|---|
 | `write` | A transaction that sets one key, without a read |
 | `read_write` | A transaction that reads one key by message and sets one key, with 1,000,000 keys |
-| `conflict` | `read_write` with 100 keys |
+| `conflict` | `read_write` with 100 keys. Each key then has several hundred versions in the MVCC window |
 | `read_version` | One read version from the Proxy |
 | `read_after_write` | A client commits a write and reads the key at the commit version. The row has the time of the read, which ends when the StorageServer has applied the record |
 | `read_by_message` | The read of one key at a read version that the client has, from the node of the benchmark |
 | `read_direct` | The same read by a client on the node of the StorageServer, from the ETS table |
 
 Results of one run on 2026-11-23, with Erlang/OTP 28 and 3 seconds for
-each row. The machine has 4 performance cores and 6 efficiency cores. The
+each row. In three runs of an earlier version on the same day, the
+operations per second and the p50 of each row differed by at most 10%.
+The p99.9 differed by at most 23% in the rows with a p99.9 of 200 us or
+more. The machine has 4 performance cores and 6 efficiency cores. The
 Sequencer, the Resolver and the Proxy are on three nodes.
 
 | Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
 |---|---|---|---|---|---|---|
-| `write` | 1 | 5944 | 169 | 200 | 256 | 1.00 |
-| `write` | 4 | 13536 | 295 | 371 | 420 | 1.00 |
-| `write` | 16 | 41711 | 383 | 465 | 576 | 1.00 |
-| `write` | 64 | 86668 | 733 | 948 | 1149 | 1.00 |
-| `write` | 256 | 116426 | 2179 | 2843 | 3149 | 1.00 |
-| `read_write` | 1 | 2960 | 327 | 502 | 580 | 1.00 |
-| `read_write` | 4 | 7433 | 533 | 838 | 990 | 1.00 |
-| `read_write` | 16 | 19696 | 803 | 1111 | 1295 | 1.00 |
-| `read_write` | 64 | 35661 | 1776 | 2485 | 2746 | 1.00 |
-| `read_write` | 256 | 42443 | 5996 | 8087 | 8669 | 1.00 |
-| `conflict` | 64 | 18636 | 1555 | 28209 | 76861 | 1.23 |
-| `read_version` | 1 | 12717 | 78 | 101 | 119 | 1.00 |
-| `read_version` | 4 | 35219 | 112 | 166 | 193 | 1.00 |
-| `read_version` | 16 | 90704 | 173 | 266 | 364 | 1.00 |
-| `read_version` | 64 | 154484 | 410 | 602 | 717 | 1.00 |
-| `read_version` | 256 | 154613 | 1620 | 2214 | 2515 | 1.00 |
-| `read_after_write` | 1 | 4848 | 33 | 43 | 51 | 1.00 |
-| `read_after_write` | 16 | 30326 | 98 | 220 | 280 | 1.00 |
-| `read_by_message` | 1 | 37454 | 26 | 40 | 55 | 1.00 |
-| `read_by_message` | 16 | 168724 | 92 | 155 | 195 | 1.00 |
-| `read_by_message` | 64 | 183009 | 352 | 537 | 628 | 1.00 |
-| `read_direct` | 1 | 597165 | 2 | 2 | 7 | 1.00 |
-| `read_direct` | 2 | 1077850 | 2 | 2 | 17 | 1.00 |
-| `read_direct` | 16 | 983109 | 2 | 852 | 1215 | 1.00 |
+| `write` | 1 | 5912 | 170 | 207 | 251 | 1.00 |
+| `write` | 4 | 13487 | 296 | 374 | 442 | 1.00 |
+| `write` | 16 | 41161 | 387 | 505 | 597 | 1.00 |
+| `write` | 64 | 83920 | 753 | 1041 | 1254 | 1.00 |
+| `write` | 256 | 106725 | 2312 | 3876 | 4596 | 1.00 |
+| `read_write` | 1 | 2820 | 329 | 544 | 658 | 1.00 |
+| `read_write` | 4 | 7416 | 531 | 849 | 967 | 1.00 |
+| `read_write` | 16 | 19293 | 821 | 1111 | 1266 | 1.00 |
+| `read_write` | 64 | 34155 | 1855 | 2599 | 2873 | 1.00 |
+| `read_write` | 256 | 42924 | 5896 | 7896 | 8596 | 1.00 |
+| `conflict` | 64 | 20815 | 1323 | 26196 | 62596 | 1.22 |
+| `read_version` | 1 | 13098 | 76 | 98 | 110 | 1.00 |
+| `read_version` | 4 | 36162 | 108 | 162 | 195 | 1.00 |
+| `read_version` | 16 | 85312 | 183 | 292 | 377 | 1.00 |
+| `read_version` | 64 | 143395 | 440 | 682 | 842 | 1.00 |
+| `read_version` | 256 | 146064 | 1707 | 2454 | 2939 | 1.00 |
+| `read_after_write` | 1 | 4849 | 32 | 46 | 57 | 1.00 |
+| `read_after_write` | 16 | 30090 | 98 | 237 | 301 | 1.00 |
+| `read_by_message` | 1 | 35969 | 28 | 35 | 83 | 1.00 |
+| `read_by_message` | 16 | 158608 | 99 | 173 | 215 | 1.00 |
+| `read_by_message` | 64 | 170902 | 375 | 595 | 709 | 1.00 |
+| `read_direct` | 1 | 566784 | 2 | 2 | 16 | 1.00 |
+| `read_direct` | 2 | 1066710 | 2 | 3 | 15 | 1.00 |
+| `read_direct` | 16 | 1044950 | 2 | 718 | 978 | 1.00 |
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
 | Clients | Transactions per batch | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
 |---|---|---|---|---|---|---|
-| 1 | 1.0 | 1 | 24 | 31 | 47 | 33 |
-| 4 | 2.0 | 109 | 27 | 38 | 49 | 34 |
-| 16 | 8.0 | 133 | 31 | 70 | 55 | 35 |
-| 64 | 31.8 | 270 | 52 | 187 | 80 | 45 |
-| 256 | 126.0 | 844 | 198 | 642 | 157 | 78 |
+| 1 | 1.0 | 1 | 25 | 31 | 47 | 33 |
+| 4 | 2.0 | 110 | 28 | 38 | 48 | 34 |
+| 16 | 8.0 | 134 | 31 | 72 | 55 | 35 |
+| 64 | 31.8 | 279 | 53 | 192 | 84 | 47 |
+| 256 | 122.7 | 878 | 211 | 677 | 162 | 82 |
 
 The longest single time of each step:
 
 | Clients | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
 |---|---|---|---|---|---|
-| 1 | 8 | 153 | 176 | 328 | 164 |
-| 4 | 295 | 106 | 141 | 156 | 211 |
-| 16 | 292 | 120 | 180 | 185 | 85 |
-| 64 | 503 | 234 | 405 | 224 | 136 |
-| 256 | 1361 | 813 | 1347 | 429 | 327 |
+| 1 | 8 | 131 | 158 | 263 | 163 |
+| 4 | 266 | 127 | 144 | 164 | 100 |
+| 16 | 421 | 136 | 200 | 187 | 147 |
+| 64 | 615 | 243 | 395 | 278 | 153 |
+| 256 | 1585 | 855 | 1987 | 543 | 356 |
 
 The confirmations of the Proxy for `read_version`:
 
 | Clients | Requests per confirmation | Time of a confirmation (us) |
 |---|---|---|
-| 1 | 1.0 | 38 |
-| 4 | 1.9 | 46 |
-| 16 | 5.7 | 57 |
-| 64 | 13.8 | 84 |
-| 256 | 15.2 | 91 |
+| 1 | 1.0 | 37 |
+| 4 | 1.9 | 45 |
+| 16 | 5.6 | 59 |
+| 64 | 13.5 | 88 |
+| 256 | 15.1 | 95 |
 
 Garbage collections and uninterrupted runs of a process of 2 ms or more, since the start of the cluster:
 
 | Kind | Process | Count | Longest (ms) | Sum (ms) |
 |---|---|---|---|---|
-| long_gc | `erpc` | 38 | 19 | 310 |
-| long_schedule | `erpc` | 8 | 9 | 55 |
-| long_gc | `deadlift_bench` | 8 | 5 | 30 |
-| long_gc | `{client_node,erlang}` | 5 | 8 | 25 |
-| long_schedule | `stopped` | 3 | 7 | 17 |
+| long_schedule | `deadlift_log` | 3 | 3 | 9 |
+| long_gc | `deadlift_storage` | 1 | 3 | 3 |
 
 The default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 625 | 1 | 2 |
-| resolver | 694 | 2 | 3 |
-| proxy | 582 | 3 | 4 |
-| sequencer | 517 | 4 | 5 |
-| cluster_controller | 11 | 5 | 6 |
+| log | 626 | 1 | 2 |
+| resolver | 602 | 2 | 3 |
+| proxy | 559 | 3 | 4 |
+| sequencer | 511 | 4 | 5 |
+| cluster_controller | 224 | 5 | 6 |
 
 The Sequencer, the Resolver and the Proxy on one node (`stateless` `together`):
 
 | Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
 |---|---|---|---|---|---|---|
-| `write` | 1 | 10669 | 91 | 226 | 308 | 1.00 |
-| `write` | 4 | 26151 | 151 | 214 | 290 | 1.00 |
-| `write` | 16 | 62398 | 252 | 373 | 456 | 1.00 |
-| `write` | 64 | 108514 | 580 | 852 | 1017 | 1.00 |
-| `write` | 256 | 119415 | 2125 | 3005 | 3454 | 1.00 |
-| `read_write` | 1 | 4124 | 237 | 381 | 513 | 1.00 |
-| `read_write` | 4 | 9762 | 386 | 745 | 954 | 1.00 |
-| `read_write` | 16 | 21431 | 743 | 1015 | 1109 | 1.00 |
-| `read_write` | 64 | 36353 | 1744 | 2474 | 2768 | 1.00 |
-| `read_write` | 256 | 42849 | 5941 | 7928 | 8628 | 1.00 |
-| `read_version` | 1 | 14592 | 69 | 94 | 112 | 1.00 |
-| `read_version` | 4 | 41883 | 93 | 149 | 188 | 1.00 |
-| `read_version` | 16 | 99071 | 158 | 250 | 317 | 1.00 |
-| `read_version` | 64 | 157626 | 409 | 613 | 781 | 1.00 |
-| `read_version` | 256 | 156508 | 1600 | 2194 | 2533 | 1.00 |
+| `write` | 1 | 10782 | 92 | 117 | 151 | 1.00 |
+| `write` | 4 | 25910 | 153 | 209 | 271 | 1.00 |
+| `write` | 16 | 59341 | 264 | 396 | 493 | 1.00 |
+| `write` | 64 | 106328 | 593 | 853 | 1049 | 1.00 |
+| `write` | 256 | 117495 | 2172 | 2732 | 3224 | 1.00 |
+| `read_write` | 1 | 3984 | 243 | 394 | 504 | 1.00 |
+| `read_write` | 4 | 9762 | 390 | 722 | 907 | 1.00 |
+| `read_write` | 16 | 21350 | 746 | 1020 | 1130 | 1.00 |
+| `read_write` | 64 | 36890 | 1715 | 2462 | 2766 | 1.00 |
+| `read_write` | 256 | 42383 | 5996 | 7996 | 8596 | 1.00 |
+| `read_version` | 1 | 14727 | 69 | 93 | 105 | 1.00 |
+| `read_version` | 4 | 41616 | 94 | 148 | 179 | 1.00 |
+| `read_version` | 16 | 95171 | 164 | 266 | 352 | 1.00 |
+| `read_version` | 64 | 150259 | 429 | 645 | 765 | 1.00 |
+| `read_version` | 256 | 149236 | 1676 | 2324 | 2657 | 1.00 |
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
 | Clients | Transactions per batch | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
 |---|---|---|---|---|---|---|
-| 1 | 1.0 | 0 | 2 | 5 | 43 | 5 |
-| 4 | 2.0 | 37 | 5 | 8 | 57 | 4 |
-| 16 | 7.2 | 51 | 13 | 25 | 71 | 6 |
-| 64 | 27.8 | 71 | 43 | 100 | 99 | 12 |
-| 256 | 66.4 | 233 | 88 | 291 | 148 | 25 |
+| 1 | 1.0 | 0 | 2 | 5 | 42 | 5 |
+| 4 | 2.0 | 38 | 5 | 8 | 58 | 4 |
+| 16 | 7.1 | 54 | 13 | 25 | 74 | 6 |
+| 64 | 27.8 | 73 | 44 | 103 | 101 | 12 |
+| 256 | 55.2 | 107 | 82 | 238 | 128 | 19 |
 
 The longest single time of each step:
 
 | Clients | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
 |---|---|---|---|---|---|
-| 1 | 6 | 23 | 47 | 1914 | 93 |
-| 4 | 193 | 53 | 52 | 544 | 196 |
-| 16 | 171 | 102 | 140 | 188 | 63 |
-| 64 | 748 | 215 | 630 | 269 | 129 |
-| 256 | 2143 | 492 | 2283 | 597 | 290 |
+| 1 | 3 | 14 | 34 | 1704 | 46 |
+| 4 | 156 | 55 | 55 | 179 | 37 |
+| 16 | 172 | 68 | 155 | 208 | 56 |
+| 64 | 250 | 231 | 279 | 291 | 120 |
+| 256 | 893 | 507 | 856 | 291 | 95 |
 
 The confirmations of the Proxy for `read_version`:
 
@@ -912,19 +925,19 @@ The confirmations of the Proxy for `read_version`:
 |---|---|---|
 | 1 | 1.0 | 31 |
 | 4 | 1.7 | 36 |
-| 16 | 5.3 | 49 |
-| 64 | 11.8 | 70 |
-| 256 | 13.1 | 76 |
+| 16 | 5.3 | 50 |
+| 64 | 11.5 | 72 |
+| 256 | 12.7 | 76 |
 
 `retry_ms` 35 and `stateless` `together`:
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 108 | 1 | 2 |
-| resolver | 94 | 2 | 3 |
-| proxy | 40 | 3 | 4 |
-| sequencer | 47 | 4 | 5 |
-| cluster_controller | 11 | 5 | 6 |
+| log | 109 | 1 | 2 |
+| resolver | 84 | 2 | 3 |
+| proxy | 45 | 3 | 4 |
+| sequencer | 41 | 4 | 5 |
+| cluster_controller | 14 | 5 | 6 |
 
 In the two tables of kills, 8 clients write, and the time is the longest
 time without an acknowledged commit after the kill of one process.
@@ -972,8 +985,12 @@ Observations:
 - The p99.9 of `write` is 0.3 ms to 3.1 ms, and no process of the
   cluster had a garbage collection of 2 ms or more. Before the changes
   of the LogServer and of the Resolver, the p99.9 was up to 85 ms.
-- The p99.9 of `conflict` is 77 ms. A client waits before it runs a
-  transaction again after a conflict.
+- The p99.9 of `conflict` is 63 ms. A client waits before it runs a
+  transaction again after a conflict. See "The versions of a hot key"
+  below.
+- No process of a node had a garbage collection of 2 ms or more. An
+  earlier version of the benchmark kept each latency in a list, and the
+  garbage collections of its own processes were in the results.
 - After the kill of a role, the time without a commit is `retry_ms` plus
   about 50 ms.
 - After the kill of the ClusterController, the old epoch accepts commits
@@ -999,13 +1016,75 @@ structures gave the same result for every transaction.
 The Resolver of deadlift has the third structure. Before this benchmark
 it had the first one.
 
+### The versions of a hot key
+
+`conflict` has 100 keys. `deadlift_bench:conflicts/1` measures it for
+several values of the client option `retry_delay_ms`, with the number of
+each error code and the steps of a batch in the Proxy. One run on
+2026-11-23:
+
+| `retry_delay_ms` | Clients | Operations per second | p50 (us) | p99.9 (us) | Attempts per operation |
+|---|---|---|---|---|---|
+| 10 (default) | 16 | 13,661 | 696 | 23,838 | 1.07 |
+| 10 (default) | 64 | 15,344 | 1,702 | 96,177 | 1.25 |
+| 10 (default) | 256 | 9,487 | 9,087 | 1,135,943 | 1.83 |
+| 0 | 16 | 14,114 | 1,041 | 3,457 | 1.11 |
+| 0 | 64 | 13,842 | 3,444 | 27,709 | 1.46 |
+| 0 | 256 | 9,295 | 20,866 | 152,838 | 2.53 |
+
+- Every failed attempt had the error 1020 (not committed).
+- The wait of the client after a conflict sets the p99.9. Without the
+  wait, the p99.9 is lower and the p50 is higher, because more attempts
+  fail.
+- The operations per second do not rise with the clients and do not
+  depend on the wait. A batch of the Proxy has 3 to 15 transactions and
+  takes 0.3 ms, so the Proxy, the Resolver and the LogServers are not the
+  limit.
+- The limit was the StorageServer. It kept every version of a key in one
+  ETS row. Each of the 100 keys has several hundred versions in the MVCC
+  window of 5 seconds, and each read and each write copied the row.
+
+A benchmark on 2026-11-23 compared three layouts for 100 keys with values
+of 100 bytes. The benchmark is not part of this repository.
+
+| Versions of each key | Layout | New version (ns) | Read at the newest version (ns) | Read at a version in the middle (ns) | Read by 8 processes (million per second) | Range of 100 keys at the newest version (us) |
+|---|---|---|---|---|---|---|
+| 1 | One row for each key | 334 | 180 | 126 | 9.14 | 12 |
+| 1 | One row for each version | 209 | 165 | 158 | 8.51 | 23 |
+| 1 | The newest version in the row of the key, the older versions in a second table | 286 | 123 | 112 | 8.73 | 10 |
+| 16 | One row for each key | 1,244 | 809 | 795 | 0.93 | 73 |
+| 16 | One row for each version | 305 | 204 | 182 | 7.77 | 34 |
+| 16 | The newest version in the row of the key, the older versions in a second table | 434 | 132 | 246 | 8.33 | 8 |
+| 256 | One row for each key | 16,208 | 9,997 | 10,260 | 0.06 | 847 |
+| 256 | One row for each version | 385 | 226 | 240 | 8.49 | 40 |
+| 256 | The newest version in the row of the key, the older versions in a second table | 419 | 123 | 286 | 9.00 | 7 |
+| 1,024 | One row for each key | 72,936 | 40,765 | 46,746 | 0.01 | 2,924 |
+| 1,024 | One row for each version | 330 | 281 | 272 | 10.62 | 28 |
+| 1,024 | The newest version in the row of the key, the older versions in a second table | 491 | 102 | 345 | 9.73 | 8 |
+
+The StorageServer of deadlift has the third layout since this benchmark.
+`conflicts/1` after the change, in one run:
+
+| `retry_delay_ms` | Clients | Operations per second before | Operations per second after | p99.9 before (us) | p99.9 after (us) |
+|---|---|---|---|---|---|
+| 10 (default) | 16 | 13,661 | 13,856 | 23,838 | 24,096 |
+| 10 (default) | 64 | 15,344 | 22,167 | 96,177 | 59,596 |
+| 10 (default) | 256 | 9,487 | 24,166 | 1,135,943 | 452,496 |
+| 0 | 16 | 14,114 | 17,300 | 3,457 | 2,708 |
+| 0 | 64 | 13,842 | 25,580 | 27,709 | 9,796 |
+| 0 | 256 | 9,295 | 18,491 | 152,838 | 76,696 |
+
+After the change, the attempts that fail and the wait of the client
+after a conflict set the results: with 256 clients and no wait, a
+transaction has 2.3 attempts.
+
 Limitations of the benchmark:
 
 - All nodes share the processors of one computer, and a message between
   two nodes has no network delay.
 - Every LogServer and the StorageServer keep their data in memory.
-- The results are from one run. Two runs of the same code differ by 10%
-  or more in some rows.
+- The runs are on one computer. Three runs differ by at most 10% in the
+  operations per second and in the p50.
 - The clients run on the node of the benchmark, so the rows with many
   clients measure that node too.
 - A kill stops one process. The node of the process continues.

@@ -1100,9 +1100,9 @@ storage_rollback(Tab, Storages, CState) ->
 %% StorageServer.
 observe(Storage) ->
     case eta_observe:read(Storage) of
-        Published = #{data := Table} ->
+        Published = #{data := _Table, history := _History} ->
             try
-                Published#{data := maps:from_list(ets:tab2list(Table))}
+                Published#{data := deadlift_storage:versions(Published)}
             catch
                 error:badarg -> no_table
             end;
