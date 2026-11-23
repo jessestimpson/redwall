@@ -299,6 +299,16 @@ writes to a store with versions (paper, sections 2.4.3 and 2.4.4).
   StorageServer sends each request again, because a message can be lost.
 - A read at a version returns the last write to the key at or below that
   version. The read waits until the StorageServer has the version.
+- The StorageServer keeps the versions of the MVCC window, which is
+  5,000,000 versions by default (paper, section 2.4.5). For each key it
+  keeps the versions above its oldest version and the last version at or
+  below the oldest version. A read below the oldest version returns
+  `{error, transaction_too_old}`.
+- The oldest version is the lower one of two versions: the version of the
+  StorageServer minus the window, and the highest Known Committed Version
+  that a LogServer has sent with its records. No recovery discards a
+  record at or below a Known Committed Version, so a rollback needs no
+  version that the StorageServer has removed.
 - The StorageServer reads the log systems of all epochs from the
   coordinated state, at its start and when a LogServer answers that it is
   stopped.
@@ -341,9 +351,11 @@ through the registry. They send a request only to a LogServer that runs.
 - The Sequencer of deadlift sends the recovery transaction itself, after
   the write of the coordinated state. The master of FoundationDB sends it
   through a proxy, before the write of the coordinated state.
-- The StorageServer keeps every version of every key in memory. A
-  StorageServer of FoundationDB keeps the versions of the MVCC window in
-  memory and writes older data to disk. This part is not in the paper.
+- The StorageServer keeps the data in memory. A StorageServer of
+  FoundationDB keeps the versions of the MVCC window in memory and writes
+  older data to disk. This part is not in the paper.
+- The rule for the oldest version of the StorageServer is not taken from
+  the FoundationDB source.
 - One StorageServer has every key. FoundationDB divides the key space
   into shards.
 - The StorageServer reads the log systems from the coordinated state. A
@@ -427,8 +439,8 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,558 acknowledged transactions, of which 2,223 with a read range and 2,169 in a batch with another acknowledged transaction, 9,265 rejected for a conflict, 1,887 too old, 22,132 transactions with reads from the StorageServer, 2,279 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,429 acknowledged transactions, of which 438 with a read range and 401 in a batch with another acknowledged transaction, 3,213 rejected for a conflict, 3,122 too old, 23,274 transactions with reads from the StorageServer, of which 7,130 from a StorageServer that started after a kill, 386 rollbacks of the StorageServer, 5,997 recoveries, 3,276 kills, of which 347 of the StorageServer, 566 partitions |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,562 acknowledged transactions, of which 2,227 with a read range and 2,166 in a batch with another acknowledged transaction, 9,258 rejected for a conflict, 1,884 too old, 22,120 transactions with reads from the StorageServer, 13 reads below the MVCC window of the StorageServer, 2,276 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,407 acknowledged transactions, of which 433 with a read range and 398 in a batch with another acknowledged transaction, 3,130 rejected for a conflict, 3,095 too old, 22,732 transactions with reads from the StorageServer, of which 6,859 from a StorageServer that started after a kill, 488 reads below the MVCC window of the StorageServer, 386 rollbacks of the StorageServer, 6,030 recoveries, 3,262 kills, of which 353 of the StorageServer, 565 partitions |
 | Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
 | Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `read_version_order` |
@@ -437,8 +449,9 @@ Results of `make dst` on 2026-11-22:
 | Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 3, `no_conflict` between the transactions with the indexes 0 and 1 of one batch |
 | Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 1, `no_conflict` between a transaction of epoch 16 and a write of epoch 15 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 18, `read_version_order`: a Proxy of epoch 10 gave a read version below a commit of epoch 11 |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 18, `read_version_order`: a Proxy of epoch 13 gave a read version below a commit of epoch 16 |
 | Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 3, `storage_rollback` |
+| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 6, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
@@ -518,8 +531,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - A batch has no limit in bytes.
 - deadlift has no client library. A caller gets the read version, reads
   and commits with separate calls, and repeats a transaction itself.
-- The StorageServer keeps every version of every key in memory, and loses
-  the data when it stops. A new StorageServer reads every record again
+- The StorageServer keeps the data in memory, and loses the data when it
+  stops. A new StorageServer reads every record again
   from the LogServers, which is possible only while the LogServers of
   every epoch run.
 - A read at a version that is not a read version from a Proxy can return
@@ -528,8 +541,11 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   state every 500 ms until the coordinated state has a later epoch.
 - A read of a key range examines every key of the StorageServer.
 - deadlift has no operation that clears a key range.
-- A read does not check the range of the MVCC window. The StorageServer
-  answers a read at any version at or below its version.
+- A rise of the oldest version of the StorageServer examines every key.
+  The oldest version rises in steps of at least one tenth of the MVCC
+  window.
+- The MVCC window of the StorageServer and the MVCC window of the Resolver
+  are two options. No part of deadlift checks that they are equal.
 - The simulation has one StorageServer at a time. A new StorageServer
   starts without data after a kill. The simulation kills at most 1
   LogServer of each epoch, so a LogServer with each body runs.

@@ -50,7 +50,10 @@
 %%
 %% A StorageServer reads the records with the request `{tail, After}'
 %% (`tail/2'). The LogServer answers with the stored records above `After'
-%% and with a flag that tells whether the LogServer is stopped. If the
+%% with a flag that tells whether the LogServer is stopped, and with the
+%% Known Committed Version of the LogServer. No recovery discards a record
+%% at or below that version, because the Recovery Version is at or above
+%% the KCV of every LogServer of the epoch. If the
 %% LogServer has no record above `After' and is not stopped, the answer
 %% waits until the LogServer stores a record above `After' or is locked.
 %% The LogServer keeps one waiting request for each calling process. A new
@@ -254,14 +257,15 @@ peek(Log, After, UpTo, Timeout) ->
     gen_server:call(Log, {peek, After, UpTo}, Timeout).
 
 %% @equiv tail(Log, After, 5000)
--spec tail(gen_server:server_ref(), version()) -> {ok, [record()], boolean()}.
+-spec tail(gen_server:server_ref(), version()) -> {ok, [record()], boolean(), version()}.
 tail(Log, After) ->
     tail(Log, After, ?TIMEOUT_MS).
 
-%% @doc Returns the stored records above `After', and whether the
-%% LogServer is stopped. The call waits while the LogServer has no record
-%% above `After' and is not stopped.
--spec tail(gen_server:server_ref(), version(), timeout()) -> {ok, [record()], boolean()}.
+%% @doc Returns the stored records above `After', whether the LogServer is
+%% stopped, and the Known Committed Version of the LogServer. The call
+%% waits while the LogServer has no record above `After' and is not
+%% stopped.
+-spec tail(gen_server:server_ref(), version(), timeout()) -> {ok, [record()], boolean(), version()}.
 tail(Log, After, Timeout) ->
     gen_server:call(Log, {tail, After}, Timeout).
 
@@ -353,10 +357,10 @@ handle_call({confirm, _Epoch}, _From, State = #state{stopped_by = undefined}) ->
     {reply, ok, State};
 handle_call({confirm, _Epoch}, _From, State) ->
     {reply, {error, stopped}, State};
-handle_call({tail, After}, From = {Caller, _Tag}, State = #state{dv = DV, stopped_by = By, records = Records, tails = Tails}) ->
+handle_call({tail, After}, From = {Caller, _Tag}, State = #state{dv = DV, kcv = KCV, stopped_by = By, records = Records, tails = Tails}) ->
     case After < DV orelse By =/= undefined of
         true ->
-            Reply = {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), By =/= undefined},
+            Reply = {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), By =/= undefined, KCV},
             {reply, Reply, State#state{tails = maps:remove(Caller, Tails)}};
         false ->
             {noreply, State#state{tails = Tails#{Caller => {From, After}}}}
@@ -376,11 +380,11 @@ handle_cast(_Message, State) ->
 
 %% Answers the tail requests that wait: after a push, the requests with
 %% `After' below the DV; after a lock, every request.
-answer_tails(Stopped, State = #state{dv = DV, records = Records, tails = Tails}) ->
+answer_tails(Stopped, State = #state{dv = DV, kcv = KCV, records = Records, tails = Tails}) ->
     Later = maps:filter(
         fun
             (_Caller, {From, After}) when Stopped; After < DV ->
-                gen_server:reply(From, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), Stopped}),
+                gen_server:reply(From, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), Stopped, KCV}),
                 false;
             (_Caller, _Tail) ->
                 true

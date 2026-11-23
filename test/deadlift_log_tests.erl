@@ -128,26 +128,27 @@ records_above_start_test() ->
 tail_test() ->
     Log = start(#{epoch => 1}),
     {ok, 1} = deadlift_log:push(Log, 1, 0, 1, 0, {body, a}),
-    ?assertEqual({ok, [{1, 0, {body, a}}], false}, deadlift_log:tail(Log, 0)),
+    %% The last element is the Known Committed Version of the LogServer.
+    ?assertEqual({ok, [{1, 0, {body, a}}], false, 0}, deadlift_log:tail(Log, 0)),
     %% No record above 1: the request waits.
     R1 = gen_server:send_request(Log, {tail, 1}),
     no_answer(R1),
     {ok, 2} = deadlift_log:push(Log, 1, 1, 2, 1, empty),
-    ?assertEqual({ok, [{2, 1, empty}], false}, answer(R1)),
+    ?assertEqual({ok, [{2, 1, empty}], false, 1}, answer(R1)),
     %% A request above the DV waits for a record above `After'.
     R2 = gen_server:send_request(Log, {tail, 3}),
     {ok, 3} = deadlift_log:push(Log, 1, 2, 3, 1, {body, c}),
     no_answer(R2),
     %% A second request of the same process replaces the first one.
     R3 = gen_server:send_request(Log, {tail, 3}),
-    {ok, 4} = deadlift_log:push(Log, 1, 3, 4, 1, {body, d}),
-    ?assertEqual({ok, [{4, 3, {body, d}}], false}, answer(R3)),
+    {ok, 4} = deadlift_log:push(Log, 1, 3, 4, 3, {body, d}),
+    ?assertEqual({ok, [{4, 3, {body, d}}], false, 3}, answer(R3)),
     no_answer(R2),
     %% A lock answers a waiting request. A stopped LogServer answers at
     %% once.
     R4 = gen_server:send_request(Log, {tail, 4}),
     no_answer(R4),
     {ok, _} = deadlift_log:lock(Log, 2),
-    ?assertEqual({ok, [], true}, answer(R4)),
-    ?assertEqual({ok, [{4, 3, {body, d}}], true}, deadlift_log:tail(Log, 3)),
+    ?assertEqual({ok, [], true, 3}, answer(R4)),
+    ?assertEqual({ok, [{4, 3, {body, d}}], true, 3}, deadlift_log:tail(Log, 3)),
     deadlift_log:stop(Log).

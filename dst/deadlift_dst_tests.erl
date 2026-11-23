@@ -124,6 +124,8 @@ faults_shard(Shard) ->
         %% acknowledged transaction.
         ?assert(maps:get(batched, Stats, 0) > 30, Stats),
         ?assert(maps:get(rollbacks, Stats, 0) > 2, Stats),
+        %% The StorageServer refused reads below its MVCC window.
+        ?assert(maps:get(read_too_old, Stats, 0) > 15, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 15, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
         %% read version of an earlier epoch.
@@ -251,6 +253,15 @@ no_rollback_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_rollback}) end),
         ?debugFmt("no_rollback: seed ~p, ~p", [Seed, Violation]),
         ?assert(lists:member(maps:get(property, Violation), [storage_rollback, read_value]), Violation)
+    end}.
+
+%% A planted defect: the StorageServer answers a read below its oldest
+%% version, after it has removed older versions.
+no_window_check_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_window_check}) end),
+        ?debugFmt("no_window_check: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := read_value}, Violation)
     end}.
 
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the

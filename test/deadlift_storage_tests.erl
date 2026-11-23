@@ -9,6 +9,7 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> reads(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> read_waits(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> batch(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> window(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> epochs(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> rollback(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end
@@ -95,6 +96,36 @@ reads(Ids) ->
     ?assertEqual(not_found, deadlift_storage:read(Storage, x, 1)),
     ok = await_version(Storage, 5),
     ?assertMatch(#{version := 5, epoch := 1, rollbacks := 0}, deadlift_storage:info(Storage)).
+
+%% A StorageServer with an MVCC window of 10 versions. The commit `N' has
+%% the LSN `N + 1' and writes `{x, N}'. The first commit also writes `y'.
+window(Ids) ->
+    {Proxy, _Logs} = epoch(Ids),
+    {ok, Storage} = deadlift_storage:start(#{coordinators => Ids, poll_ms => 5, mvcc_window => 10}),
+    {ok, 2} = deadlift_proxy:commit(Proxy, #{writes => [{x, 1}, {y, 1}]}),
+    [{ok, _} = deadlift_proxy:commit(Proxy, #{writes => [{x, N}]}) || N <- lists:seq(2, 30)],
+    ok = await_version(Storage, 31),
+    %% The LogServers have the Known Committed Version 30 with the record
+    %% 31. The oldest version is 31 - 10.
+    ?assertMatch(#{version := 31, oldest := 21}, deadlift_storage:info(Storage)),
+    ?assertEqual({ok, 30}, deadlift_storage:read(Storage, x, 31)),
+    ?assertEqual({ok, 20, 21}, deadlift_storage:read_with_version(Storage, x, 21, 5000)),
+    ?assertEqual({error, transaction_too_old}, deadlift_storage:read(Storage, x, 20)),
+    ?assertEqual({error, transaction_too_old}, deadlift_storage:read_range(Storage, a, z, 20)),
+    %% The StorageServer keeps the last version at or below the oldest
+    %% version: the write of `y' at the LSN 2.
+    ?assertEqual({ok, 1, 2}, deadlift_storage:read_with_version(Storage, y, 31, 5000)),
+    ?assertEqual({ok, [{x, 22}, {y, 1}]}, deadlift_storage:read_range(Storage, a, z, 23)),
+    %% The StorageServer has 11 versions of `x': the versions 22 to 31 and
+    %% the version 21.
+    #{data := #{x := Versions, y := [{2, 1}]}} = sys_state(Storage),
+    ?assertEqual(lists:seq(31, 21, -1), [Version || {Version, _Value} <- Versions]).
+
+%% The versions that the StorageServer keeps for each key.
+sys_state(Storage) ->
+    State = sys:get_state(Storage),
+    [Data] = [Field || Field <- tuple_to_list(State), is_map(Field), is_map_key(x, Field)],
+    #{data => Data}.
 
 %% Two transactions of one batch write the key `x'. A read returns the
 %% write of the transaction with the higher index.

@@ -32,7 +32,9 @@
 %% <li>`{transaction, R1, R2}': a client runs one transaction. It gets a
 %%   read version from one Proxy, and commits through a Proxy that can be
 %%   another one. Between the two steps, the client reads its read keys
-%%   from the StorageServer at the read version. One client in three then
+%%   from the StorageServer at the read version. The StorageServer has an
+%%   MVCC window of 100,000 versions in the runs with an odd seed, and of
+%%   5,000,000 versions in the other runs. One client in three then
 %%   waits, and commits through the Proxy of the highest epoch that
 %%   runs. The client uses the Proxy of the highest epoch in 3 of 4
 %%   cases, and any Proxy that runs in the others. A Proxy can belong to an
@@ -134,6 +136,8 @@
 %%   confirmation that its epoch is live.</li>
 %% <li>`no_rollback' - the StorageServer keeps the writes above the end
 %%   version of an epoch.</li>
+%% <li>`no_window_check' - the StorageServer answers a read below its
+%%   oldest version, after it has removed older versions.</li>
 %% </ul>
 %%
 %% == Limitations ==
@@ -167,8 +171,16 @@
 %% eta_harness
 %% ---------------------------------------------------------------------------
 
-init(_Seed, Config) ->
+init(Seed, Config) ->
     Mode = maps:get(mode, Config, correct),
+    %% The MVCC window of the StorageServer is 100,000 versions in the runs
+    %% with an odd seed: the versions of 100 ms of the virtual clock. In
+    %% the other runs it is the default of 5,000,000 versions.
+    Window =
+        case Seed rem 2 of
+            1 -> 100000;
+            0 -> 5000000
+        end,
     %% The modules in dst/ are not part of the deadlift application, so
     %% `preload => [deadlift]' does not load them.
     {module, _} = code:ensure_loaded(deadlift_dst_client),
@@ -179,7 +191,7 @@ init(_Seed, Config) ->
     ok = eta_net:place(coordinators, [CState]),
     ok = eta_net:place(clients, []),
     true = ets:insert(Tab, [{{node, coordinators}, true}, {{node, clients}, true}]),
-    Storage = start_storage(Tab, CState, Mode, 0, 0),
+    Storage = start_storage(Tab, CState, {Mode, Window}, 0, 0),
     ok = eta_net:place(deadlift_dst_client:storage_node(0), [Storage]),
     {ok, #{
         tab => Tab,
@@ -189,6 +201,7 @@ init(_Seed, Config) ->
         %% StorageServer that runs.
         storage => Storage,
         mode => Mode,
+        window => Window,
         faults => maps:get(faults, Config, true),
         %% Every process that an operation started, oldest first.
         ops => [],
@@ -208,11 +221,13 @@ processes(#{registry := Registry, cstate := CState, storage := Storage, ops := O
 %% every epoch. The StorageServer runs on the node `storage_N'. After a
 %% kill, an operation process on that node calls this function, and the
 %% StorageServer starts on the node of that process.
-start_storage(Tab, CState, Mode, N, Generation) ->
+start_storage(Tab, CState, {Mode, Window}, N, Generation) ->
     {ok, Storage} = deadlift_storage:start(#{
         coordinators => {local, CState},
         poll_ms => 100,
-        rollback => Mode =/= no_rollback
+        mvcc_window => Window,
+        rollback => Mode =/= no_rollback,
+        check_window => Mode =/= no_window_check
     }),
     Node = deadlift_dst_client:storage_node(N),
     true = ets:insert(Tab, [{{node, Node}, true}, {{storage_started, N}, Storage}, {storage, Storage, Generation, Node}]),
@@ -314,7 +329,7 @@ execute({kill_resolver, R}, _N, S = #{tab := Tab}) ->
             true = ets:insert(Tab, {{killed_resolver, N}, true}),
             kill(deadlift_dst_client:resolver_node(N), kills_resolver, S)
     end;
-execute(kill_storage, N, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
+execute(kill_storage, N, S = #{tab := Tab, cstate := CState, mode := Mode, window := Window}) ->
     [{storage, Storage, Generation, Node}] = ets:lookup(Tab, storage),
     case is_process_alive(Storage) of
         true ->
@@ -326,7 +341,7 @@ execute(kill_storage, N, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
             S1 = kill(Node, kills_storage, S),
             %% An operation process starts the new StorageServer, because a
             %% process starts only in a step of the scheduler.
-            spawn_op(deadlift_dst_client:storage_node(N), fun() -> start_storage(Tab, CState, Mode, N, Generation + 1) end, S1);
+            spawn_op(deadlift_dst_client:storage_node(N), fun() -> start_storage(Tab, CState, {Mode, Window}, N, Generation + 1) end, S1);
         false ->
             %% The StorageServer after the last kill has not started.
             S
@@ -426,6 +441,8 @@ record_stats(Tab) ->
     bump(too_old, length(ets:match(Tab, {{rejected, '_'}, transaction_too_old}))),
     bump(no_read_version, length(ets:match(Tab, {{no_read_version, '_'}, '_'}))),
     bump(no_read, length(ets:match(Tab, {{no_read, '_'}, '_'}))),
+    %% The reads below the MVCC window of the StorageServer.
+    bump(read_too_old, length(ets:match(Tab, {{read_too_old, '_'}, '_'}))),
     %% The acknowledged transactions that have their LSN together with
     %% another acknowledged transaction.
     LSNs = [LSN || [LSN] <- ets:match(Tab, {{ack, '_'}, '_', '$1'})],

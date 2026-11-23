@@ -83,7 +83,7 @@ commits and recoveries, and no run violates an invariant.
       which is about 30% of the time of a run. The wait is not in the
       harness of deadlift. A change of eta needs the agreement of the
       owner of eta.
-- [ ] Keep only the versions of the MVCC window in the StorageServer.
+- [x] Keep only the versions of the MVCC window in the StorageServer.
 - [ ] Write a client: get a read version, read, commit, retry on conflict.
 - [ ] Check strict serializability of client histories with Elle.
 

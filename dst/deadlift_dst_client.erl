@@ -148,6 +148,10 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
                 {ok, Values, Generation} ->
                     true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation}}),
                     commit(Tab, C, Read, {Reads, Ranges}, Writes, Chosen, R);
+                {error, transaction_too_old} ->
+                    %% The read version is below the MVCC window of the
+                    %% StorageServer.
+                    true = ets:insert(Tab, {{read_too_old, C}, ReaderEpoch});
                 {error, _Reason} ->
                     true = ets:insert(Tab, {{no_read, C}, ReaderEpoch})
             end;

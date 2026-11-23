@@ -85,13 +85,39 @@
 %%   write.</li>
 %% </ul>
 %%
+%% == MVCC window ==
+%%
+%% The StorageServer keeps the versions of the MVCC window (paper, section
+%% 2.4.5; `mvcc_window', default: 5,000,000 versions, the versions of 5
+%% seconds). The StorageServer has an oldest version:
+%%
+%% <ul>
+%% <li>The oldest version rises to the lower one of two versions: the
+%%   version of the StorageServer minus the window, and the highest Known
+%%   Committed Version that a LogServer has sent with its records. No
+%%   recovery discards a record at or below a Known Committed Version, so
+%%   a rollback never needs a version that the StorageServer has
+%%   removed.</li>
+%% <li>For each key, the StorageServer keeps the versions above the oldest
+%%   version, and the last version at or below the oldest version.</li>
+%% <li>A read at a version below the oldest version returns
+%%   `{error, transaction_too_old}'.</li>
+%% <li>The oldest version rises in steps of at least one tenth of the
+%%   window, because a rise examines every key.</li>
+%% </ul>
+%%
+%% The first version of an epoch is more than the window above the last
+%% version of the previous epoch (see {@link deadlift_sequencer}). A read
+%% at a read version of the previous epoch is therefore too old when the
+%% StorageServer has applied a committed record of the new epoch.
+%%
 %% == Departures from the paper ==
 %%
 %% <ul>
-%% <li>The StorageServer keeps the data in memory, and keeps every version.
-%%   A StorageServer of FoundationDB keeps the versions of the MVCC window
-%%   in memory and writes older data to disk. This part is not in the
-%%   paper.</li>
+%% <li>The StorageServer keeps the data in memory, and loses the data
+%%   below the MVCC window. A StorageServer of FoundationDB keeps the
+%%   versions of the MVCC window in memory and writes older data to disk.
+%%   This part is not in the paper.</li>
 %% <li>One StorageServer has every key. FoundationDB divides the key space
 %%   into shards, and a StorageServer reads the records with its tags.</li>
 %% <li>The StorageServer reads the log systems from the coordinated state.
@@ -116,13 +142,19 @@
 
 -type version() :: deadlift_cstate:version().
 
+%% `mvcc_window' is a number of versions, or `infinity'.
+%%
 %% `rollback => false' plants a defect for the simulation: the
 %% StorageServer keeps the writes above the end version of an epoch.
+%% `check_window => false' plants a second defect: the StorageServer
+%% answers a read below the oldest version.
 -type options() :: #{
     coordinators := deadlift_cstate:servers(),
     poll_ms => pos_integer(),
     cstate_timeout_ms => timeout(),
-    rollback => boolean()
+    mvcc_window => pos_integer() | infinity,
+    rollback => boolean(),
+    check_window => boolean()
 }.
 
 -record(state, {
@@ -130,8 +162,14 @@
     poll_ms :: pos_integer(),
     cstate_timeout_ms :: timeout(),
     rollback :: boolean(),
+    window :: pos_integer() | infinity,
+    check_window :: boolean(),
     %% The LSN of the last record that the StorageServer has applied.
     version = 0 :: version(),
+    %% The oldest version that a read can have.
+    oldest = 0 :: version(),
+    %% The highest Known Committed Version that a LogServer has sent.
+    kcv = 0 :: version(),
     %% Key -> [{Version, Value}], the highest version first.
     data = #{} :: #{term() => [{version(), term()}]},
     %% The log systems of all epochs, from the last read of the coordinated
@@ -163,6 +201,7 @@
 
 -define(TIMEOUT_MS, 5000).
 -define(POLL_MS, 500).
+-define(MVCC_WINDOW, 5000000).
 -define(CSTATE_TIMEOUT_MS, 1000).
 %% The StorageServer sends every request again at each tenth interval.
 -define(RESEND_TICKS, 10).
@@ -191,8 +230,9 @@ read(Storage, Key, Version) ->
 
 %% @doc Reads the value of `Key' at the read version `Version'. The result
 %% is `not_found' if no record at or below `Version' wrote the key. The
-%% result is `{error, Reason}' if the StorageServer does not reach
-%% `Version' in time, or is not alive.
+%% result is `{error, transaction_too_old}' if `Version' is below the MVCC
+%% window. The result is `{error, Reason}' if the StorageServer does not
+%% reach `Version' in time, or is not alive.
 -spec read(gen_server:server_ref(), term(), version(), timeout()) ->
     {ok, term()} | not_found | {error, term()}.
 read(Storage, Key, Version, Timeout) ->
@@ -242,7 +282,7 @@ read_range_with_version(Storage, Begin, End, Version, Timeout) ->
     end.
 
 -spec info(gen_server:server_ref()) ->
-    #{version := version(), epoch := deadlift_cstate:epoch() | undefined, rollbacks := non_neg_integer()}.
+    #{version := version(), oldest := version(), epoch := deadlift_cstate:epoch() | undefined, rollbacks := non_neg_integer()}.
 info(Storage) ->
     gen_server:call(Storage, info).
 
@@ -257,6 +297,8 @@ init(Options = #{coordinators := Coordinators}) ->
         poll_ms = maps:get(poll_ms, Options, ?POLL_MS),
         cstate_timeout_ms = maps:get(cstate_timeout_ms, Options, ?CSTATE_TIMEOUT_MS),
         rollback = maps:get(rollback, Options, true),
+        window = maps:get(mvcc_window, Options, ?MVCC_WINDOW),
+        check_window = maps:get(check_window, Options, true),
         buffer = gb_trees:empty(),
         requests = gen_server:reqids_new()
     },
@@ -274,7 +316,7 @@ handle_call(info, _From, State = #state{version = Version, system = System, roll
             #{epoch := E} -> E;
             undefined -> undefined
         end,
-    {reply, #{version => Version, epoch => Epoch, rollbacks => Rollbacks}, State};
+    {reply, #{version => Version, oldest => State#state.oldest, epoch => Epoch, rollbacks => Rollbacks}, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State}.
 
@@ -299,8 +341,9 @@ handle_info(poll, State = #state{poll_ms = PollMs, system = System, stopped = St
     {noreply, State2#state{ticks = Ticks}};
 handle_info(Message, State = #state{requests = Requests}) ->
     case gen_server:check_response(Message, Requests, true) of
-        {{reply, {ok, Records, Stopped}}, Label, Requests1} ->
-            {noreply, received(Label, Records, Stopped, State#state{requests = Requests1})};
+        {{reply, {ok, Records, Stopped, KCV}}, Label, Requests1} ->
+            State1 = State#state{requests = Requests1, kcv = max(KCV, State#state.kcv)},
+            {noreply, advance_oldest(received(Label, Records, Stopped, State1))};
         {_ErrorOrOtherReply, _Label, Requests1} ->
             {noreply, State#state{requests = Requests1}};
         _NoRequestOrNoReply ->
@@ -475,11 +518,38 @@ write_entry(_NoTransaction, _LSN, Data) ->
     Data.
 
 %% ---------------------------------------------------------------------------
+%% MVCC window
+%% ---------------------------------------------------------------------------
+
+%% Raises the oldest version, and removes the versions that no read at or
+%% above the oldest version returns.
+advance_oldest(State = #state{window = infinity}) ->
+    State;
+advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, window = Window, data = Data}) ->
+    case min(Version - Window, KCV) of
+        New when New - Oldest >= max(1, Window div 10) ->
+            State#state{oldest = New, data = maps:map(fun(_Key, Versions) -> prune(Versions, New) end, Data)};
+        _ ->
+            State
+    end.
+
+%% The versions above `Oldest', and the last version at or below `Oldest'.
+%% The list has the highest version first.
+prune([Write = {Version, _Value} | Versions], Oldest) when Version > Oldest ->
+    [Write | prune(Versions, Oldest)];
+prune([Write | _Older], _Oldest) ->
+    [Write];
+prune([], _Oldest) ->
+    [].
+
+%% ---------------------------------------------------------------------------
 %% Reads
 %% ---------------------------------------------------------------------------
 
 %% Answers a read at `Version', or keeps the read until the StorageServer
 %% has the version.
+read_at(_Query, Version, _From, State = #state{oldest = Oldest, check_window = true}) when Version < Oldest ->
+    {reply, {error, transaction_too_old}, State};
 read_at(Query, Version, _From, State = #state{version = Mine}) when Version =< Mine ->
     {reply, lookup(Query, Version, State), State};
 read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
