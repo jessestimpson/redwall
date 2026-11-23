@@ -694,9 +694,18 @@ Recruitment:
    and registers with it. A worker has the class `log`, `stateless` or
    `unset`.
 2. The leader recruits when it has no epoch and at least `min_workers`
-   workers (default 1).
-3. The leader chooses a worker for each of the `logs` LogServers, and
-   prefers the class `log`. It chooses a worker for the process of the
+   workers (default 1). A cluster of several nodes sets `min_workers` to
+   2 or more. With the default, the leader recruits when the first
+   worker has registered, and every LogServer of the first epoch is on
+   that worker.
+3. With several workers, each LogServer of an epoch is on a worker of
+   its own: an epoch has `logs` LogServers, or one for each worker if
+   the leader has fewer workers, and `replication` is at most the number
+   of LogServers. Before 2026-11-23 the leader used a worker for two
+   LogServers when it had fewer workers than `logs`, and the stop of one
+   node could then end every LogServer with a record. With one worker,
+   every LogServer is on that worker. The leader prefers the class `log`
+   for a LogServer. It chooses a worker for the process of the
    epoch, and prefers the class `stateless`. Each attempt starts at a
    different worker.
 4. The leader starts the process of the epoch on its worker. The process

@@ -55,7 +55,13 @@
 %% == Recruitment ==
 %%
 %% The leader recruits when it has no epoch and at least `min_workers'
-%% workers (default 1):
+%% workers (default 1). With several workers, each LogServer of an epoch
+%% is on a worker of its own: an epoch has `logs' LogServers, or one for
+%% each worker if the leader has fewer workers, and `replication' is at
+%% most the number of LogServers. With one worker, every LogServer is on
+%% that worker. A cluster of several nodes sets `min_workers' to 2 or
+%% more, so that the first epoch does not have every LogServer on the
+%% first worker that registers.
 %%
 %% <ol>
 %% <li>The leader orders the workers by their nodes, and starts at a
@@ -466,8 +472,21 @@ forget_workers(State = #state{workers = Workers}) ->
 %% Recruitment
 %% ---------------------------------------------------------------------------
 
-maybe_recruit(State = #state{role = leader, generation = undefined, waiting = false, workers = Workers, options = Options, attempt = Attempt0}) ->
-    Logs = maps:get(logs, Options, 3),
+maybe_recruit(State = #state{role = leader, generation = undefined, waiting = false, workers = Workers, options = Options0, attempt = Attempt0}) ->
+    %% With several workers, each LogServer of an epoch is on a worker of
+    %% its own. With fewer workers than `logs', the epoch has one
+    %% LogServer for each worker, and `replication' is at most that
+    %% number. Two LogServers on one node stop together when the node
+    %% stops, so the two copies of a record could be lost with one node.
+    %% With one worker, every LogServer is on that worker: the stop of the
+    %% node ends the cluster in any case, and several LogServers let the
+    %% cluster continue after the stop of one LogServer process.
+    Logs =
+        case map_size(Workers) of
+            Count when Count > 1 -> min(maps:get(logs, Options0, 3), Count);
+            _ -> maps:get(logs, Options0, 3)
+        end,
+    Options = Options0#{logs => Logs, replication => min(maps:get(replication, Options0, 2), Logs)},
     case map_size(Workers) >= maps:get(min_workers, Options, 1) of
         true ->
             Attempt = Attempt0 + 1,

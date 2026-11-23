@@ -93,14 +93,13 @@ controller() ->
         {ok, _} = peer:call(Peer, deadlift_worker, start, [#{coordinators => Ids, class => log, poll_ms => 50}]),
         %% The candidate of the first node is the leader. It recruits
         %% with the workers of both nodes. The Sequencer and the Proxy
-        %% are on the first node. The leader uses each worker once before
-        %% it uses a worker again, so 2 LogServers are on the second
-        %% node and 1 is on the first node.
+        %% are on the first node. The leader has 2 workers, so the epoch
+        %% has 2 LogServers, each on a node of its own.
         ok = await(fun() -> epoch(deadlift_worker:db_info()) =:= 1 end, 300),
         ?assertMatch(#{role := leader, term := 1, workers := [_, _]}, deadlift_cluster_controller:info(A)),
         Info1 = #{proxies := [Proxy1]} = deadlift_worker:db_info(),
         ?assertEqual(node(), node(Proxy1)),
-        ?assertEqual(lists:sort([Node, Node, node()]), lists:sort([node(Pid) || Pid <- log_pids(Ids)])),
+        ?assertEqual(lists:sort([Node, node()]), lists:sort([node(Pid) || Pid <- log_pids(Ids)])),
         %% The worker of the second node has the same information.
         ok = await(fun() -> peer:call(Peer, deadlift_worker, db_info, []) =:= Info1 end, 100),
         {ok, Storage} = deadlift_storage:start(#{coordinators => Ids, poll_ms => 5}),
@@ -122,7 +121,7 @@ controller() ->
         exit(hd(log_pids(Ids)), kill),
         ok = await(fun() -> epoch(deadlift_worker:db_info()) =:= 3 end, 300),
         ?assertEqual({1, 2}, deadlift:transactional(Db, fun(Tx) -> {deadlift:get(Tx, a), deadlift:get(Tx, b)} end)),
-        %% The second node stops, with the leader and 2 LogServers. A
+        %% The second node stops, with the leader and a LogServer. A
         %% new candidate on the first node wins the election of term 3.
         %% It has one worker and needs two, so it does not recruit.
         {ok, C} = deadlift_cluster_controller:start(Options),
