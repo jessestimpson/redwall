@@ -131,6 +131,27 @@
 %% After 1021 the first attempt can be committed, so the function must
 %% give the same result when it runs twice.
 %%
+%% == Profiles ==
+%%
+%% A profile is a set of client options for one kind of StorageServer.
+%% `open/1' takes the profile in the option `profile', and `profile/1'
+%% returns its options. An option of `open/1' replaces the option of the
+%% profile.
+%%
+%% <ul>
+%% <li>`default': the values of FoundationDB. The first backoff after a
+%%   conflict is 10 ms and the highest backoff is 1,000 ms.</li>
+%% <li>`ets': for the StorageServer of deadlift, which keeps the data in
+%%   ETS tables in memory. A commit takes about 0.2 ms with this
+%%   StorageServer, so the first backoff is 1 ms and the highest backoff
+%%   is 100 ms. The values are from the benchmark of 2026-11-23 in
+%%   README.md.</li>
+%% </ul>
+%%
+%% A StorageServer with another store can need other values, and gets a
+%% profile of its own. A profile is not taken from FoundationDB. This part
+%% is not in the paper.
+%%
 %% == Limitations ==
 %%
 %% <ul>
@@ -155,13 +176,13 @@
 
 -include("deadlift_eta.hrl").
 
--export([open/1, create_transaction/1, transactional/2, snapshot/1]).
+-export([open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, set/3, clear/2, clear_range/3]).
 -export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
 -export([add_read_conflict_key/2, add_read_conflict_range/3, is_read_only/1]).
 
--export_type([database/0, transaction/0, snapshot/0, key/0, value/0]).
+-export_type([database/0, transaction/0, snapshot/0, key/0, value/0, profile/0]).
 
 -type key() :: term().
 -type value() :: term().
@@ -182,8 +203,11 @@
     storage := storage(),
     direct => boolean(),
     retry_delay_ms => number(),
-    max_retry_delay_ms => number()
+    max_retry_delay_ms => number(),
+    profile => profile()
 }.
+
+-type profile() :: default | ets.
 
 -type database() :: {deadlift_database, servers()}.
 -type transaction() :: {deadlift_transaction, ets:tid()}.
@@ -222,9 +246,21 @@
 %% FoundationDB. `max_retry_delay_ms' is the highest backoff. The default
 %% is 1,000. FoundationDB has the transaction option `max_retry_delay' for
 %% it. FoundationDB has no option for the first backoff.
+%%
+%% `profile' is `default' or `ets'. See "Profiles" in the module
+%% documentation. The default is `default'. Each option above replaces the
+%% option of the profile.
 -spec open(servers()) -> database().
 open(Servers = #{proxy := _, storage := _}) ->
-    {deadlift_database, maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms], Servers)}.
+    Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms], Servers),
+    {deadlift_database, maps:merge(profile(maps:get(profile, Servers, default)), Options)}.
+
+%% @doc Returns the client options of a profile.
+-spec profile(profile()) -> #{direct := boolean(), retry_delay_ms := number(), max_retry_delay_ms := number()}.
+profile(default) ->
+    #{direct => true, retry_delay_ms => ?BACKOFF_MS, max_retry_delay_ms => ?MAX_BACKOFF_MS};
+profile(ets) ->
+    #{direct => true, retry_delay_ms => 1, max_retry_delay_ms => 100}.
 
 -spec create_transaction(database()) -> transaction().
 create_transaction({deadlift_database, Servers}) ->

@@ -303,6 +303,15 @@ end).
   first backoff and the highest backoff. FoundationDB has the
   transaction option `max_retry_delay` for the highest backoff, and no
   option for the first one.
+- A profile is a set of client options for one kind of StorageServer.
+  `deadlift:open/1` takes the option `profile`, and an option of
+  `open/1` replaces the option of the profile. A StorageServer with
+  another store gets a profile of its own.
+
+  | Profile | For | `retry_delay_ms` | `max_retry_delay_ms` | `direct` |
+  |---|---|---|---|---|
+  | `default` | The values of FoundationDB | 10 | 1,000 | `true` |
+  | `ets` | The StorageServer of deadlift, with the data in ETS tables in memory | 1 | 100 | `true` |
   `transactional/2` then runs the function again.
 
 ### The Proxy
@@ -1077,6 +1086,21 @@ The StorageServer of deadlift has the third layout since this benchmark.
 After the change, the attempts that fail and the wait of the client
 after a conflict set the results: with 256 clients and no wait, a
 transaction has 2.3 attempts.
+
+The two profiles of the client, in one run of `conflicts/1`:
+
+| Profile | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
+|---|---|---|---|---|---|---|
+| `default` | 16 | 13,942 | 676 | 10,896 | 25,996 | 1.07 |
+| `default` | 64 | 22,870 | 1,183 | 24,796 | 57,696 | 1.21 |
+| `default` | 256 | 24,346 | 2,973 | 104,096 | 441,096 | 1.56 |
+| `ets` | 16 | 17,316 | 767 | 3,450 | 6,096 | 1.10 |
+| `ets` | 64 | 26,001 | 1,705 | 10,896 | 24,696 | 1.35 |
+| `ets` | 256 | 21,001 | 7,396 | 76,796 | 266,096 | 2.04 |
+
+With 256 clients on 100 keys, the profile `ets` has fewer operations per
+second than `default`, because more attempts fail. The other rows of the
+benchmark use the profile `default`.
 
 Limitations of the benchmark:
 

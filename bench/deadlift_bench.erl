@@ -146,7 +146,8 @@ depth(Options) ->
     ).
 
 %% @doc Measures `conflict' for several values of the option
-%% `retry_delay_ms' of the client, with 16 and 64 clients.
+%% `retry_delay_ms' of the client, with 16, 64 and 256 clients. An element
+%% `{profile, Profile}' of `delays' selects a profile of the client.
 conflicts(Options) ->
     Ms = round(1000 * maps:get(seconds, Options, 3)),
     Cluster = #{storage := Storage} = start_cluster(#{}),
@@ -154,7 +155,11 @@ conflicts(Options) ->
         #{proxies := [Proxy]} = db_info(Cluster),
         lists:foreach(
             fun(Delay) ->
-                Db = deadlift:open(#{proxy => Proxy, storage => Storage, direct => false, retry_delay_ms => Delay}),
+                Db =
+                    case Delay of
+                        {profile, Profile} -> deadlift:open(#{proxy => Proxy, storage => Storage, direct => false, profile => Profile});
+                        _ -> deadlift:open(#{proxy => Proxy, storage => Storage, direct => false, retry_delay_ms => Delay})
+                    end,
                 io:format("~n`retry_delay_ms` ~p:~n~n", [Delay]),
                 Errors = counters:new(6, [write_concurrency]),
                 ok = persistent_term:put({?MODULE, errors}, Errors),

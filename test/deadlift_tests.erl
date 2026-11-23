@@ -355,3 +355,21 @@ retry_delay_test() ->
     %% 10 ms to 320 ms, and the client waits for a random part of each.
     Default = Elapsed(#{}, 6),
     ?assert(Default > 20, Default).
+
+%% A profile is a set of client options. `open/1' takes the options of the
+%% profile, and an option of `open/1' replaces the option of the profile.
+profile_test() ->
+    ?assertEqual(#{direct => true, retry_delay_ms => 10, max_retry_delay_ms => 1000}, deadlift:profile(default)),
+    ?assertEqual(#{direct => true, retry_delay_ms => 1, max_retry_delay_ms => 100}, deadlift:profile(ets)),
+    Servers = #{proxy => self(), storage => self()},
+    ?assertEqual({deadlift_database, maps:merge(deadlift:profile(default), Servers)}, deadlift:open(Servers)),
+    ?assertEqual({deadlift_database, maps:merge(deadlift:profile(ets), Servers)}, deadlift:open(Servers#{profile => ets})),
+    {deadlift_database, Options} = deadlift:open(Servers#{profile => ets, retry_delay_ms => 3, direct => false}),
+    ?assertEqual(#{proxy => self(), storage => self(), direct => false, retry_delay_ms => 3, max_retry_delay_ms => 100}, Options),
+    ?assertError(function_clause, deadlift:open(Servers#{profile => unknown})),
+    %% With the profile `ets', 30 errors wait for at most 100 ms each, and
+    %% for a random part of it.
+    Tx = deadlift:create_transaction(deadlift:open(Servers#{profile => ets})),
+    Start = erlang:monotonic_time(millisecond),
+    [ok = deadlift:on_error(Tx, 1020) || _ <- lists:seq(1, 30)],
+    ?assert(erlang:monotonic_time(millisecond) - Start < 3100).

@@ -79,9 +79,11 @@ commits and recoveries, and no run violates an invariant.
 - [x] Keep the newest version of a key in the row of the key, and the
       older versions in a second table of the StorageServer, chosen from
       a benchmark of three layouts in the README.
-- [ ] Decide the default of the client option `retry_delay_ms` (10 ms
-      today, as in FoundationDB). A commit takes 0.2 ms, so the first
-      wait after a conflict is 50 times a commit.
+- [x] Add the client profile `ets` for the StorageServer with ETS
+      tables, with a first backoff of 1 ms and a highest backoff of
+      100 ms. The profile `default` has the values of FoundationDB.
+- [ ] Add a client profile for each further store of the StorageServer,
+      and choose its values from a benchmark.
 - [ ] Decide the defaults of `retry_ms` (500 ms today, 35 ms in
       FoundationDB) and of the placement of the Sequencer, the Resolver
       and the Proxy (`spread` today) from the benchmark.
