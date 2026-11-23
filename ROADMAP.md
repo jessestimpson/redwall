@@ -125,6 +125,12 @@ has the basic functions. The remaining parts, in the planned order:
       timeout error of the transaction. The design is open.
 - [ ] Find the Proxy and the StorageServer from the coordinators in
       `open`.
+- [ ] Client options for the read version, not planned soon:
+  - [ ] A cache of the read version in the client, as `USE_GRV_CACHE` of
+        FoundationDB. A read can then miss a commit that was
+        acknowledged in the time of the cache.
+  - [ ] A read version without the confirmation of the LogServers, as
+        `CAUSAL_READ_RISKY` of FoundationDB.
 - [ ] Run the test suite of erlfdb against deadlift.
 
 ### Milestone 3: Scale and operations

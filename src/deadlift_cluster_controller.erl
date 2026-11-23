@@ -190,6 +190,8 @@
     job :: reference() | undefined,
     workers = #{} :: #{pid() => {node(), deadlift_worker:class(), reference()}},
     attempt = 0 :: non_neg_integer(),
+    %% Whether the leader waits for `retry_ms' after a failure.
+    waiting = false :: boolean(),
     generation :: #generation{} | undefined,
     db_info :: deadlift_worker:db_info() | undefined
 }).
@@ -260,7 +262,7 @@ handle_cast({register, Worker, #{node := Node, class := Class}, Term}, State = #
     ok = gen_server:cast(Worker, {db_info, Info}),
     {noreply, maybe_recruit(State#state{workers = Workers1})};
 handle_cast(force_recovery, State = #state{role = leader}) ->
-    {noreply, maybe_recruit(abandon(State))};
+    {noreply, maybe_recruit(abandon(State#state{waiting = false}))};
 handle_cast(_Message, State) ->
     {noreply, State}.
 
@@ -269,7 +271,7 @@ handle_info(poll, State = #state{options = Options}) ->
     _ = erlang:send_after(maps:get(poll_ms, Options, 1000), self(), poll),
     {noreply, poll(State)};
 handle_info(recruit, State) ->
-    {noreply, maybe_recruit(State)};
+    {noreply, maybe_recruit(State#state{waiting = false})};
 handle_info({recruited, Attempt, Role, Pid}, State = #state{role = leader, generation = Generation = #generation{attempt = Attempt, roles = Roles}}) ->
     Generation1 = Generation#generation{roles = Roles#{erlang:monitor(process, Pid) => {Role, Pid}}},
     Generation2 =
@@ -380,7 +382,7 @@ read(Result, State = #state{options = Options, role = Role, term = Term, known =
 %% abandoned.
 superseded(Count, State = #state{generation = #generation{recovered = true}, db_info = #{epoch := Epoch}}) when is_integer(Epoch), Count > Epoch ->
     ok = notify({superseded, Epoch, Count}, State),
-    maybe_recruit(abandon(State));
+    maybe_recruit(abandon(State#state{waiting = false}));
 superseded(_Count, State) ->
     State.
 
@@ -443,7 +445,7 @@ forget_workers(State = #state{workers = Workers}) ->
 %% Recruitment
 %% ---------------------------------------------------------------------------
 
-maybe_recruit(State = #state{role = leader, generation = undefined, workers = Workers, options = Options, attempt = Attempt0}) ->
+maybe_recruit(State = #state{role = leader, generation = undefined, waiting = false, workers = Workers, options = Options, attempt = Attempt0}) ->
     Logs = maps:get(logs, Options, 3),
     case map_size(Workers) >= maps:get(min_workers, Options, 1) of
         true ->
@@ -560,9 +562,13 @@ abandon(State = #state{generation = Generation, db_info = Info}) ->
             State1
     end.
 
+%% Recruits again after `retry_ms'. A registration of a worker in that
+%% time does not start an attempt.
+retry(State = #state{waiting = true}) ->
+    State;
 retry(State = #state{options = Options}) ->
     _ = erlang:send_after(maps:get(retry_ms, Options, 500), self(), recruit),
-    State.
+    State#state{waiting = true}.
 
 %% Sends the information about the database to every registered worker.
 broadcast(State = #state{workers = Workers, db_info = Info}) ->

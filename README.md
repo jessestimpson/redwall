@@ -696,9 +696,9 @@ Results of `make dst` on 2026-11-22:
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
 | No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 5,540 acknowledged transactions, of which 1,474 with a read range, 679 with a clear of keys and 784 in a batch with another acknowledged transaction, 3,227 rejected for a conflict, 455 too old, 9,436 transactions with reads, of which 3,783 with direct reads on the node of a StorageServer and 1,888 by message only, 0 reads below the MVCC window of the StorageServer, 1,127 recoveries, 344 failed recoveries |
 | Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 1,067 acknowledged transactions, of which 227 with a read range, 134 with a clear of keys and 205 in a batch with another acknowledged transaction, 1,623 rejected for a conflict, 742 too old, 6,882 transactions with reads, of which 1,067 after the start of a new StorageServer, 217 while one of several StorageServers was not alive, 2,741 with direct reads on the node of a StorageServer and 1,362 by message only, 42 reads below the MVCC window of the StorageServer, 245 rollbacks of StorageServers, 2,300 recoveries, 2,838 failed recoveries, 1,560 kills, of which 203 of a StorageServer, 272 partitions |
-| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,461 acknowledged transactions, 270 recoveries, 2 failed recoveries, 50 elections |
-| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 459 acknowledged transactions, 1,006 recoveries, 140 failed recoveries, 476 kills of a worker node, of which 245 with a ClusterController process, 289 elections, 219 recoveries after the failure of a role, 86 rollbacks of StorageServers, 118 partitions |
-| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 28 runs with two leaders at the same time, 222 elections, 3 epochs that the leader found superseded, 249 acknowledged transactions, 523 recoveries, 237 kills of a worker node, 41 cuts |
+| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,462 acknowledged transactions, 270 recoveries, 2 failed recoveries, 50 elections |
+| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 483 acknowledged transactions, 997 recoveries, 133 failed recoveries, 462 kills of a worker node, of which 232 with a ClusterController process, 286 elections, 210 recoveries after the failure of a role, 98 rollbacks of StorageServers, 122 partitions |
+| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 30 runs with two leaders at the same time, 219 elections, 2 epochs that the leader found superseded, 262 acknowledged transactions, 528 recoveries, 229 kills of a worker node, 46 cuts |
 | Planted defect: the coordinated state accepts the proposal of a candidate for the ClusterController with any term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 2, `one_leader`: two processes are the leader of term 1 |
 | Planted defect: a ClusterController does not recruit after the failure of a role | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 2, `epoch`: the run ends with an epoch whose Sequencer or Proxy does not run |
 | Planted defect: a ClusterController stays the leader when the coordinated state has another term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 7, `stale_leader`: the run ends with the leaders of term 1 and term 2 |
@@ -739,6 +739,104 @@ A run has about 5,000 steps and takes about 0.65 s in a node alone. About
 30% of that time, the node uses no processor. The invariant checks of the
 harness take less than 1% of the time.
 
+## Benchmark
+
+`make bench` runs [bench/deadlift_bench.erl](bench/deadlift_bench.erl). The
+benchmark is not a test. It has no limits and does not check the results
+of the transactions.
+
+The cluster of the benchmark:
+
+- 3 Erlang nodes with a worker of the class `log`, for the LogServers;
+- 3 Erlang nodes with a worker of the class `stateless`, for the
+  Sequencer, the Resolver and the Proxy. 2 of them have a candidate for
+  the ClusterController;
+- 1 Erlang node with a StorageServer;
+- the node of the benchmark, with the peace cluster of 3 servers and the
+  clients.
+
+Each of the 7 nodes has 2 scheduler threads. Every role has its default
+options. A client is one process that runs one operation after another.
+A value has 100 bytes.
+
+| Operation | Description |
+|---|---|
+| `write` | A transaction that sets one key, without a read |
+| `read_write` | A transaction that reads one key by message and sets one key, with 1,000,000 keys |
+| `conflict` | `read_write` with 100 keys |
+| `read_version` | One read version from the Proxy |
+| `read_by_message` | The read of one key at a read version that the client has, from the node of the benchmark |
+| `read_direct` | The same read by a client on the node of the StorageServer, from the ETS table |
+
+Results of one run on 2026-11-23, with Erlang/OTP 28 and 3 seconds for
+each row. The machine has 4 performance cores and 6 efficiency cores.
+
+| Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
+|---|---|---|---|---|---|---|
+| `write` | 1 | 492 | 2002 | 2862 | 4334 | 1.00 |
+| `write` | 4 | 1389 | 2909 | 4869 | 12250 | 1.00 |
+| `write` | 16 | 4333 | 3781 | 5237 | 5744 | 1.00 |
+| `write` | 64 | 11136 | 5606 | 8343 | 9924 | 1.00 |
+| `write` | 256 | 10193 | 24948 | 29403 | 30591 | 1.00 |
+| `read_write` | 1 | 185 | 5138 | 8848 | 10523 | 1.00 |
+| `read_write` | 4 | 1112 | 3542 | 5388 | 20198 | 1.00 |
+| `read_write` | 16 | 3507 | 4669 | 5662 | 9350 | 1.00 |
+| `read_write` | 64 | 8380 | 7422 | 13273 | 16351 | 1.00 |
+| `read_write` | 256 | 7122 | 36335 | 50349 | 53173 | 1.00 |
+| `conflict` | 64 | 2375 | 6043 | 221131 | 444345 | 1.33 |
+| `read_version` | 1 | 12894 | 78 | 101 | 123 | 1.00 |
+| `read_version` | 4 | 30537 | 129 | 178 | 359 | 1.00 |
+| `read_version` | 16 | 41107 | 382 | 595 | 784 | 1.00 |
+| `read_version` | 64 | 49116 | 1289 | 1936 | 2340 | 1.00 |
+| `read_version` | 256 | 50408 | 5050 | 6623 | 8233 | 1.00 |
+| `read_by_message` | 1 | 38547 | 26 | 35 | 81 | 1.00 |
+| `read_by_message` | 16 | 173370 | 88 | 158 | 212 | 1.00 |
+| `read_by_message` | 64 | 179280 | 360 | 562 | 645 | 1.00 |
+| `read_direct` | 1 | 617647 | 2 | 2 | 16 | 1.00 |
+| `read_direct` | 2 | 1168685 | 2 | 3 | 17 | 1.00 |
+| `read_direct` | 16 | 1076327 | 2 | 788 | 1093 | 1.00 |
+
+The benchmark then kills one process while 8 clients write, and measures
+the longest time without an acknowledged commit. The first column of
+times is for the default options of the ClusterController (`retry_ms`
+500). The second column is for `retry_ms` 35, which is
+`ATTEMPT_RECRUITMENT_DELAY` of FoundationDB.
+
+| Killed process | Time without a commit, `retry_ms` 500 (ms) | Time without a commit, `retry_ms` 35 (ms) |
+|---|---|---|
+| A LogServer | 639 | 50 |
+| The Resolver | 560 | 56 |
+| The Proxy | 576 | 53 |
+| The Sequencer | 540 | 50 |
+| The ClusterController | 15 | 12 |
+
+Observations:
+
+- A `write` of one client takes 2 ms. The Proxy collects the commits of
+  1 ms into a batch (`batch_ms`).
+- The commits reach about 11,000 per second with 64 clients, and 256
+  clients add none.
+- A `read_write` of one client takes 5 ms. The read waits until the
+  StorageServer has applied the record of the read version, and the
+  StorageServer asks the LogServers at an interval.
+- A read from the ETS table takes 2 us, and a read by message takes
+  26 us.
+- After the kill of a role, the time without a commit is `retry_ms` plus
+  about 50 ms.
+- After the kill of the ClusterController, the old epoch accepts commits
+  until the Sequencer of the new ClusterController stops its LogServers.
+
+Limitations of the benchmark:
+
+- All nodes share the processors of one computer, and a message between
+  two nodes has no network delay.
+- Every LogServer and the StorageServer keep their data in memory.
+- The results are from one run. In an earlier run of 1 second for each
+  row, `write` with 64 clients had 21,154 operations per second.
+- The clients run on the node of the benchmark, so the rows with many
+  clients measure that node too.
+- A kill stops one process. The node of the process continues.
+
 ## Commands
 
 ```
@@ -746,6 +844,7 @@ make compile    # compile
 make test       # unit tests
 make dst        # deterministic simulation with eta, in several nodes
 make dst-serial # the same tests in one node
+make bench      # the benchmark of a cluster of 8 Erlang nodes
 make tlc        # the quick TLC configs
 make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 ```
@@ -779,6 +878,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [dst/deadlift_dst.erl](dst/deadlift_dst.erl) | The eta harness: the workload and the invariants |
 | [dst/deadlift_dst_client.erl](dst/deadlift_dst_client.erl) | The processes that perform the operations of the simulation |
 | [dst/deadlift_dst_tests.erl](dst/deadlift_dst_tests.erl) | The simulation suite |
+| [bench/deadlift_bench.erl](bench/deadlift_bench.erl), [bench/run.sh](bench/run.sh) | The benchmark of a cluster on one computer |
 | [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
 | [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which starts the registry |
 | [test/deadlift_cstate_tests.erl](test/deadlift_cstate_tests.erl) | Tests for `deadlift_cstate` |

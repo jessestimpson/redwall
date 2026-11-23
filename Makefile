@@ -1,4 +1,4 @@
-.PHONY: all compile test dst dst-serial tlc tlc-long
+.PHONY: all compile test dst dst-serial bench tlc tlc-long
 
 all: compile
 
@@ -19,6 +19,11 @@ dst:
 
 dst-serial:
 	ERL_FLAGS="+S 1" rebar3 as dst eunit
+
+# The benchmark of a cluster of 8 Erlang nodes on this computer. See
+# bench/deadlift_bench.erl.
+bench:
+	bench/run.sh
 
 # Model checking with TLC. This target needs Java. formal/README.md states
 # which configs a change needs: `formal/check_all.sh resolver' takes about

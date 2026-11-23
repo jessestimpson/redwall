@@ -275,6 +275,24 @@ superseded_test_() ->
         end)
     end}.
 
+%% After the failure of a role, the leader waits for `retry_ms'. The
+%% registration of a worker in that time does not start an attempt.
+retry_delay_test_() ->
+    {timeout, 60, fun() ->
+        with_controller(#{retry_ms => 400}, fun(Controller, _CState) ->
+            _ = fake(Controller, w1, unset),
+            {recovered, #{epoch := 1, proxy := Proxy}} = next(recovered),
+            exit(Proxy, kill),
+            {role_failed, proxy, Proxy} = next(role_failed),
+            _ = fake(Controller, w2, unset),
+            ok = await(fun() -> length(maps:get(workers, deadlift_cluster_controller:info(Controller))) =:= 2 end, 20),
+            timer:sleep(100),
+            ?assertEqual(none, peek(recruiting)),
+            {recruiting, 2, _} = next(recruiting),
+            {recovered, #{epoch := 2}} = next(recovered)
+        end)
+    end}.
+
 %% With the planted defect `monitor_roles => false', the leader does not
 %% recruit after the failure of a role.
 no_monitor_roles_test_() ->

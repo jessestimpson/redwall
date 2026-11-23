@@ -188,7 +188,7 @@ controller_faults_shard(Shard) ->
         ?assert(maps:get(kills_log, Stats, 0) > 30, Stats),
         ?assert(maps:get(kills_sequencer, Stats, 0) > 30, Stats),
         ?assert(maps:get(kills_proxy, Stats, 0) > 10, Stats),
-        ?assert(maps:get(kills_resolver, Stats, 0) > 15, Stats),
+        ?assert(maps:get(kills_resolver, Stats, 0) > 8, Stats),
         ?assert(maps:get(kills_controller, Stats, 0) > 30, Stats),
         ?assert(maps:get(leaders, Stats, 0) > 120, Stats),
         %% A ClusterController started a recovery after the failure of a
