@@ -108,6 +108,27 @@
 %%   leave the MVCC window.</li>
 %% </ul>
 %%
+%% == Direct reads ==
+%%
+%% A client can read the table of the data in its own process, without a
+%% message to the StorageServer (`handle/1' and `read_direct/3'). The
+%% StorageServer publishes its version and its oldest version in an
+%% `atomics' array for this purpose:
+%%
+%% <ul>
+%% <li>The StorageServer writes the rows of a record before it publishes
+%%   the version of the record. A client that finds the published version
+%%   at or above its read version finds every row at or below the read
+%%   version.</li>
+%% <li>The StorageServer publishes a new oldest version before it removes
+%%   the versions below it. A client reads the published oldest version
+%%   after it has read its rows. If its read version is below that oldest
+%%   version, the read is too old, and the client discards the rows.</li>
+%% <li>A read at a read version returns only versions at or below the read
+%%   version, so a record that the StorageServer applies during the read
+%%   does not change the result.</li>
+%% </ul>
+%%
 %% A benchmark compared this layout with `gb_trees', with an ETS table with
 %% one row for each version, and with a NIF. The benchmark is not part of
 %% this repository. See "The store of the StorageServer" in README.md.
@@ -161,6 +182,8 @@
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
+-export([handle/1, read_direct/3]).
+-export_type([handle/0, query/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([options/0]).
@@ -184,6 +207,13 @@
     clear => boolean()
 }.
 
+%% The table of the data and the published versions of a StorageServer.
+%% Element 1 of `published' is the version, and element 2 is the oldest
+%% version.
+-type handle() :: #{data := ets:tid(), published := atomics:atomics_ref()}.
+
+-type query() :: {key, term()} | {range, term(), term()}.
+
 -record(state, {
     coordinators :: deadlift_cstate:servers(),
     poll_ms :: pos_integer(),
@@ -204,6 +234,8 @@
     %% The ETS table with a row `{{Version, Key}}' for each version above
     %% the oldest version.
     changes :: ets:tid(),
+    %% The version and the oldest version for direct reads.
+    published :: atomics:atomics_ref(),
     %% The log systems of all epochs, from the last read of the coordinated
     %% state, in the order of the epochs.
     systems = [] :: [map()],
@@ -313,6 +345,44 @@ read_range_with_version(Storage, Begin, End, Version, Timeout) ->
         exit:Reason -> {error, Reason}
     end.
 
+%% @doc Returns the handle for direct reads, or an error if the
+%% StorageServer does not answer.
+-spec handle(gen_server:server_ref()) -> {ok, handle()} | {error, term()}.
+handle(Storage) ->
+    try gen_server:call(Storage, handle, ?TIMEOUT_MS) of
+        Handle -> {ok, Handle}
+    catch
+        exit:Reason -> {error, Reason}
+    end.
+
+%% @doc Reads at the read version `Version' in the calling process. See
+%% "Direct reads" in the module documentation. The results are:
+%%
+%% <ul>
+%% <li>`{ok, Result}': `Result' is the result of `read_with_version/4' for
+%%   a key, or of `read_range_with_version/5' for a range.</li>
+%% <li>`behind': the StorageServer has not applied the record `Version'.
+%%   `read_with_version/4' waits for the record.</li>
+%% <li>`too_old': `Version' is below the oldest version.</li>
+%% <li>`gone': the table does not exist. The StorageServer has stopped.</li>
+%% </ul>
+-spec read_direct(handle(), query(), version()) -> {ok, term()} | behind | too_old | gone.
+read_direct(#{data := Data, published := Published}, Query, Version) ->
+    case atomics:get(Published, 1) >= Version of
+        false ->
+            behind;
+        true ->
+            try lookup(Query, Version, Data) of
+                Result ->
+                    case Version < atomics:get(Published, 2) of
+                        true -> too_old;
+                        false -> {ok, Result}
+                    end
+            catch
+                error:badarg -> gone
+            end
+    end.
+
 -spec info(gen_server:server_ref()) ->
     #{
         version := version(),
@@ -343,6 +413,7 @@ init(Options = #{coordinators := Coordinators}) ->
         data = ets:new(deadlift_storage_data, [ordered_set, protected, {read_concurrency, true}]),
         changes = ets:new(deadlift_storage_changes, [ordered_set, private]),
         buffer = gb_trees:empty(),
+        published = atomics:new(2, [{signed, true}]),
         requests = gen_server:reqids_new()
     },
     self() ! poll,
@@ -353,6 +424,8 @@ handle_call({read, Key, Version}, From, State) ->
     read_at({key, Key}, Version, From, State);
 handle_call({read_range, Begin, End, Version}, From, State) ->
     read_at({range, Begin, End}, Version, From, State);
+handle_call(handle, _From, State = #state{data = Data, published = Published}) ->
+    {reply, #{data => Data, published => Published}, State};
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
     Epoch =
         case System of
@@ -442,6 +515,7 @@ rollback(End, State = #state{rollback = false}) ->
     %% The planted defect `rollback => false'.
     State#state{version = End, buffer = gb_trees:empty()};
 rollback(End, State = #state{data = Data, changes = Changes, rollbacks = Rollbacks}) ->
+    ok = atomics:put(State#state.published, 1, End),
     ok = remove_above(End, ets:last(Changes), Data, Changes),
     State#state{version = End, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1}.
 
@@ -538,6 +612,8 @@ apply_records(State = #state{version = Version, buffer = Buffer}) ->
                     apply_records(State#state{buffer = gb_trees:delete(LSN, Buffer)});
                 {LSN, {Version, {body, Body}}} ->
                     ok = write(without_clears(Body, State), LSN, State),
+                    %% The rows are written before the version is published.
+                    ok = atomics:put(State#state.published, 1, LSN),
                     State1 = State#state{version = LSN, buffer = gb_trees:delete(LSN, Buffer)},
                     apply_records(State1);
                 _BodyNotReceivedOrPreviousRecordNotReceived ->
@@ -628,6 +704,10 @@ advance_oldest(State = #state{window = infinity}) ->
 advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, window = Window}) ->
     case min(Version - Window, KCV) of
         New when New > Oldest ->
+            %% The oldest version is published before the versions below
+            %% it are removed. With the planted defect
+            %% `check_window => false' it is not published.
+            _ = State#state.check_window andalso atomics:put(State#state.published, 2, New),
             ok = remove_old(New, ets:first(State#state.changes), State),
             State#state{oldest = New};
         _ ->
@@ -678,21 +758,21 @@ prune([], _Oldest) ->
 read_at(_Query, Version, _From, State = #state{oldest = Oldest, check_window = true}) when Version < Oldest ->
     {reply, {error, transaction_too_old}, State};
 read_at(Query, Version, _From, State = #state{version = Mine}) when Version =< Mine ->
-    {reply, lookup(Query, Version, State), State};
+    {reply, lookup(Query, Version, State#state.data), State};
 read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
     {noreply, State#state{waiting = [{From, Query, Version} | Waiting]}}.
 
 answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
     {Ready, Later} = lists:partition(fun({_From, _Query, V}) -> V =< Version end, Waiting),
-    lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, State)) end, Ready),
+    lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, State#state.data)) end, Ready),
     State#state{waiting = Later}.
 
-lookup({key, Key}, Version, #state{data = Data}) ->
+lookup({key, Key}, Version, Data) ->
     case ets:lookup(Data, Key) of
         [{Key, Versions}] -> visible(Versions, Version);
         [] -> not_found
     end;
-lookup({range, Begin, End}, Version, #state{data = Data}) ->
+lookup({range, Begin, End}, Version, Data) ->
     {ok, [
         {Key, Value, Written}
      || {Key, Versions} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Versions, Version)]

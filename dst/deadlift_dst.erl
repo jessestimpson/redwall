@@ -379,7 +379,7 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> durable(Acks, CState) end,
         fun() -> body_available(Acks, Logs) end,
         fun() -> copied(Tab, Acks, CState, Logs) end,
-        fun() -> transactions(Tab, Acks) end,
+        fun() -> transactions(Tab, Acks, Logs) end,
         fun() -> storage_rollback(Tab, Storage, CState) end,
         fun() -> kcv_below_dv(Logs) end,
         fun() -> chain(Logs) end
@@ -587,7 +587,7 @@ match_client(_Mutation, _C) -> false.
 %% read version with every acknowledged transaction. The harness checks
 %% them only when the number of acknowledged transactions or the number of
 %% read versions has changed.
-transactions(Tab, Acks) ->
+transactions(Tab, Acks, Logs) ->
     Reads = [Read#{client => C} || [C, Read] <- ets:match(Tab, {{read, '$1'}, '$2'})],
     Rejected = [C || [C] <- ets:match(Tab, {{rejected, '$1'}, '_'})],
     Count = {length(Acks), length(Reads), length([x || #{values := _} <- Reads]), length(Rejected)},
@@ -599,7 +599,7 @@ transactions(Tab, Acks) ->
                 Txn#{client => C, epoch => Epoch, version => LSN}
              || {C, Epoch, LSN} <- Acks, [{_, Txn}] <- [ets:lookup(Tab, {txn, C})]
             ],
-            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns, open_clears(Tab, Acks, Rejected)) end]) of
+            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns, open_clears(Tab, Acks, Rejected), written(Logs)) end]) of
                 ok ->
                     true = ets:insert(Tab, {transactions_checked, Count}),
                     ok;
@@ -656,12 +656,28 @@ open_clears(Tab, Acks, Rejected) ->
     Done = [C || {C, _Epoch, _LSN} <- Acks] ++ Rejected,
     lists:usort(lists:append([Clears || [C, Clears] <- ets:match(Tab, {{attempt, '$1'}, '$2'}), not lists:member(C, Done)])).
 
-%% `Reads' have the values that the clients read from the StorageServer:
-%% `{Key, not_found}' or `{Key, {Value, Written}}', where `Written' is the
-%% LSN of the record that wrote the value. The value of a write is
-%% `{client, C}'. `OpenClears' are the keys of `open_clears/3'.
-read_value(Reads, Txns, OpenClears) ->
-    ByClient = maps:from_list([{C, T} || T = #{client := C} <- Txns]),
+%% The LSN of the record of each client, from the records of the
+%% LogServers that run. A client commits one transaction, and every write
+%% of the transaction has the value `{client, C}'.
+written(Logs) ->
+    maps:from_list([
+        {C, LSN}
+     || {_Id, #{records := Records}} <- Logs,
+        {LSN, {_Prev, {body, {batch, Entries}}}} <- gb_trees:to_list(Records),
+        Entry <- Entries,
+        is_list(Entry),
+        {set, _Key, {client, C}} <- Entry
+    ]).
+
+%% `Reads' have the values that the clients read through the client
+%% library: `{Key, not_found}' or `{Key, {Value, unknown}}'. The value of a
+%% write is `{client, C}'. The LSN of the record that wrote the value is
+%% the commit version of the client `C' if `C' received an
+%% acknowledgement, and else the LSN of `Written'. `OpenClears' are the
+%% keys of `open_clears/3'.
+read_value(Reads, Txns, OpenClears, Written) ->
+    ByClient0 = maps:from_list([{C, T} || T = #{client := C} <- Txns]),
+    ByClient = {ByClient0, Written},
     Wrong = [
         {R, Key, Found, Reason}
      || R = #{read_version := ReadVersion, values := Values} <- Reads,
@@ -692,6 +708,15 @@ wrong_value(Key, not_found, ReadVersion, _ByClient, Txns, OpenClears) ->
         Changers ->
             {_Order, Last = #{clears := Clears}} = lists:last(Changers),
             [{missed, maps:with([client, epoch, version], Last)} || not lists:member(Key, Clears), not lists:member(Key, OpenClears)]
+    end;
+wrong_value(Key, {{client, Writer}, unknown}, ReadVersion, {ByClient, Logged}, Txns, OpenClears) ->
+    case {ByClient, Logged} of
+        {#{Writer := #{version := Written}}, _} ->
+            wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns, OpenClears);
+        {_, #{Writer := Written}} ->
+            wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns, OpenClears);
+        _NoRecordOnALogServerThatRuns ->
+            []
     end;
 wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns, _OpenClears) ->
     [above_read_version || Written > ReadVersion] ++

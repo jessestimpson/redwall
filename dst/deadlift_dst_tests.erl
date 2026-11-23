@@ -126,8 +126,10 @@ faults_shard(Shard) ->
         %% acknowledged transaction.
         ?assert(maps:get(batched, Stats, 0) > 30, Stats),
         ?assert(maps:get(rollbacks, Stats, 0) > 2, Stats),
-        %% The StorageServer refused reads below its MVCC window.
-        ?assert(maps:get(read_too_old, Stats, 0) > 15, Stats),
+        %% Reads were below the MVCC window of the StorageServer. With the
+        %% direct reads of the client library, a shard has 10 to 50 of
+        %% them.
+        ?assert(maps:get(read_too_old, Stats, 0) > 3, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 15, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
         %% read version of an earlier epoch.

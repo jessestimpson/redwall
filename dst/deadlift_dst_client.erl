@@ -116,7 +116,8 @@ recover(Tab, N, CState, Mode) ->
 %%
 %% The client records every read version that it receives, also when the
 %% commit fails. With the read version, the client reads its read keys from
-%% the StorageServer, and records the values.
+%% the StorageServer, and records the values. The reads and the commit go
+%% through the client library, `deadlift'.
 %%
 %% One client in three waits between the read version and the commit, for
 %% 20 ms to 100 ms of the virtual clock. A recovery can end the epoch in
@@ -145,58 +146,68 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             true -> [range(R div 7)];
             false -> []
         end,
+    %% The transaction of the client library. Its Proxy is the Proxy that
+    %% the row `{commit_proxy, C}' names at the time of the commit. Its
+    %% StorageServer is the StorageServer that runs at the time of a read.
+    Db = deadlift:open(#{
+        proxy => fun() -> ets:lookup_element(Tab, {commit_proxy, C}, 2) end,
+        storage => fun() -> element(2, hd(ets:lookup(Tab, storage))) end
+    }),
+    Tx = deadlift:create_transaction(Db),
     Start = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
+    %% The client asks the Proxy `Reader' for the read version itself,
+    %% because the Proxy of the commit can be another one.
     case deadlift_proxy:read_version(Reader) of
         {ok, ReadVersion} ->
+            ok = deadlift:set_read_version(Tx, ReadVersion),
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
             true = ets:insert(Tab, {{read, C}, Read}),
-            case read_keys(Tab, Reads, Ranges, ReadVersion) of
+            case read_keys(Tab, Tx, Reads, Ranges) of
                 {ok, Values, Generation} ->
                     true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation}}),
-                    commit(Tab, C, Read, {Reads, Ranges}, Writes, Chosen, R);
+                    commit(Tab, C, Tx, Read, {Reads, Ranges}, Writes, Chosen, R);
                 {error, transaction_too_old} ->
                     %% The read version is below the MVCC window of the
                     %% StorageServer.
                     true = ets:insert(Tab, {{read_too_old, C}, ReaderEpoch});
-                {error, _Reason} ->
+                {error, _Code} ->
                     true = ets:insert(Tab, {{no_read, C}, ReaderEpoch})
             end;
         {error, _Reason} ->
             true = ets:insert(Tab, {{no_read_version, C}, ReaderEpoch})
     end.
 
-%% Reads the keys from the StorageServer at the read version. The result
-%% has `{Key, not_found}' or `{Key, {Value, Written}}' for each key.
-read_keys(Tab, Keys, Ranges, ReadVersion) ->
-    %% The StorageServer that runs. The harness starts a new one after a
-    %% kill. `Generation' is the number of StorageServers before this one.
-    [{storage, Storage, Generation, _Node}] = ets:lookup(Tab, storage),
-    maybe
-        {ok, Values0} ?= read_each(Storage, Keys, ReadVersion, []),
-        {ok, Values} ?= read_ranges(Storage, Ranges, ReadVersion, Values0),
-        {ok, Values, Generation}
+%% Reads the keys and the ranges through the client library, which reads
+%% the ETS table of the StorageServer in this process. The result has
+%% `{Key, not_found}' or `{Key, {Value, unknown}}' for each key, and for
+%% each key of the workload in each range. The client library does not
+%% return the LSN of the record that wrote a value. The harness finds that
+%% LSN in the records of the LogServers.
+read_keys(Tab, Tx, Keys, Ranges) ->
+    %% `Generation' is the number of StorageServers before the one that
+    %% runs. The harness starts a new StorageServer after a kill.
+    [{storage, _Storage, Generation, _Node}] = ets:lookup(Tab, storage),
+    try
+        Single = [{Key, found(deadlift:wait(deadlift:get(Tx, Key)))} || Key <- Keys],
+        InRanges = lists:append([
+            begin
+                Found = deadlift:get_range(Tx, Begin, End),
+                %% The read returns no key outside the range, and the keys
+                %% are in their order.
+                [] = [Key || {Key, _Value} <- Found, not lists:member(Key, keys_in(Range))],
+                Found = lists:ukeysort(1, Found),
+                [{Key, found(proplists:get_value(Key, Found, not_found))} || Key <- keys_in(Range)]
+            end
+         || Range = {Begin, End} <- Ranges
+        ]),
+        {ok, Single ++ InRanges, Generation}
+    catch
+        error:{erlfdb_error, 1007} -> {error, transaction_too_old};
+        error:{erlfdb_error, Code} -> {error, Code}
     end.
 
-%% Reads the ranges from the StorageServer. Adds a result for each key of
-%% the workload in each range to `Values'.
-read_ranges(_Storage, [], _ReadVersion, Values) ->
-    {ok, Values};
-read_ranges(Storage, [Range = {Begin, End} | Ranges], ReadVersion, Values) ->
-    case deadlift_storage:read_range_with_version(Storage, Begin, End, ReadVersion, 2000) of
-        {ok, Found} ->
-            InRange = [
-                case lists:keyfind(Key, 1, Found) of
-                    {Key, Value, Written} -> {Key, {Value, Written}};
-                    false -> {Key, not_found}
-                end
-             || Key <- keys_in(Range)
-            ],
-            %% The StorageServer returns no key outside the range.
-            [] = [Key || {Key, _Value, _Written} <- Found, not lists:member(Key, keys_in(Range))],
-            read_ranges(Storage, Ranges, ReadVersion, Values ++ InRange);
-        {error, Reason} ->
-            {error, Reason}
-    end.
+found(not_found) -> not_found;
+found(Value) -> {Value, unknown}.
 
 %% The keys of the workload in a range.
 keys_in({Begin, End}) ->
@@ -208,16 +219,7 @@ range(R) ->
     Pairs = [{Begin, End} || Begin <- Bounds, End <- Bounds, Begin < End],
     lists:nth(R rem length(Pairs) + 1, Pairs).
 
-read_each(_Storage, [], _ReadVersion, Values) ->
-    {ok, lists:reverse(Values)};
-read_each(Storage, [Key | Keys], ReadVersion, Values) ->
-    case deadlift_storage:read_with_version(Storage, Key, ReadVersion, 2000) of
-        {ok, Value, Written} -> read_each(Storage, Keys, ReadVersion, [{Key, {Value, Written}} | Values]);
-        not_found -> read_each(Storage, Keys, ReadVersion, [{Key, not_found} | Values]);
-        {error, Reason} -> {error, Reason}
-    end.
-
-commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, {Reads, Ranges}, Writes, Chosen, R) ->
+commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, {Reads, Ranges}, Writes, Chosen, R) ->
     {Proxy, Epoch} =
         case R rem 3 of
             0 ->
@@ -226,7 +228,7 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
             _ ->
                 Chosen
         end,
-    true = ets:insert(Tab, {{invoked, C}, Epoch}),
+    true = ets:insert(Tab, [{{invoked, C}, Epoch}, {{commit_proxy, C}, Proxy}]),
     Cleared =
         case R rem 11 < 2 of
             true -> [range(R div 11)];
@@ -234,16 +236,12 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
         end,
     Clears = lists:append([keys_in(Range) || Range <- Cleared]) -- Writes,
     true = ets:insert(Tab, {{attempt, C}, Clears}),
-    Transaction = #{
-        read_version => ReadVersion,
-        reads => Reads,
-        read_ranges => Ranges,
-        mutations =>
-            [{clear_range, Begin, End} || {Begin, End} <- Cleared] ++
-                [{set, Key, {client, C}} || Key <- Writes]
-    },
-    case deadlift_proxy:commit_with_index(Proxy, Transaction, 5000) of
-        {ok, LSN, Index} ->
+    lists:foreach(fun({Begin, End}) -> ok = deadlift:clear_range(Tx, Begin, End) end, Cleared),
+    lists:foreach(fun(Key) -> ok = deadlift:set(Tx, Key, {client, C}) end, Writes),
+    try deadlift:wait(deadlift:commit(Tx)) of
+        ok ->
+            LSN = deadlift:get_committed_version(Tx),
+            <<LSN:64, Index:16>> = deadlift:get_versionstamp(Tx),
             End = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
             true = ets:insert(Tab, {{txn, C}, #{
                 read_version => ReadVersion,
@@ -260,11 +258,12 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
                 start => Start,
                 'end' => End
             }}),
-            true = ets:insert(Tab, {{ack, C}, Epoch, LSN});
-        {error, commit_unknown_result} ->
-            true = ets:insert(Tab, {{unknown, C}, Epoch});
-        {error, Rejected} ->
-            true = ets:insert(Tab, {{rejected, C}, Rejected})
+            true = ets:insert(Tab, {{ack, C}, Epoch, LSN})
+    catch
+        %% The error codes of FoundationDB. See `deadlift'.
+        error:{erlfdb_error, 1021} -> true = ets:insert(Tab, {{unknown, C}, Epoch});
+        error:{erlfdb_error, 1020} -> true = ets:insert(Tab, {{rejected, C}, not_committed});
+        error:{erlfdb_error, 1007} -> true = ets:insert(Tab, {{rejected, C}, transaction_too_old})
     end.
 
 %% The Proxy of the highest epoch that runs, or `Default'.

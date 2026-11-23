@@ -84,11 +84,37 @@ commits and recoveries, and no run violates an invariant.
       harness of deadlift. A change of eta needs the agreement of the
       owner of eta.
 - [x] Keep only the versions of the MVCC window in the StorageServer.
-- [ ] Write a client: get a read version, read, commit, retry on conflict.
+- [x] Write a client: get a read version, read, commit, retry on conflict.
+      The client has the function names of erlfdb.
 - [ ] Check strict serializability of client histories with Elle.
 
 Done when: a Jepsen test with a transactional workload passes under kills
 and partitions.
+
+### The API of erlfdb
+
+The goal is that deadlift replaces erlfdb in an application. The client
+has the basic functions. The remaining parts, in the planned order:
+
+- [ ] `get_range` with `limit` and `reverse`, key selectors and
+      `get_key`. This step makes the tuple layer, subspaces and the
+      directory layer of erlfdb usable.
+- [ ] The fold functions, `get_range_startswith` and
+      `clear_range_startswith`.
+- [ ] Transaction options, for example `timeout` and `retry_limit`, and
+      the limits of a transaction for time and size.
+- [ ] `add_write_conflict_key`, `add_write_conflict_range` and
+      `get_conflicting_keys`.
+- [ ] Atomic operations, versionstamped keys and versionstamped values.
+- [ ] Watches.
+- [ ] Tenants, mapped ranges, and the functions for locality and
+      statistics.
+- [ ] `get_last_error/0`. erlfdb keeps the last error in the process
+      dictionary, and an error that causes a retry is hidden by a later
+      timeout error of the transaction. The design is open.
+- [ ] Find the Proxy and the StorageServer from the coordinators in
+      `open`.
+- [ ] Run the test suite of erlfdb against deadlift.
 
 ### Milestone 3: Scale and operations
 
@@ -114,7 +140,7 @@ node of the cluster. See "Use cases" in [README.md](README.md).
 
 - [x] Keep the keys of the StorageServer in their order, in an ETS table
       of type `ordered_set`.
-- [ ] Read from the ETS table of the StorageServer in the process of the
+- [x] Read from the ETS table of the StorageServer in the process of the
       client, without a message to the StorageServer.
 - [ ] Write a storage engine for the StorageServer that keeps the data in
       memory.

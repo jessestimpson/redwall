@@ -39,15 +39,16 @@ deadlift is at the start. The repository contains:
 - a Proxy that gives read versions and commits transactions, with tests;
 - a StorageServer that reads the records from the LogServers and answers
   reads at a version, with tests;
+- a client with the function names of erlfdb, with tests;
 - a deterministic simulation of these parts with
   [eta](https://github.com/jessestimpson/eta), with kills, partitions,
   and lost and delayed messages.
 
-A caller can run a complete transaction with three calls: get a read
-version from a Proxy, read keys from the StorageServer at the read
-version, and commit the read keys and the writes through a Proxy. deadlift
-has no client library that makes these calls and repeats a transaction
-after a conflict. Every part keeps its data in memory. See
+A caller runs a transaction with the client: the client gets a read
+version from a Proxy, reads keys from the StorageServer at the read
+version, commits the read keys and the writes through a Proxy, and repeats
+the transaction after a conflict. The client has the basic functions of
+erlfdb only. Every part keeps its data in memory. See
 [ROADMAP.md](ROADMAP.md).
 
 ## Design
@@ -225,6 +226,54 @@ repository.
 | Reads by 8 processes at the same time | million per second | Not possible | 5.13 | 2.99 | 5.04 |
 
 The owner of the project chose the ETS table with one row for each key.
+
+### The client
+
+The module [deadlift](src/deadlift.erl) is the client. The functions have
+the names, the arguments and the results of
+[erlfdb](https://github.com/foundationdb-beam/erlfdb) 1.2.3, so that
+deadlift can replace erlfdb in an application later.
+
+```erlang
+Db = deadlift:open(#{proxy => Proxy, storage => Storage}),
+deadlift:transactional(Db, fun(Tx) ->
+    Balance = deadlift:wait(deadlift:get(Tx, account)),
+    deadlift:set(Tx, account, Balance + 1)
+end).
+```
+
+| Group | Functions |
+|---|---|
+| Database and transaction | `open/1`, `create_transaction/1`, `transactional/2`, `snapshot/1` |
+| Reads | `get/2`, `get_range/3`, `wait/1`, `wait/2` |
+| Writes | `set/3`, `clear/2`, `clear_range/3` |
+| Commit and errors | `commit/1`, `reset/1`, `cancel/1`, `on_error/2` |
+| Versions | `get_read_version/1`, `set_read_version/2`, `get_committed_version/1`, `get_versionstamp/1` |
+| Conflict ranges and status | `add_read_conflict_key/2`, `add_read_conflict_range/3`, `is_read_only/1` |
+
+- A transaction of erlfdb is a mutable object of the C library of
+  FoundationDB. A transaction of deadlift is an ETS table of type
+  `ordered_set`, so that several processes can use one transaction, as
+  with erlfdb. A benchmark measured 213 ns to create and delete such a
+  table, and 1,915 ns for the state of a transaction with 2 reads and 2
+  writes.
+- A read returns a write of the same transaction (paper, section 2.4.1).
+- Another read goes to the ETS table of the StorageServer in the process
+  of the client, without a message. The StorageServer publishes its
+  version and its oldest version for this purpose. If the StorageServer
+  has not applied the read version, the read goes to the StorageServer
+  process, which waits for the version.
+- `get/2` returns a future, as in erlfdb. The future of deadlift is the
+  result itself, and `wait/1` returns its argument.
+- An error is `error({erlfdb_error, Code})` with the error code of
+  FoundationDB 7.3: 1007 `transaction_too_old`, 1009 `future_version`,
+  1020 `not_committed`, 1021 `commit_unknown_result`, 1025
+  `transaction_cancelled` and 1037 `process_behind`.
+- `on_error/2` follows `Transaction::onError` of
+  `fdbclient/NativeAPI.actor.cpp`. After 1020, 1021 and 1037 it waits for a
+  random part of a backoff that starts at 10 ms, doubles with each error
+  and is at most 1 s. After 1007 and 1009 it waits for 10 ms.
+  `transactional/2` then runs the function again.
 
 ### The Proxy
 
@@ -478,21 +527,21 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,378 acknowledged transactions, of which 2,278 with a read range, 1,167 with a clear of keys and 1,973 in a batch with another acknowledged transaction, 9,447 rejected for a conflict, 1,838 too old, 22,088 transactions with reads from the StorageServer, 13 reads below the MVCC window of the StorageServer, 2,278 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,408 acknowledged transactions, of which 439 with a read range, 275 with a clear of keys and 378 in a batch with another acknowledged transaction, 3,270 rejected for a conflict, 3,042 too old, 22,681 transactions with reads from the StorageServer, of which 6,801 from a StorageServer that started after a kill, 530 reads below the MVCC window of the StorageServer, 387 rollbacks of the StorageServer, 6,029 recoveries, 3,264 kills, of which 355 of the StorageServer, 564 partitions |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 10,417 acknowledged transactions, of which 2,643 with a read range, 1,301 with a clear of keys and 2,028 in a batch with another acknowledged transaction, 9,262 rejected for a conflict, 1,627 too old, 22,244 transactions with reads, 2 reads below the MVCC window of the StorageServer, 2,298 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 3,097 acknowledged transactions, of which 755 with a read range, 378 with a clear of keys and 580 in a batch with another acknowledged transaction, 4,575 rejected for a conflict, 2,890 too old, 22,886 transactions with reads, of which 7,264 from a StorageServer that started after a kill, 137 reads below the MVCC window of the StorageServer, 455 rollbacks of the StorageServer, 6,246 recoveries, 3,315 kills, of which 380 of the StorageServer, 618 partitions |
 | Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
-| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `read_version_order` |
+| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
 | Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 2, `no_conflict` |
-| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 2, `no_conflict` between the transactions with the indexes 2 and 4 of one batch |
-| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 2, `no_conflict`: a transaction read a key that another transaction cleared in a range |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 3, `no_conflict` between a transaction of epoch 15 and a write of epoch 12 |
+| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 1, `no_conflict` between the transactions with the indexes 1 and 2 of one batch |
+| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 3, `no_conflict`: a transaction read a key that another transaction cleared in a range |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` between a transaction of epoch 14 and a write of epoch 13 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 26, `read_version_order`: a Proxy of epoch 3 gave a read version below a commit of epoch 5 |
-| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 3, `storage_rollback` |
-| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 9, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
-| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 2, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 2, `read_version_order`: a Proxy of epoch 3 gave a read version below a commit of epoch 4 |
+| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 4, `storage_rollback` |
+| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 6, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
+| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 1, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
@@ -545,6 +594,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/deadlift_resolver.erl](src/deadlift_resolver.erl) | The Resolver |
 | [src/deadlift_proxy.erl](src/deadlift_proxy.erl) | The Proxy |
 | [src/deadlift_storage.erl](src/deadlift_storage.erl) | The StorageServer |
+| [src/deadlift.erl](src/deadlift.erl) | The client, with the function names of erlfdb |
 | [src/deadlift_registry.erl](src/deadlift_registry.erl) | The registry of the processes of one node |
 | [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
 | [include/deadlift_eta.hrl](include/deadlift_eta.hrl) | The header that puts a module under the parse transform of eta in the `dst` profile |
@@ -570,8 +620,23 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - A commit waits for the time of a batch, 1 ms by default, also when no
   other transaction arrives. The time does not change with the load.
 - A batch has no limit in bytes.
-- deadlift has no client library. A caller gets the read version, reads
-  and commits with separate calls, and repeats a transaction itself.
+- The client has the basic functions of erlfdb only. It has no key
+  selectors, no options of `get_range`, no atomic operations, no
+  versionstamped keys and values, no watches, no transaction options, no
+  tenants and no `get_last_error/0`. It has no tuple layer, no subspaces
+  and no directory layer.
+- A database of the client is a Proxy and a StorageServer that the caller
+  names. deadlift has no process that tells a client which Proxy runs.
+  The client raises the error 1037 when the Proxy does not answer. The
+  client of FoundationDB waits for a new Proxy.
+- A transaction of `create_transaction/1` keeps its ETS table until its
+  process ends. erlfdb frees a transaction when no process has a
+  reference to it.
+- Two processes that use one transaction at the same time get no error.
+- The simulation does not use `transactional/2` and `on_error/2`. Unit
+  tests cover them.
+- The direct read was not measured in deadlift. The store benchmark
+  measured about 1,000 ns for a read of one key from such a table.
 - The StorageServer keeps the data in memory, and loses the data when it
   stops. A new StorageServer reads every record again
   from the LogServers, which is possible only while the LogServers of
