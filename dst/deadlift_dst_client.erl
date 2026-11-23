@@ -169,8 +169,9 @@ force_recovery(Tab) ->
 
 %% The options of the process of an epoch for a planted defect. `Count'
 %% selects the batch time of 0 ms, 5 ms or 50 ms of the virtual clock.
-%% 1 process in 2 closes a batch at once when no batch is in progress, and
-%% 1 process in 2 shares the confirmations for read versions.
+%% 1 process in 2 closes a batch at once when no batch is in progress,
+%% 1 process in 2 shares the confirmations for read versions, and 1
+%% process in 2 has 3 batches in progress at the same time (`batch_depth').
 proxy_options(Count, Mode) ->
     Options = #{
         ack =>
@@ -186,7 +187,8 @@ proxy_options(Count, Mode) ->
         check_write_ranges => Mode =/= no_write_range,
         batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50]),
         batch_idle => Count rem 2 =:= 0,
-        read_version_share => Count div 2 rem 2 =:= 0
+        read_version_share => Count div 2 rem 2 =:= 0,
+        batch_depth => lists:nth(Count div 4 rem 2 + 1, [1, 3])
     },
     case Mode of
         %% The planted defect: the first commit version of an epoch is the
@@ -319,8 +321,24 @@ read_keys(Tab, Db, Tx, Keys, Ranges) ->
         Single = [{Key, found(deadlift:wait(deadlift:get(Tx, Key)))} || Key <- Keys],
         InRanges = lists:append([
             begin
-                Found = deadlift:get_range(Tx, Begin, End),
-                ok = select(Tab, Tx, Range, Found),
+                %% 1 range in 4 is read with `get_mapped_range/4' only,
+                %% with a mapper that maps each key to itself. The
+                %% transaction then has the read conflict ranges of the
+                %% mapped range read and no other for the range, and the
+                %% invariant `no_conflict' checks them.
+                Found =
+                    case ets:update_counter(Tab, range_number, 1, {range_number, 0}) rem 4 of
+                        0 ->
+                            _ = ets:update_counter(Tab, own_mapped_reads, 1, {own_mapped_reads, 0}),
+                            Mapped = deadlift:get_mapped_range(Tx, Begin, End, {<<"k">>, <<"{K[1]}">>}),
+                            Rows = [Row || {Row, _Second, [Same]} <- Mapped, Same =:= Row],
+                            _ = length(Rows) =:= length(Mapped) orelse ets:insert(Tab, {{mapped_differs, {own, Begin, End}}, #{range => Range, mapped => Mapped}}),
+                            Rows;
+                        _ ->
+                            Rows = deadlift:get_range(Tx, Begin, End),
+                            ok = select(Tab, Tx, Range, Rows),
+                            Rows
+                    end,
                 ok = mapped_range(Tab, Db, deadlift:get_read_version(Tx), Range, Found),
                 %% The read returns no key outside the range, and the keys
                 %% are in their order.
@@ -351,9 +369,11 @@ select(Tab, Tx, {Begin, End}, Found) ->
         fun(Spec) ->
             Expected = ets:match_spec_run(Found, ets:match_spec_compile(Spec)),
             N = ets:update_counter(Tab, selects, 1, {selects, 0}),
-            case deadlift:select(Tx, Begin, End, Spec) of
-                Expected -> ok;
-                Other -> true = ets:insert(Tab, {{select_differs, N}, #{range => {Begin, End}, expected => Expected, selected => Other}})
+            Limit = N rem 3 + 1,
+            First = lists:sublist(Expected, Limit),
+            case {deadlift:select(Tx, Begin, End, Spec), deadlift:select(Tx, Begin, End, Spec, [{limit, Limit}])} of
+                {Expected, First} -> ok;
+                Other -> true = ets:insert(Tab, {{select_differs, N}, #{range => {Begin, End}, expected => Expected, limit => Limit, selected => Other}})
             end
         end,
         Specs
@@ -388,9 +408,11 @@ mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found) ->
         lists:foreach(
             fun({Mapper, Expected}) ->
                 N = ets:update_counter(Tab, mapped_reads, 1, {mapped_reads, 0}),
-                case deadlift:get_mapped_range(Tx, Begin, End, Mapper) of
-                    Expected -> ok;
-                    Other -> true = ets:insert(Tab, {{mapped_differs, N}, #{range => {Begin, End}, mapper => Mapper, expected => Expected, mapped => Other}})
+                Limit = N rem 3 + 1,
+                First = lists:sublist(Expected, Limit),
+                case {deadlift:get_mapped_range(Tx, Begin, End, Mapper), deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{limit, Limit}])} of
+                    {Expected, First} -> ok;
+                    Other -> true = ets:insert(Tab, {{mapped_differs, N}, #{range => {Begin, End}, mapper => Mapper, expected => Expected, limit => Limit, mapped => Other}})
                 end
             end,
             Cases
@@ -435,6 +457,7 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
     true = ets:insert(Tab, {{attempt, C}, Clears}),
     lists:foreach(fun({Begin, End}) -> ok = deadlift:clear_range(Tx, Begin, End) end, Cleared),
     lists:foreach(fun(Key) -> ok = deadlift:set(Tx, Key, {client, C}) end, Writes),
+    ok = own_writes(Tab, C, Tx, ReadVersion, Writes, Clears),
     try deadlift:wait(deadlift:commit(Tx)) of
         ok ->
             LSN = deadlift:get_committed_version(Tx),
@@ -458,9 +481,87 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
             true = ets:insert(Tab, {{ack, C}, Epoch, LSN})
     catch
         %% The error codes of FoundationDB. See `deadlift'.
-        error:{erlfdb_error, 1021} -> true = ets:insert(Tab, {{unknown, C}, Epoch});
-        error:{erlfdb_error, 1020} -> true = ets:insert(Tab, {{rejected, C}, not_committed});
-        error:{erlfdb_error, 1007} -> true = ets:insert(Tab, {{rejected, C}, transaction_too_old})
+        error:{erlfdb_error, 1021} ->
+            true = ets:insert(Tab, {{unknown, C}, Epoch}),
+            after_error(Tab, Tx, 1021);
+        error:{erlfdb_error, 1020} ->
+            true = ets:insert(Tab, {{rejected, C}, not_committed}),
+            after_error(Tab, Tx, 1020);
+        error:{erlfdb_error, 1007} ->
+            true = ets:insert(Tab, {{rejected, C}, transaction_too_old}),
+            after_error(Tab, Tx, 1007)
+    end.
+
+%% Calls `deadlift:on_error/2' after a failed commit, as
+%% `deadlift:transactional/2' does. The call waits for the backoff on the
+%% virtual clock, and leaves a transaction without a read version and
+%% without a mutation. The client does not run the transaction again.
+after_error(Tab, Tx = {deadlift_transaction, Table}, Code) ->
+    ok = deadlift:on_error(Tx, Code),
+    _ = ets:update_counter(Tab, on_errors, 1, {on_errors, 0}),
+    case deadlift:is_read_only(Tx) andalso ets:lookup(Table, read_version) =:= [] of
+        true -> true;
+        false -> ets:insert(Tab, {{own_writes_differ, {on_error, Code}}, #{code => Code}})
+    end.
+
+%% Checks the reads of a transaction that has written and cleared keys,
+%% before the commit. `Writes' are the keys that the transaction has set,
+%% and `Clears' are the keys that it has cleared and not set.
+%%
+%% <ul>
+%% <li>`get/2' returns the value of the transaction for a key that it
+%%   set, and `not_found' for a key that it cleared.</li>
+%% <li>`get_range/3' and `select/4' on every key return the stored rows
+%%   at the read version with the sets and the clears of the transaction.
+%%   The stored rows are read through a second transaction with the same
+%%   read version.</li>
+%% <li>`get_mapped_range/4' on every key raises 2039, because the
+%%   transaction has written a key of the range.</li>
+%% </ul>
+%%
+%% The reads are reads of a snapshot, so the transaction gets no read
+%% conflict range from them. The function records a difference in the
+%% table of the run, for the invariant `own_writes'. It checks nothing
+%% when a read fails with an error code.
+own_writes(Tab, C, Tx, ReadVersion, Writes, Clears) ->
+    [{db, Servers}] = ets:lookup(element(2, Tx), db),
+    Plain = {deadlift_transaction, Table} = deadlift:create_transaction({deadlift_database, Servers}),
+    Snapshot = deadlift:snapshot(Tx),
+    {Begin, End} = {key(1), key(5)},
+    try
+        ok = deadlift:set_read_version(Plain, ReadVersion),
+        Stored = deadlift:get_range(deadlift:snapshot(Plain), Begin, End),
+        Expected = lists:ukeymerge(1, [{Key, {client, C}} || Key <- lists:sort(Writes)], [Row || Row = {Key, _} <- Stored, not lists:member(Key, Clears)]),
+        All = [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}],
+        Mapped =
+            try deadlift:get_mapped_range(Tx, Begin, End, {<<"k">>, <<"{K[1]}">>}) of
+                Rows -> {ok, Rows}
+            catch
+                error:{erlfdb_error, 2039} -> reads_your_writes
+            end,
+        Got = #{
+            sets => [deadlift:get(Snapshot, Key) || Key <- Writes],
+            clears => [deadlift:get(Snapshot, Key) || Key <- Clears],
+            range => deadlift:get_range(Snapshot, Begin, End),
+            select => deadlift:select(Snapshot, Begin, End, All),
+            limit => deadlift:select(Snapshot, Begin, End, All, [{limit, 2}]),
+            mapped => Mapped
+        },
+        Want = #{
+            sets => [{client, C} || _ <- Writes],
+            clears => [not_found || _ <- Clears],
+            range => Expected,
+            select => Expected,
+            limit => lists:sublist(Expected, 2),
+            mapped => reads_your_writes
+        },
+        _ = ets:update_counter(Tab, own_write_checks, 1, {own_write_checks, 0}),
+        _ = Got =:= Want orelse ets:insert(Tab, {{own_writes_differ, C}, #{got => Got, expected => Want, writes => Writes, clears => Clears}}),
+        ok
+    catch
+        error:{erlfdb_error, _Code} -> ok
+    after
+        ets:delete(Table)
     end.
 
 %% The Proxy of the highest epoch that runs, or `Default'.

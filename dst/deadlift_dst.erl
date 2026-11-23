@@ -183,6 +183,15 @@
 %%   with the result of its second read. A client with a read range reads
 %%   the range with two mappers: one with a second read of a key, and one
 %%   with a second read of a prefix.</li>
+%%   1 read range in 4 of a transaction is read with
+%%   `get_mapped_range/4' only, so that `no_conflict' checks the read
+%%   conflict ranges of a mapped range read. Each read with a limit
+%%   returns the first rows of the read without a limit.</li>
+%% <li>`own_writes' - before the commit, the reads of a transaction
+%%   return its sets and its clears: `get/2', `get_range/3' and
+%%   `select/4' of a snapshot. `get_mapped_range/4' raises 2039. After a
+%%   failed commit, `on_error/2' leaves a transaction without a read
+%%   version and without a mutation.</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -240,7 +249,10 @@
 %% <li>The coordinated state is one process that is never killed. The run
 %%   has no peace cluster.</li>
 %% <li>A killed process does not start again. A LogServer has no disk.</li>
-%% <li>The run has one StorageServer at a time.</li>
+%% <li>The application start and `deadlift:open/0' are not in the run. A
+%%   client names its Proxy and its StorageServers.</li>
+%% <li>A client does not run a transaction again after an error. It calls
+%%   `deadlift:on_error/2' and ends.</li>
 %% <li>deadlift does not send a message again. A lost message to a
 %%   LogServer stops the commits of the epoch until the next recovery.
 %%   FoundationDB runs on TCP, and treats a broken connection as a failure
@@ -602,7 +614,8 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> chain(Logs) end,
         fun() -> one_leader(Tab) end,
         fun() -> select_agrees(Tab) end,
-        fun() -> mapped_range_agrees(Tab) end
+        fun() -> mapped_range_agrees(Tab) end,
+        fun() -> own_writes(Tab) end
     ]).
 
 %% A `select/4' of a client returned the result of the match spec on the
@@ -611,6 +624,15 @@ select_agrees(Tab) ->
     case ets:match(Tab, {{select_differs, '_'}, '$1'}) of
         [] -> ok;
         [[Detail] | _] -> violation(select_agrees, Detail)
+    end.
+
+%% The reads of a transaction returned its own sets and clears, and
+%% `on_error/2' left a transaction without a read version and without a
+%% mutation.
+own_writes(Tab) ->
+    case ets:match(Tab, {{own_writes_differ, '_'}, '$1'}) of
+        [] -> ok;
+        [[Detail] | _] -> violation(own_writes, Detail)
     end.
 
 %% A `get_mapped_range/4' of a client returned the rows of `get_range/3'
@@ -780,6 +802,10 @@ record_stats(Tab) ->
     bump(runs),
     bump(selects, case ets:lookup(Tab, selects) of [{selects, Selects}] -> Selects; [] -> 0 end),
     bump(mapped_reads, case ets:lookup(Tab, mapped_reads) of [{mapped_reads, Mapped}] -> Mapped; [] -> 0 end),
+    [
+        bump(Counter, case ets:lookup(Tab, Counter) of [{Counter, Count}] -> Count; [] -> 0 end)
+     || Counter <- [own_mapped_reads, own_write_checks, on_errors]
+    ],
     bump(runs_with_two_leaders, length(ets:lookup(Tab, two_leaders))),
     bump(leaders, length(ets:match(Tab, {{leader, '_'}, '_'}))),
     bump(role_failures, length(ets:match(Tab, {{role_failed, '_'}, '_'}))),

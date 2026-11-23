@@ -63,6 +63,29 @@ determinism_test_() ->
         )
     end}.
 
+%% The same checks for the runs with ClusterControllers: without faults,
+%% with kills and partitions, and with cuts between the nodes of the
+%% ClusterControllers.
+controller_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Kinds = [
+            fun(Seed) -> (opts(Seed, #{faults => false, controller => true, last_op => 80}))#{net => true, settle_steps => 20000} end,
+            fun(Seed) -> (opts(Seed, #{controller => true, last_op => 80}))#{settle_steps => 20000} end,
+            fun(Seed) -> controller_partitions(Seed, correct) end
+        ],
+        lists:foreach(
+            fun({Kind, Seed}) ->
+                Opts = Kind(Seed),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                Replayed = eta_run:replay(deadlift_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [{Kind, Seed} || Kind <- Kinds, Seed <- lists:seq(1, 6)]
+        )
+    end}.
+
 %% The runs without faults and the runs with faults are divided into
 %% shards, so that `dst/run.sh' runs the shards in several nodes at the
 %% same time. A shard has its own seeds and its own statistics. Each limit
@@ -388,10 +411,12 @@ no_window_check_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_window_check}) end),
         ?debugFmt("no_window_check: seed ~p, ~p", [Seed, Violation]),
         %% A read returns no value for a key that has one, or a select or
-        %% a mapped range read and a read of the same range differ,
+        %% a mapped range read and a read of the same range differ, or a
+        %% read of a transaction with its own writes and a read of the
+        %% stored rows differ,
         %% because the two read at two times and the StorageServer removes
         %% versions in between.
-        ?assert(lists:member(maps:get(property, Violation), [read_value, select_agrees, mapped_range_agrees]), Violation)
+        ?assert(lists:member(maps:get(property, Violation), [read_value, select_agrees, mapped_range_agrees, own_writes]), Violation)
     end}.
 
 %% A planted defect: the StorageServer answers a read at a version that it

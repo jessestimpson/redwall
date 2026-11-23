@@ -940,6 +940,7 @@ The harness checks these invariants after every step:
 | `replicas_agree` | Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both |
 | `select_agrees` | A `deadlift:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
 | `mapped_range_agrees` | A `deadlift:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
+| `own_writes` | Before the commit, the reads of a transaction return its sets and its clears, and `get_mapped_range/4` raises 2039. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -948,6 +949,7 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
+| The same for the runs with ClusterControllers: without faults, with faults, and with cuts between ClusterController nodes | 18 seeds, 3 runs each | Pass |
 | No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 8,883 acknowledged transactions, of which 2,289 with a read range, 1,100 with a clear of keys and 546 in a batch with another acknowledged transaction, 3,446 rejected for a conflict, 391 too old, 12,683 transactions with reads, of which 4,995 with direct reads on the node of a StorageServer and 2,517 by message only, 7,610 selects, 12 reads below the MVCC window of the StorageServer, 1,388 recoveries, 89 failed recoveries |
 | Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 3,934 acknowledged transactions, of which 839 with a read range, 497 with a clear of keys and 371 in a batch with another acknowledged transaction, 3,756 rejected for a conflict, 1,470 too old, 13,757 transactions with reads, of which 2,475 after the start of a new StorageServer, 237 while one of several StorageServers was not alive, 5,646 with direct reads on the node of a StorageServer and 2,781 by message only, 8,326 selects, 164 reads below the MVCC window of the StorageServer, 1,145 rollbacks of StorageServers, 3,666 recoveries, 1,397 failed recoveries, 1,641 kills, of which 210 of a StorageServer, 285 partitions |
 | ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,708 acknowledged transactions, 328 recoveries, 2 failed recoveries, 50 elections |
@@ -972,15 +974,50 @@ Results of `make dst` on 2026-11-22:
 | Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
 | Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value` |
 
-A run of `make dst` on 2026-11-23, with the invariant
-`mapped_range_agrees`: the 32 tests pass in 122 s. The runs compared
-21,780 mapped range reads with reads of the same read version:
+A run of `make dst` on 2026-11-23, with the invariants
+`mapped_range_agrees` and `own_writes`: the 32 tests pass in 130 s
+without a violation. The test `controller_determinism_test_` was added
+after that run and passes in 22 s. The checks of the client in that run:
 
-| Tests | Mapped range reads compared | Result |
-|---|---|---|
-| No kills, no partitions, no lost or delayed messages | 7,622 | No violation |
-| Kills, partitions, lost and delayed messages | 8,111 | No violation |
-| ClusterControllers, 4 tests | 6,047 | No violation |
+| Check | No faults, 4 tests | Faults, 5 tests | ClusterControllers, 4 tests |
+|---|---|---|---|
+| Selects compared with `get_range/3`, each also with a limit | 5,884 | 6,356 | 4,672 |
+| Mapped range reads compared with `get_range/3`, each also with a limit | 7,627 | 7,528 | 5,600 |
+| Read ranges of a transaction that were read with `get_mapped_range/4` only | 881 | 831 | 615 |
+| Transactions whose reads of their own writes were checked before the commit | 12,582 | 11,530 | 8,716 |
+| Calls of `on_error/2` after a failed commit | 6,102 | 11,054 | 6,937 |
+
+The process of an epoch has `batch_depth` 1 in 1 epoch of 2, and 3 in
+the others.
+
+On 2026-11-23, six defects were planted in the source one at a time, to
+check that the invariants of the client fail. The defects are not part
+of the repository. Each one was found at seed 1 of the runs with faults:
+
+| Planted defect | Invariant that failed |
+|---|---|
+| The second read of a mapped range read uses another version than the read version | `mapped_range_agrees` |
+| `get_mapped_range/5` adds no read conflict range | `no_conflict` |
+| The StorageServer returns one row too many for a limit of a mapped range read | `mapped_range_agrees` |
+| `get_mapped_range/5` does not raise 2039 after a write of the transaction | `own_writes` |
+| `select/5` returns a stored row of a key range that the transaction cleared | `own_writes` |
+| `select/5` sends the limit to the StorageServer when the transaction has written a key of the range | `own_writes` |
+
+Limitations of the simulation:
+
+- The application start (`deadlift_sup`) and `deadlift:open/0` are not
+  in the simulation. Unit tests on two nodes cover them.
+- `deadlift:transactional/2` is not in the simulation. A client calls
+  `on_error/2` after a failed commit, and does not run the transaction
+  again.
+- The errors of a mapper are not in the simulation. Unit tests cover
+  them.
+- No planted defect is specific to `batch_depth` above 1.
+- Temporary processes of a worker and of a ClusterController can run
+  after the end of a run, until the tables of eta are deleted. They
+  write an error report. Two runs of the suite with the same source
+  differed by 1 in two counters of the statistics. The traces of the
+  runs are the same: the determinism tests compare them.
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
