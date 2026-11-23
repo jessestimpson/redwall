@@ -112,6 +112,10 @@ The goal is a storage backend in memory with low latency and high
 throughput, which an application uses as it uses an ETS table, on every
 node of the cluster. See "Use cases" in [README.md](README.md).
 
+- [x] Keep the keys of the StorageServer in their order, in an ETS table
+      of type `ordered_set`.
+- [ ] Read from the ETS table of the StorageServer in the process of the
+      client, without a message to the StorageServer.
 - [ ] Write a storage engine for the StorageServer that keeps the data in
       memory.
 - [ ] Decide which parts of the transaction system write to disk in this

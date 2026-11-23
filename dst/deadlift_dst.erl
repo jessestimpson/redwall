@@ -728,7 +728,20 @@ storage_rollback(Tab, Storage, CState) ->
     %% The check reads every write of the StorageServer, so the harness
     %% performs it only when the StorageServer or the coordinated state has
     %% changed.
-    Observed = eta_observe:read(Storage),
+    %% The published state has the ETS table of the data. The harness
+    %% reads the rows of the table. The table does not exist after the
+    %% kill of the StorageServer.
+    Observed =
+        case eta_observe:read(Storage) of
+            Published = #{data := Table} ->
+                try
+                    Published#{data := maps:from_list(ets:tab2list(Table))}
+                catch
+                    error:badarg -> no_table
+                end;
+            Other ->
+                Other
+        end,
     Old = maps:get(old, cstate(CState), []),
     Key = erlang:phash2({Observed, Old}),
     case ets:lookup(Tab, storage_checked) of

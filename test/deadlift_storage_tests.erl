@@ -11,6 +11,7 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> batch(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> window(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> clears(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> key_order(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> epochs(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> rollback(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end
@@ -128,6 +129,24 @@ clears(Ids) ->
     Data = all_data(Storage),
     ?assertEqual([c], maps:keys(Data)).
 
+%% The order of the keys is the order of Erlang terms: a number is below an
+%% atom, an atom is below a tuple, and a tuple is below a binary. A read of
+%% a range returns the keys in this order.
+key_order(Ids) ->
+    {Proxy, _Logs} = epoch(Ids),
+    Storage = storage(Ids),
+    Keys = [<<"b">>, {t, 2}, 7, b, <<"a">>, {t, 1}, a, 3.5, <<"a", 0>>],
+    {ok, 2} = deadlift_proxy:commit(Proxy, #{writes => [{Key, Key} || Key <- Keys]}),
+    Sorted = lists:sort(Keys),
+    ?assertEqual([3.5, 7, a, b, {t, 1}, {t, 2}, <<"a">>, <<"a", 0>>, <<"b">>], Sorted),
+    ?assertEqual({ok, [{Key, Key} || Key <- Sorted]}, deadlift_storage:read_range(Storage, 0, <<"z">>, 2)),
+    ?assertEqual({ok, [{b, b}, {{t, 1}, {t, 1}}]}, deadlift_storage:read_range(Storage, b, {t, 2}, 2)),
+    %% The range from the binary `a' to the binary `b' has `a' and the
+    %% binary `a' with a zero byte.
+    ?assertEqual({ok, [{<<"a">>, <<"a">>}, {<<"a", 0>>, <<"a", 0>>}]}, deadlift_storage:read_range(Storage, <<"a">>, <<"b">>, 2)),
+    {ok, 3} = deadlift_proxy:commit(Proxy, #{mutations => [{clear_range, a, {t, 2}}]}),
+    ?assertEqual({ok, [{3.5, 3.5}, {7, 7}, {{t, 2}, {t, 2}}]}, deadlift_storage:read_range(Storage, 0, <<>>, 3)).
+
 %% A StorageServer with an MVCC window of 10 versions. The commit `N' has
 %% the LSN `N + 1' and writes `{x, N}'. The first commit also writes `y'.
 window(Ids) ->
@@ -156,18 +175,10 @@ window(Ids) ->
 sys_state(Storage) ->
     #{data => all_data(Storage)}.
 
-%% The field `data' of the state: the only map of the state whose values
-%% are lists of versions.
+%% The rows of the ETS table of the data, as a map.
 all_data(Storage) ->
-    State = sys:get_state(Storage),
-    [Data] = [
-        Field
-     || Field <- tuple_to_list(State),
-        is_map(Field),
-        map_size(Field) > 0,
-        lists:all(fun(V) -> is_list(V) andalso V =/= [] andalso is_tuple(hd(V)) andalso tuple_size(hd(V)) =:= 2 end, maps:values(Field))
-    ],
-    Data.
+    #{data := Table} = deadlift_storage:info(Storage),
+    maps:from_list(ets:tab2list(Table)).
 
 %% Two transactions of one batch write the key `x'. A read returns the
 %% write of the transaction with the higher index.

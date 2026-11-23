@@ -35,11 +35,10 @@
 %% Another entry, and a record with another body, contain no mutation. The
 %% StorageServer applies the mutations of an entry in their order. A clear
 %% adds a version without a value to each key that has a value. A clear of
-%% a range examines every key. The StorageServer applies
-%% the entries in their order. When two transactions of a batch write one
-%% key, the StorageServer keeps the value of the later transaction for the
-%% version of the batch. The StorageServer keeps every version of every
-%% key.
+%% a range examines the keys of the range. The StorageServer applies the
+%% entries in their order. When two transactions of a batch write one key,
+%% the StorageServer keeps the value of the later transaction for the
+%% version of the batch.
 %%
 %% == Epochs ==
 %%
@@ -89,6 +88,30 @@
 %%   write.</li>
 %% </ul>
 %%
+%% == Store ==
+%%
+%% FoundationDB has an ordered keyspace. The StorageServer keeps the keys
+%% in their order, so that a read or a clear of a key range examines only
+%% the keys of the range. The order of the keys is the order of Erlang
+%% terms.
+%%
+%% <ul>
+%% <li>The data is an ETS table of type `ordered_set' with one row for each
+%%   key: `{Key, Versions}'. `Versions' is a list of `{Version, Change}'
+%%   with the highest version first. `Change' is `{set, Value}', or
+%%   `clear' for a version without a value. The table is `protected', so
+%%   another process can read it. `info/1' returns the table.</li>
+%% <li>A second ETS table of type `ordered_set' has one row
+%%   `{{Version, Key}}' for each version above the oldest version. With
+%%   this table, a rollback examines only the versions that it removes,
+%%   and a rise of the oldest version examines only the versions that
+%%   leave the MVCC window.</li>
+%% </ul>
+%%
+%% A benchmark compared this layout with `gb_trees', with an ETS table with
+%% one row for each version, and with a NIF. The benchmark is not part of
+%% this repository. See "The store of the StorageServer" in README.md.
+%%
 %% == MVCC window ==
 %%
 %% The StorageServer keeps the versions of the MVCC window (paper, section
@@ -106,8 +129,6 @@
 %%   version, and the last version at or below the oldest version.</li>
 %% <li>A read at a version below the oldest version returns
 %%   `{error, transaction_too_old}'.</li>
-%% <li>The oldest version rises in steps of at least one tenth of the
-%%   window, because a rise examines every key.</li>
 %% </ul>
 %%
 %% The first version of an epoch is more than the window above the last
@@ -177,9 +198,12 @@
     oldest = 0 :: version(),
     %% The highest Known Committed Version that a LogServer has sent.
     kcv = 0 :: version(),
-    %% Key -> [{Version, Change}], the highest version first. `Change' is
-    %% `{set, Value}', or `clear' for a version without a value.
-    data = #{} :: #{term() => [{version(), {set, term()} | clear}]},
+    %% The ETS table of the data, with the rows `{Key, Versions}'. See
+    %% "Store" above.
+    data :: ets:tid(),
+    %% The ETS table with a row `{{Version, Key}}' for each version above
+    %% the oldest version.
+    changes :: ets:tid(),
     %% The log systems of all epochs, from the last read of the coordinated
     %% state, in the order of the epochs.
     systems = [] :: [map()],
@@ -290,7 +314,15 @@ read_range_with_version(Storage, Begin, End, Version, Timeout) ->
     end.
 
 -spec info(gen_server:server_ref()) ->
-    #{version := version(), oldest := version(), epoch := deadlift_cstate:epoch() | undefined, rollbacks := non_neg_integer()}.
+    #{
+        version := version(),
+        oldest := version(),
+        epoch := deadlift_cstate:epoch() | undefined,
+        rollbacks := non_neg_integer(),
+        %% The ETS table of the data. See "Store" in the module
+        %% documentation.
+        data := ets:tid()
+    }.
 info(Storage) ->
     gen_server:call(Storage, info).
 
@@ -308,6 +340,8 @@ init(Options = #{coordinators := Coordinators}) ->
         window = maps:get(mvcc_window, Options, ?MVCC_WINDOW),
         check_window = maps:get(check_window, Options, true),
         clear = maps:get(clear, Options, true),
+        data = ets:new(deadlift_storage_data, [ordered_set, protected, {read_concurrency, true}]),
+        changes = ets:new(deadlift_storage_changes, [ordered_set, private]),
         buffer = gb_trees:empty(),
         requests = gen_server:reqids_new()
     },
@@ -325,7 +359,8 @@ handle_call(info, _From, State = #state{version = Version, system = System, roll
             #{epoch := E} -> E;
             undefined -> undefined
         end,
-    {reply, #{version => Version, oldest => State#state.oldest, epoch => Epoch, rollbacks => Rollbacks}, State};
+    Info = #{version => Version, oldest => State#state.oldest, epoch => Epoch, rollbacks => Rollbacks, data => State#state.data},
+    {reply, Info, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State}.
 
@@ -406,17 +441,28 @@ start(System, State) ->
 rollback(End, State = #state{rollback = false}) ->
     %% The planted defect `rollback => false'.
     State#state{version = End, buffer = gb_trees:empty()};
-rollback(End, State = #state{data = Data, rollbacks = Rollbacks}) ->
-    Data1 = maps:filtermap(
-        fun(_Key, Versions) ->
-            case [W || W = {Version, _Value} <- Versions, Version =< End] of
-                [] -> false;
-                Kept -> {true, Kept}
-            end
-        end,
-        Data
-    ),
-    State#state{version = End, data = Data1, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1}.
+rollback(End, State = #state{data = Data, changes = Changes, rollbacks = Rollbacks}) ->
+    ok = remove_above(End, ets:last(Changes), Data, Changes),
+    State#state{version = End, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1}.
+
+%% Removes the versions above `End', from the highest version down. The
+%% oldest version is at or below `End', so the table of the versions has a
+%% row for each of them.
+remove_above(End, {Version, Key} = Row, Data, Changes) when Version > End ->
+    Previous = ets:prev(Changes, Row),
+    true = ets:delete(Changes, Row),
+    case ets:lookup(Data, Key) of
+        [{Key, Versions}] ->
+            case [W || W = {Written, _Change} <- Versions, Written =< End] of
+                [] -> true = ets:delete(Data, Key);
+                Kept -> true = ets:insert(Data, {Key, Kept})
+            end;
+        [] ->
+            true
+    end,
+    remove_above(End, Previous, Data, Changes);
+remove_above(_End, _RowAtOrBelowEndOrNoRow, _Data, _Changes) ->
+    ok.
 
 %% ---------------------------------------------------------------------------
 %% Records
@@ -491,11 +537,8 @@ apply_records(State = #state{version = Version, buffer = Buffer}) ->
                 {LSN, _Record} when LSN =< Version ->
                     apply_records(State#state{buffer = gb_trees:delete(LSN, Buffer)});
                 {LSN, {Version, {body, Body}}} ->
-                    State1 = State#state{
-                        version = LSN,
-                        data = write(without_clears(Body, State), LSN, State#state.data),
-                        buffer = gb_trees:delete(LSN, Buffer)
-                    },
+                    ok = write(without_clears(Body, State), LSN, State),
+                    State1 = State#state{version = LSN, buffer = gb_trees:delete(LSN, Buffer)},
                     apply_records(State1);
                 _BodyNotReceivedOrPreviousRecordNotReceived ->
                     answer_waiting(State)
@@ -514,52 +557,65 @@ without_clears({batch, Entries}, #state{clear = false}) ->
 without_clears(Body, _State) ->
     Body.
 
-write({batch, Entries}, LSN, Data) ->
-    lists:foldl(fun(Entry, Acc) -> write_entry(Entry, LSN, Acc) end, Data, Entries);
-write(_NoTransaction, _LSN, Data) ->
-    Data.
+write({batch, Entries}, LSN, State) ->
+    lists:foreach(fun(Entry) -> write_entry(Entry, LSN, State) end, Entries);
+write(_NoTransaction, _LSN, _State) ->
+    ok.
 
 %% Applies the mutations of one transaction, in their order.
-write_entry(Entry, LSN, Data) when is_list(Entry) ->
-    lists:foldl(
+write_entry(Entry, LSN, State = #state{data = Data}) when is_list(Entry) ->
+    lists:foreach(
         fun
-            ({set, Key, Value}, Acc) ->
-                put_version(Key, LSN, {set, Value}, Acc);
-            ({clear, Key}, Acc) ->
-                clear_key(Key, LSN, Acc);
-            ({clear_range, Begin, End}, Acc) ->
-                %% The StorageServer examines every key.
-                lists:foldl(
-                    fun(Key, Acc1) -> clear_key(Key, LSN, Acc1) end,
-                    Acc,
-                    [Key || Key <- maps:keys(Acc), Key >= Begin, Key < End]
-                );
-            (_Other, Acc) ->
-                Acc
+            ({set, Key, Value}) ->
+                put_version(Key, LSN, {set, Value}, ets:lookup(Data, Key), State);
+            ({clear, Key}) ->
+                clear_key(Key, LSN, ets:lookup(Data, Key), State);
+            ({clear_range, Begin, End}) ->
+                %% The rows of the range are read before the first change.
+                lists:foreach(fun(Row = {Key, _Versions}) -> clear_key(Key, LSN, [Row], State) end, rows(Begin, End, Data));
+            (_Other) ->
+                ok
         end,
-        Data,
         Entry
     );
-write_entry(_NoTransaction, _LSN, Data) ->
-    Data.
+write_entry(_NoTransaction, _LSN, _State) ->
+    ok.
 
 %% Adds the version `LSN' of `Key'. `Change' is `{set, Value}' or `clear'.
-%% If a mutation of the same record changed the key before, the new change
-%% replaces that one.
-put_version(Key, LSN, Change, Data) ->
-    case Data of
-        #{Key := [{LSN, _Earlier} | Versions]} -> Data#{Key := [{LSN, Change} | Versions]};
-        #{Key := Versions} -> Data#{Key := [{LSN, Change} | Versions]};
-        _ -> Data#{Key => [{LSN, Change}]}
-    end.
+%% `Row' is the result of the lookup of the key. If a mutation of the same
+%% record changed the key before, the new change replaces that one.
+put_version(Key, LSN, Change, Row, #state{data = Data, changes = Changes}) ->
+    Versions =
+        case Row of
+            [{Key, [{LSN, _Earlier} | Older]}] -> [{LSN, Change} | Older];
+            [{Key, Older}] -> [{LSN, Change} | Older];
+            [] -> [{LSN, Change}]
+        end,
+    true = ets:insert(Data, {Key, Versions}),
+    true = ets:insert(Changes, {{LSN, Key}}),
+    ok.
 
 %% A clear of a key without a value adds no version.
-clear_key(Key, LSN, Data) ->
-    case Data of
-        #{Key := [{_Version, {set, _Value}} | _]} -> put_version(Key, LSN, clear, Data);
-        #{Key := [{LSN, clear}, {_Version, {set, _Value}} | _]} -> Data;
-        _ -> Data
-    end.
+clear_key(Key, LSN, Row = [{Key, [{_Version, {set, _Value}} | _]}], State) ->
+    put_version(Key, LSN, clear, Row, State);
+clear_key(_Key, _LSN, _NoRowOrNoValue, _State) ->
+    ok.
+
+%% The rows of the keys `K' with `Begin =< K' and `K < End', in the order
+%% of the keys. The function reads only these rows and the row after
+%% them.
+rows(Begin, End, Data) ->
+    First =
+        case ets:lookup(Data, Begin) of
+            [Row] -> {Begin, [Row]};
+            [] -> ets:next_lookup(Data, Begin)
+        end,
+    rows_until(First, End, Data).
+
+rows_until({Key, [Row]}, End, Data) when Key < End ->
+    [Row | rows_until(ets:next_lookup(Data, Key), End, Data)];
+rows_until(_RowAtOrAfterEndOrEndOfTable, _End, _Data) ->
+    [].
 
 %% ---------------------------------------------------------------------------
 %% MVCC window
@@ -569,22 +625,37 @@ clear_key(Key, LSN, Data) ->
 %% above the oldest version returns.
 advance_oldest(State = #state{window = infinity}) ->
     State;
-advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, window = Window, data = Data}) ->
+advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, window = Window}) ->
     case min(Version - Window, KCV) of
-        New when New - Oldest >= max(1, Window div 10) ->
-            Pruned = maps:filtermap(
-                fun(_Key, Versions) ->
-                    case prune(Versions, New) of
-                        [] -> false;
-                        Kept -> {true, Kept}
-                    end
-                end,
-                Data
-            ),
-            State#state{oldest = New, data = Pruned};
+        New when New > Oldest ->
+            ok = remove_old(New, ets:first(State#state.changes), State),
+            State#state{oldest = New};
         _ ->
             State
     end.
+
+%% Handles the versions at or below `Oldest', from the lowest version up.
+%% For the key of each such version, the function removes the versions
+%% that no read at or above `Oldest' returns. The row of the version leaves
+%% the table of the versions. The last version of a key at or below
+%% `Oldest' stays in the data without such a row, until a later version of
+%% the key is at or below a later oldest version.
+remove_old(Oldest, {Version, Key} = Row, State = #state{data = Data, changes = Changes}) when Version =< Oldest ->
+    Next = ets:next(Changes, Row),
+    true = ets:delete(Changes, Row),
+    case ets:lookup(Data, Key) of
+        [{Key, Versions}] ->
+            case prune(Versions, Oldest) of
+                [] -> true = ets:delete(Data, Key);
+                Versions -> true;
+                Kept -> true = ets:insert(Data, {Key, Kept})
+            end;
+        [] ->
+            true
+    end,
+    remove_old(Oldest, Next, State);
+remove_old(_Oldest, _RowAboveOldestOrNoRow, _State) ->
+    ok.
 
 %% The versions above `Oldest', and the last version at or below `Oldest'.
 %% The list has the highest version first.
@@ -616,17 +687,19 @@ answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
     lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, State)) end, Ready),
     State#state{waiting = Later}.
 
-%% The StorageServer examines every key for a range. See "Limitations" in
-%% README.md.
-lookup({key, Key}, Version, State) ->
-    lookup_key(Key, Version, State);
-lookup({range, Begin, End}, Version, State = #state{data = Data}) ->
-    Keys = lists:sort([Key || Key <- maps:keys(Data), Key >= Begin, Key < End]),
-    {ok, [{Key, Value, Written} || Key <- Keys, {ok, Value, Written} <- [lookup_key(Key, Version, State)]]}.
-
-lookup_key(Key, Version, #state{data = Data}) ->
-    case [W || W = {Written, _Value} <- maps:get(Key, Data, []), Written =< Version] of
-        [{Written, {set, Value}} | _] -> {ok, Value, Written};
-        [{_Written, clear} | _] -> not_found;
+lookup({key, Key}, Version, #state{data = Data}) ->
+    case ets:lookup(Data, Key) of
+        [{Key, Versions}] -> visible(Versions, Version);
         [] -> not_found
-    end.
+    end;
+lookup({range, Begin, End}, Version, #state{data = Data}) ->
+    {ok, [
+        {Key, Value, Written}
+     || {Key, Versions} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Versions, Version)]
+    ]}.
+
+%% The value of the last version at or below `Version'.
+visible([{Written, {set, Value}} | _], Version) when Written =< Version -> {ok, Value, Written};
+visible([{Written, clear} | _], Version) when Written =< Version -> not_found;
+visible([_Later | Older], Version) -> visible(Older, Version);
+visible([], _Version) -> not_found.

@@ -194,6 +194,38 @@ the range.
 - The Resolver handles the commit versions in their order. A request that
   arrives before the request with the previous version waits.
 
+#### The store of the StorageServer
+
+FoundationDB has an ordered keyspace. Every structure of deadlift that
+holds keys keeps the keys in their order.
+
+- The data of the StorageServer is an ETS table of type `ordered_set`
+  with one row for each key. The row has the versions of the key, with
+  the highest version first.
+- A second ETS table of type `ordered_set` has one row for each version
+  above the oldest version. A rollback examines only the versions that it
+  removes. A rise of the oldest version examines only the versions that
+  leave the MVCC window.
+- The table of the data is readable by other processes.
+  `deadlift_storage:info/1` returns it. No part of deadlift reads it
+  directly yet.
+
+A benchmark on 2026-11-22 compared four stores with 1,000,000 keys of 12
+bytes and values of 100 bytes, on an Apple M4 with Erlang/OTP 28.3. Each
+number is the median of 3 runs. The benchmark is not part of this
+repository.
+
+| Measurement | Unit | `gb_trees` | ETS, one row for each key | ETS, one row for each version | NIF with `std::map` |
+|---|---|---|---|---|---|
+| Read of one key | ns | 1,161 | 1,016 | 1,195 | 1,118 |
+| Read of a range of 1,000 keys | µs | 28 | 242 | 481 | 240 |
+| New version of one key | ns | 2,414 | 1,726 | 1,414 | 884 |
+| Longest single put of 200,000 | µs | 23,658 | 661 | 603 | 676 |
+| Clear of a range of 100 keys | µs | 162 | 78 | 92 | 16 |
+| Reads by 8 processes at the same time | million per second | Not possible | 5.13 | 2.99 | 5.04 |
+
+The owner of the project chose the ETS table with one row for each key.
+
 ### The Proxy
 
 A Proxy commits a batch of transactions in five steps (paper, sections
@@ -297,6 +329,9 @@ writes to a store with versions (paper, sections 2.4.3 and 2.4.4).
   it. The StorageServer applies a record when it has received the body
   from one of the k LogServers that have it. Every 5 s, the
   StorageServer sends each request again, because a message can be lost.
+- The StorageServer keeps the keys in their order, which is the order of
+  Erlang terms. A read or a clear of a key range examines only the keys
+  of the range. See "The store of the StorageServer" below.
 - A transaction has mutations: `{set, Key, Value}`, `{clear, Key}` and
   `{clear_range, Begin, End}`. The StorageServer applies the mutations of
   a transaction in their order. The clear of a key range is a write range
@@ -444,7 +479,7 @@ Results of `make dst` on 2026-11-22:
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
 | No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,378 acknowledged transactions, of which 2,278 with a read range, 1,167 with a clear of keys and 1,973 in a batch with another acknowledged transaction, 9,447 rejected for a conflict, 1,838 too old, 22,088 transactions with reads from the StorageServer, 13 reads below the MVCC window of the StorageServer, 2,278 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,399 acknowledged transactions, of which 442 with a read range, 274 with a clear of keys and 376 in a batch with another acknowledged transaction, 3,252 rejected for a conflict, 3,055 too old, 22,688 transactions with reads from the StorageServer, of which 6,779 from a StorageServer that started after a kill, 504 reads below the MVCC window of the StorageServer, 384 rollbacks of the StorageServer, 6,034 recoveries, 3,264 kills, of which 355 of the StorageServer, 563 partitions |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,408 acknowledged transactions, of which 439 with a read range, 275 with a clear of keys and 378 in a batch with another acknowledged transaction, 3,270 rejected for a conflict, 3,042 too old, 22,681 transactions with reads from the StorageServer, of which 6,801 from a StorageServer that started after a kill, 530 reads below the MVCC window of the StorageServer, 387 rollbacks of the StorageServer, 6,029 recoveries, 3,264 kills, of which 355 of the StorageServer, 564 partitions |
 | Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
 | Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `read_version_order` |
@@ -545,13 +580,12 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   a write that a recovery discards.
 - After a LogServer is stopped, the StorageServer reads the coordinated
   state every 500 ms until the coordinated state has a later epoch.
-- A read of a key range examines every key of the StorageServer.
-- A clear of a key range examines every key of the StorageServer.
+- A read of a key range returns every key of the range. A read has no
+  limit of rows.
+- A read copies each value from the ETS table to the StorageServer, and
+  from the StorageServer to the client.
 - In the simulation, a read that returns no value is accepted when a
   transaction without a known result cleared the key at any version.
-- A rise of the oldest version of the StorageServer examines every key.
-  The oldest version rises in steps of at least one tenth of the MVCC
-  window.
 - The MVCC window of the StorageServer and the MVCC window of the Resolver
   are two options. No part of deadlift checks that they are equal.
 - The simulation has one StorageServer at a time. A new StorageServer
