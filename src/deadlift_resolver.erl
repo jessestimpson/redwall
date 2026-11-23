@@ -70,6 +70,24 @@
 %% epoch (see {@link deadlift_sequencer}). A transaction with a read version
 %% of the previous epoch is therefore too old for the new Resolver.
 %%
+%% == Batch ==
+%%
+%% A request has the transactions of one batch of a Proxy, in the order of
+%% the batch. Every transaction of the batch has the commit version of the
+%% batch. The Resolver checks the transactions in the order of the batch:
+%%
+%% <ul>
+%% <li>A transaction has a conflict if a key that it read was written by an
+%%   earlier transaction of the batch that the Resolver admitted. The
+%%   commit version of the batch is above the read version of every
+%%   transaction of the batch.</li>
+%% <li>The writes of a transaction that the Resolver did not admit give no
+%%   conflict.</li>
+%% </ul>
+%%
+%% The source has the same rules (`checkIntraBatchConflicts' in
+%% `fdbserver/SkipList.cpp').
+%%
 %% == Order ==
 %%
 %% The Resolver handles the commit versions in their order. A request has
@@ -89,8 +107,6 @@
 %%   string.</li>
 %% <li>The Proxy sends no write range. deadlift has no operation that
 %%   clears a range.</li>
-%% <li>A request has one transaction. A request of FoundationDB has a batch
-%%   of transactions with one commit version.</li>
 %% <li>One Resolver handles every key. FoundationDB divides the key space
 %%   over several Resolvers.</li>
 %% </ul>
@@ -101,7 +117,7 @@
 -include("deadlift_eta.hrl").
 
 -export([start/1, start_link/1, stop/1, ref/1]).
--export([new/1, check/3]).
+-export([new/1, check/3, check_batch/3]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
 -export_type([options/0, transaction/0, key_range/0, result/0, history/0]).
@@ -114,13 +130,15 @@
 %% `infinity'. Two options plant a defect for the simulation. With
 %% `check => false' the Resolver admits every transaction. With
 %% `check_ranges => false' the Resolver does not check the read ranges of a
-%% transaction.
+%% transaction. With `check_batch => false' the Resolver does not check a
+%% transaction against the earlier transactions of its batch.
 -type options() :: #{
     epoch := epoch(),
     version := version(),
     mvcc_window => pos_integer() | infinity,
     check => boolean(),
-    check_ranges => boolean()
+    check_ranges => boolean(),
+    check_batch => boolean()
 }.
 
 -type key_range() :: {Begin :: term(), End :: term()}.
@@ -153,9 +171,10 @@
     history :: history(),
     check :: boolean(),
     check_ranges :: boolean(),
-    %% PreviousVersion -> {Version, Transaction, Callers}: the requests that
+    check_batch :: boolean(),
+    %% PreviousVersion -> {Version, Transactions, Callers}: the requests that
     %% wait for the request with the previous version.
-    waiting = #{} :: #{version() => {version(), transaction(), [gen_server:from()]}}
+    waiting = #{} :: #{version() => {version(), [transaction()], [gen_server:from()]}}
 }).
 
 %% ---------------------------------------------------------------------------
@@ -177,8 +196,9 @@ stop(Resolver) ->
     gen_server:call(Resolver, stop).
 
 %% @doc The process of the Resolver of `Epoch', or `undefined'. A Proxy
-%% sends the request `{resolve, Epoch, Prev, Version, Transaction}' to this
-%% process. The answer is a `result()', or `{error, {epoch, Epoch}}'.
+%% sends the request `{resolve, Epoch, Prev, Version, Transactions}' to
+%% this process, with the transactions of one batch. The answer is a list
+%% with one `result()' for each transaction, or `{error, {epoch, Epoch}}'.
 -spec ref(epoch()) -> pid() | undefined.
 ref(Epoch) ->
     deadlift_registry:whereis({resolver, Epoch}).
@@ -221,6 +241,13 @@ check(Transaction = #{read_version := ReadVersion}, Version, History) ->
             _ -> LastCommit
         end,
     {Result, History#{last_commit := LastCommit1, oldest := NewOldest}}.
+
+%% @doc Checks the transactions of one batch, in their order, with the
+%% commit version `Version'. Returns one result for each transaction, and
+%% the history after the batch.
+-spec check_batch([transaction()], version(), history()) -> {[result()], history()}.
+check_batch(Transactions, Version, History) ->
+    lists:mapfoldl(fun(Transaction, Acc) -> check(Transaction, Version, Acc) end, History, Transactions).
 
 %% The keys and the ranges of a transaction as intervals of bounds. A range
 %% without a key gives no interval.
@@ -301,14 +328,15 @@ init(Options = #{epoch := Epoch, version := Version}) ->
                 version = Version,
                 history = new(maps:get(mvcc_window, Options, infinity)),
                 check = maps:get(check, Options, true),
-                check_ranges = maps:get(check_ranges, Options, true)
+                check_ranges = maps:get(check_ranges, Options, true),
+                check_batch = maps:get(check_batch, Options, true)
             }};
         no ->
             {stop, {already_registered, Epoch}}
     end.
 
 %% @private
-handle_call({resolve, Epoch, _Prev, _Version, _Transaction}, _From, State = #state{epoch = Mine}) when Epoch =/= Mine ->
+handle_call({resolve, Epoch, _Prev, _Version, _Transactions}, _From, State = #state{epoch = Mine}) when Epoch =/= Mine ->
     {reply, {error, {epoch, Mine}}, State};
 handle_call({resolve, _Epoch, Prev, Version, Transaction}, From, State = #state{version = Prev}) when Version > Prev ->
     {Result, State1} = resolve(Version, Transaction, State),
@@ -324,7 +352,7 @@ handle_call({resolve, _Epoch, Prev, Version, Transaction}, From, State = #state{
         _ ->
             {noreply, State#state{waiting = Waiting#{Prev => {Version, Transaction, [From]}}}}
     end;
-handle_call({resolve, _Epoch, _Prev, Version, _Transaction}, _From, State) ->
+handle_call({resolve, _Epoch, _Prev, Version, _Transactions}, _From, State) ->
     %% A version that the Resolver has handled. The Resolver does not keep
     %% the result of a transaction.
     {reply, {error, {handled, Version}}, State};
@@ -335,23 +363,36 @@ handle_call(stop, _From, State) ->
 handle_cast(_Message, State) ->
     {noreply, State}.
 
-resolve(Version, Transaction0, State = #state{history = History, check = Check, check_ranges = CheckRanges}) ->
-    Transaction =
+resolve(Version, Transactions0, State = #state{history = History}) ->
+    #state{check = Check, check_ranges = CheckRanges, check_batch = CheckBatch} = State,
+    Transactions =
         case CheckRanges of
-            true -> Transaction0;
+            true -> Transactions0;
             %% The planted defect: the read ranges are not checked.
-            false -> Transaction0#{read_ranges => []}
+            false -> [Transaction#{read_ranges => []} || Transaction <- Transactions0]
         end,
-    {Result0, History1} = check(Transaction, Version, History),
-    case Check of
-        true ->
-            {Result0, State#state{version = Version, history = History1}};
-        false ->
-            %% The planted defect: every transaction is admitted, and its
-            %% writes are recorded.
-            {_, History2} = check(Transaction#{reads := [], read_ranges => []}, Version, History),
-            {committed, State#state{version = Version, history = History2}}
-    end.
+    WithoutReads = fun(Transaction) -> Transaction#{reads := [], read_ranges => []} end,
+    {Results, History1} =
+        case {Check, CheckBatch} of
+            {true, true} ->
+                check_batch(Transactions, Version, History);
+            {false, _} ->
+                %% The planted defect: every transaction is admitted, and
+                %% its writes are recorded.
+                check_batch([WithoutReads(Transaction) || Transaction <- Transactions], Version, History);
+            {true, false} ->
+                %% The planted defect: each transaction is checked against
+                %% the history before the batch. The writes of the admitted
+                %% transactions are recorded after the checks.
+                Checked = [{element(1, check(Transaction, Version, History)), Transaction} || Transaction <- Transactions],
+                Admitted = [WithoutReads(Transaction) || {committed, Transaction} <- Checked],
+                {_, History2} = check_batch(Admitted, Version, History),
+                %% The oldest version rises also when no transaction is
+                %% admitted.
+                {_, History3} = check(#{read_version => 0, reads => [], writes => []}, Version, History2),
+                {[Result || {Result, _Transaction} <- Checked], History3}
+        end,
+    {Results, State#state{version = Version, history = History1}}.
 
 %% Handles the waiting requests whose previous version is now the last
 %% version.

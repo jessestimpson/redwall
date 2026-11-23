@@ -7,10 +7,10 @@ cd "$(dirname "$0")"
 
 QUICK_PASS="RecoverySafe RecoveryReads RecoveryStorage ResolverSafe ResolverSafeThreeEpochs ResolverSmallestGap"
 # Planted bugs: each config must produce a counterexample.
-QUICK_FAIL="RecoveryAckReplicasOnly RecoveryFewReplies RecoveryNoCas RecoveryNoReport RecoveryFewConfirms RecoveryNoRollback RecoveryNoInFlightLimit ResolverNoCheck ResolverNoGap"
+QUICK_FAIL="RecoveryAckReplicasOnly RecoveryFewReplies RecoveryNoCas RecoveryNoReport RecoveryFewConfirms RecoveryNoRollback RecoveryNoInFlightLimit ResolverNoCheck ResolverNoBatchCheck ResolverNoGap"
 # Reachability: each config must reach the state that the invariant of the
 # config says is never reached.
-QUICK_REACH="RecoveryReachThirdEpoch RecoveryReachDiscard RecoveryReachCopy RecoveryReachRollback RecoveryReachReadSecondEpoch RecoveryReachStoreSecondEpoch ResolverReachConflict ResolverReachTooOldInEpoch ResolverReachTooOldAcrossEpochs ResolverReachCommitSecondEpoch"
+QUICK_REACH="RecoveryReachThirdEpoch RecoveryReachDiscard RecoveryReachCopy RecoveryReachRollback RecoveryReachReadSecondEpoch RecoveryReachStoreSecondEpoch ResolverReachConflict ResolverReachTooOldInEpoch ResolverReachTooOldAcrossEpochs ResolverReachCommitSecondEpoch ResolverReachTwoInBatch ResolverReachConflictInBatch"
 LONG_PASS="RecoverySafeThreeEpochs RecoveryStorageThreeEpochs"
 
 run() { # expectation configs...

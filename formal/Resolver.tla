@@ -19,6 +19,8 @@
 (*     write keys.                                                         *)
 (*   - commit versions that rise by 1 to MaxStep, as the clock does in     *)
 (*     deadlift.                                                           *)
+(*   - batches: several transactions with one commit version. The Resolver *)
+(*     checks them in the order of the batch.                              *)
 (*   - the start of a new epoch: a Resolver without history, and a first   *)
 (*     version that is Gap above the last version.                         *)
 (*                                                                         *)
@@ -42,8 +44,10 @@ CONSTANTS
     Gap,         \* the first version of an epoch is the last version of
                  \*   the previous epoch plus Gap. A Gap below Window - 1
                  \*   is unsafe.
-    Check        \* TRUE: the Resolver checks the read keys. FALSE is
+    Check,       \* TRUE: the Resolver checks the read keys. FALSE is
                  \*   unsafe.
+    CheckBatch   \* TRUE: the Resolver checks a transaction against the
+                 \*   earlier transactions of its batch. FALSE is unsafe.
 
 Versions == 0..MaxVersion
 
@@ -59,10 +63,19 @@ VARIABLES
     reads,       \* reads[t]: the read keys
     writes,      \* writes[t]: the write keys
     commitVersion, \* commitVersion[t], or 0
-    commitEpoch  \* commitEpoch[t]: the epoch of the commit, or 0
+    commitEpoch, \* commitEpoch[t]: the epoch of the commit, or 0
+    batchOpen,   \* TRUE: the version `last' is the version of a batch of
+                 \*   a Proxy, and another transaction can join the batch
+    base,        \* lastCommit before the first transaction of the batch
+    count,       \* the number of transactions that the Resolver has
+                 \*   checked
+    order        \* order[t]: the value of count when the Resolver checked
+                 \*   t, or 0. Of two transactions with one commit
+                 \*   version, the one with the lower order is the earlier
+                 \*   one in the batch.
 
 vars == <<epoch, last, lastCommit, oldest, status, readVersion, reads,
-          writes, commitVersion, commitEpoch>>
+          writes, commitVersion, commitEpoch, batchOpen, base, count, order>>
 
 TypeOK ==
     /\ epoch \in 1..MaxEpoch
@@ -75,6 +88,10 @@ TypeOK ==
     /\ writes \in [Txns -> SUBSET Keys]
     /\ commitVersion \in [Txns -> Versions]
     /\ commitEpoch \in [Txns -> 0..MaxEpoch]
+    /\ batchOpen \in BOOLEAN
+    /\ base \in [Keys -> Versions]
+    /\ count \in 0..Cardinality(Txns)
+    /\ order \in [Txns -> 0..Cardinality(Txns)]
 
 \* Version 1 is the recovery transaction of epoch 1.
 Init ==
@@ -88,6 +105,10 @@ Init ==
     /\ writes = [t \in Txns |-> {}]
     /\ commitVersion = [t \in Txns |-> 0]
     /\ commitEpoch = [t \in Txns |-> 0]
+    /\ batchOpen = FALSE
+    /\ base = [k \in Keys |-> 0]
+    /\ count = 0
+    /\ order = [t \in Txns |-> 0]
 
 \* A client starts transaction t with the read keys R and the write keys W.
 \* The read version is the last commit version. In deadlift, a Proxy
@@ -101,7 +122,7 @@ Begin(t, R, W) ==
     /\ readVersion' = [readVersion EXCEPT ![t] = last]
     /\ reads' = [reads EXCEPT ![t] = R]
     /\ writes' = [writes EXCEPT ![t] = W]
-    /\ UNCHANGED <<epoch, last, lastCommit, oldest, commitVersion, commitEpoch>>
+    /\ UNCHANGED <<epoch, last, lastCommit, oldest, commitVersion, commitEpoch, batchOpen, base, count, order>>
 
 \* The Sequencer assigns the commit version last + d to transaction t, and
 \* the Resolver of the epoch checks the transaction. Algorithm 1, with the
@@ -111,17 +132,27 @@ Begin(t, R, W) ==
 \*     version is too old;
 \*   - the Resolver removes the entries of lastCommit below the oldest
 \*     version.
+\*
+\* With d = 0, the transaction joins the batch of the last commit version.
+\* The Resolver checks it after the earlier transactions of the batch. The
+\* recovery transaction is a batch of the Sequencer, and no transaction
+\* joins it. With CheckBatch = FALSE, the Resolver checks the transaction
+\* against lastCommit before the batch.
 Commit(t, d) ==
     /\ status[t] = "open"
     /\ last + d <= MaxVersion
+    /\ d = 0 => batchOpen
     /\ LET v == last + d
            newOldest == IF v > Window /\ v - Window > oldest THEN v - Window ELSE oldest
            kept == [k \in Keys |-> IF lastCommit[k] < newOldest THEN 0 ELSE lastCommit[k]]
+           before == IF d = 0 THEN base ELSE kept
+           seen == IF CheckBatch THEN kept ELSE before
            result ==
                IF readVersion[t] < newOldest /\ reads[t] # {} THEN "too_old"
-               ELSE IF Check /\ \E k \in reads[t] : kept[k] > readVersion[t] THEN "conflict"
+               ELSE IF Check /\ \E k \in reads[t] : seen[k] > readVersion[t] THEN "conflict"
                ELSE "committed"
        IN
+        /\ base' = before
         /\ last' = v
         /\ oldest' = newOldest
         /\ lastCommit' = IF result = "committed"
@@ -130,6 +161,9 @@ Commit(t, d) ==
         /\ status' = [status EXCEPT ![t] = result]
         /\ commitVersion' = [commitVersion EXCEPT ![t] = v]
         /\ commitEpoch' = [commitEpoch EXCEPT ![t] = epoch]
+    /\ batchOpen' = TRUE
+    /\ count' = count + 1
+    /\ order' = [order EXCEPT ![t] = count + 1]
     /\ UNCHANGED <<epoch, readVersion, reads, writes>>
 
 \* A recovery starts a new epoch. The Resolver of the new epoch has no
@@ -143,11 +177,13 @@ NewEpoch ==
         /\ oldest' = IF v > Window THEN v - Window ELSE 0
     /\ epoch' = epoch + 1
     /\ lastCommit' = [k \in Keys |-> 0]
-    /\ UNCHANGED <<status, readVersion, reads, writes, commitVersion, commitEpoch>>
+    /\ batchOpen' = FALSE
+    /\ base' = [k \in Keys |-> 0]
+    /\ UNCHANGED <<status, readVersion, reads, writes, commitVersion, commitEpoch, count, order>>
 
 Next ==
     \/ \E t \in Txns, R \in SUBSET Keys, W \in SUBSET Keys : Begin(t, R, W)
-    \/ \E t \in Txns, d \in 1..MaxStep : Commit(t, d)
+    \/ \E t \in Txns, d \in 0..MaxStep : Commit(t, d)
     \/ NewEpoch
 
 Spec == Init /\ [][Next]_vars
@@ -157,16 +193,18 @@ Spec == Init /\ [][Next]_vars
 
 \* No committed transaction read a key that another committed transaction
 \* wrote at a commit version above the read version of the first
-\* transaction and below its commit version. With this property, the
-\* committed transactions are serializable in the order of the commit
-\* versions (paper, section 2.4.2).
+\* transaction and below its commit version, or at its commit version and
+\* earlier in the batch. With this property, the committed transactions
+\* are serializable in the order of the commit versions and, for one
+\* commit version, in the order of the batch (paper, section 2.4.2).
 NoConflict ==
     \A t, u \in Txns :
         (/\ t # u
          /\ status[t] = "committed"
          /\ status[u] = "committed"
          /\ commitVersion[u] > readVersion[t]
-         /\ commitVersion[u] < commitVersion[t])
+         /\ \/ commitVersion[u] < commitVersion[t]
+            \/ commitVersion[u] = commitVersion[t] /\ order[u] < order[t])
         => reads[t] \cap writes[u] = {}
 
 \* A transaction without read keys is never rejected.

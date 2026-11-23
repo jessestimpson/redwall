@@ -66,7 +66,8 @@
 %% <li>`durable' - when an epoch has ended, every LSN that a client
 %%   received as committed in that epoch is at or below the Recovery
 %%   Version that ended the epoch. This is `Durable' of the model.</li>
-%% <li>`unique_versions' - no LSN is acknowledged in two epochs or to two
+%% <li>`unique_versions' - no LSN is acknowledged in two epochs, and no
+%%   pair of an LSN and an index in a batch is acknowledged to two
 %%   clients. This is `UniqueVersions' of the model.</li>
 %% <li>`no_loss' - no recovery ends with `missing_body'. This is `NoLoss'
 %%   of the model.</li>
@@ -78,8 +79,9 @@
 %% <li>`no_conflict' - no acknowledged transaction read a key, alone or in
 %%   a key range, that another
 %%   acknowledged transaction wrote at a commit version above the read
-%%   version of the first transaction and below its commit version. This is
-%%   the guarantee of the Resolver.</li>
+%%   version of the first transaction and below its commit version, or
+%%   at its commit version with a lower index in the batch. This is the
+%%   guarantee of the Resolver.</li>
 %% <li>`read_version_order' - a read version is at or above the commit
 %%   version of every transaction that was acknowledged before the client
 %%   asked for the read version, in any epoch. The harness checks every
@@ -87,7 +89,8 @@
 %%   must not give a read version.</li>
 %% <li>`read_value' - a read of a key at a read version returns the write
 %%   of the acknowledged transaction with the highest commit version at or
-%%   below the read version, or a write with a higher commit version at or
+%%   below the read version, and with the highest index among the
+%%   transactions of that version, or a write with a higher commit version at or
 %%   below the read version whose client received no answer. The read
 %%   returns `not_found' only if no acknowledged transaction wrote the key
 %%   at or below the read version.</li>
@@ -116,6 +119,8 @@
 %% <li>`no_check' - the Resolver admits every transaction.</li>
 %% <li>`no_range_check' - the Resolver does not check the read ranges of a
 %%   transaction.</li>
+%% <li>`no_batch_check' - the Resolver does not check a transaction
+%%   against the earlier transactions of its batch.</li>
 %% <li>`no_gap' - the first commit version of an epoch is the Recovery
 %%   Version plus 1. The Resolver of the new epoch then admits a
 %%   transaction with a read version of the previous epoch.</li>
@@ -304,7 +309,7 @@ check(#{tab := Tab, cstate := CState, storage := Storage}) ->
     Logs = logs(),
     first_violation([
         fun() -> no_loss(Tab) end,
-        fun() -> unique_versions(Acks) end,
+        fun() -> unique_versions(Tab, Acks) end,
         fun() -> durable(Acks, CState) end,
         fun() -> body_available(Acks, Logs) end,
         fun() -> copied(Tab, Acks, CState, Logs) end,
@@ -378,6 +383,11 @@ record_stats(Tab) ->
     bump(too_old, length(ets:match(Tab, {{rejected, '_'}, transaction_too_old}))),
     bump(no_read_version, length(ets:match(Tab, {{no_read_version, '_'}, '_'}))),
     bump(no_read, length(ets:match(Tab, {{no_read, '_'}, '_'}))),
+    %% The acknowledged transactions that have their LSN together with
+    %% another acknowledged transaction.
+    LSNs = [LSN || [LSN] <- ets:match(Tab, {{ack, '_'}, '_', '$1'})],
+    Repeated = LSNs -- lists:usort(LSNs),
+    bump(batched, length([LSN || LSN <- LSNs, lists:member(LSN, Repeated)])),
     bump(reads, length([x || [#{values := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
     bump(range_reads, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
     %% The acknowledged transactions with a read range.
@@ -407,13 +417,22 @@ no_loss(Tab) ->
         [Reason | _] -> violation(no_loss, #{reason => Reason})
     end.
 
-unique_versions(Acks) ->
+unique_versions(Tab, Acks) ->
     ByLSN = lists:foldl(
-        fun({C, Epoch, LSN}, Acc) -> maps:update_with(LSN, fun(L) -> [{Epoch, C} | L] end, [{Epoch, C}], Acc) end,
+        fun({C, Epoch, LSN}, Acc) ->
+            [{_, #{index := Index}}] = ets:lookup(Tab, {txn, C}),
+            maps:update_with(LSN, fun(L) -> [{Epoch, Index, C} | L] end, [{Epoch, Index, C}], Acc)
+        end,
         #{},
         Acks
     ),
-    case [{LSN, Who} || {LSN, Who = [_, _ | _]} <- maps:to_list(ByLSN)] of
+    %% The acknowledgements of one LSN have one epoch, and each has its own
+    %% index.
+    Same = fun(Who) ->
+        length(lists:usort([Epoch || {Epoch, _Index, _C} <- Who])) > 1 orelse
+            length(lists:usort([Index || {_Epoch, Index, _C} <- Who])) < length(Who)
+    end,
+    case [{LSN, Who} || {LSN, Who = [_, _ | _]} <- maps:to_list(ByLSN), Same(Who)] of
         [] -> ok;
         [{LSN, Who} | _] -> violation(unique_versions, #{lsn => LSN, acknowledged => lists:sort(Who)})
     end.
@@ -434,10 +453,7 @@ body_available(Acks, Logs) ->
         not lists:any(
             fun
                 ({{E, _Index}, #{records := Records}}) when E =:= Epoch ->
-                    case gb_trees:lookup(LSN, Records) of
-                        {value, {_Prev, {body, [{_Key, {client, C}} | _]}}} -> true;
-                        _ -> false
-                    end;
+                    has_body(LSN, C, Records);
                 (_) ->
                     false
             end,
@@ -475,9 +491,17 @@ copied(Tab, Acks, CState, Logs) ->
         [{C, Epoch, LSN, Id} | _] -> violation(copied, #{client => C, epoch => Epoch, lsn => LSN, log => Id})
     end.
 
+%% The record `LSN' has a body with an entry of the client `C'.
 has_body(LSN, C, Records) ->
     case gb_trees:lookup(LSN, Records) of
-        {value, {_Prev, {body, [{_Key, {client, C}} | _]}}} -> true;
+        {value, {_Prev, {body, {batch, Entries}}}} -> 
+            lists:any(
+                fun
+                    ([{_Key, {client, Writer}} | _]) -> Writer =:= C;
+                    (_Other) -> false
+                end,
+                Entries
+            );
         _ -> false
     end.
 
@@ -509,10 +533,11 @@ transactions(Tab, Acks) ->
 no_conflict(Txns) ->
     Conflicts = [
         {T, W}
-     || T = #{read_version := ReadVersion, version := Version, reads := Reads} <- Txns,
-        W = #{version := Written, writes := Writes} <- Txns,
+     || T = #{read_version := ReadVersion, version := Version, index := Index, reads := Reads} <- Txns,
+        W = #{version := Written, index := WriterIndex, writes := Writes} <- Txns,
         Written > ReadVersion,
-        Written < Version,
+        %% An earlier version, or an earlier transaction of the batch.
+        {Written, WriterIndex} < {Version, Index},
         Writes -- (Writes -- Reads) =/= []
     ],
     case Conflicts of
@@ -520,8 +545,8 @@ no_conflict(Txns) ->
             ok;
         [{T, W} | _] ->
             violation(no_conflict, #{
-                reader => maps:with([client, epoch, read_version, version, reads], T),
-                writer => maps:with([client, epoch, version, writes], W)
+                reader => maps:with([client, epoch, read_version, version, index, reads], T),
+                writer => maps:with([client, epoch, version, index, writes], W)
             })
     end.
 
@@ -581,7 +606,15 @@ wrong_value(Key, {{client, Writer}, Written}, ReadVersion, ByClient, Txns) ->
             _ ->
                 []
         end ++
-        [{missed, maps:with([client, epoch, version], T)} || T <- writers(Key, Written, ReadVersion, Txns)].
+        [{missed, maps:with([client, epoch, version], T)} || T <- writers(Key, Written, ReadVersion, Txns)] ++
+        %% An acknowledged transaction of the same batch, after the writer.
+        [
+            {missed_in_batch, maps:with([client, epoch, version, index], T)}
+         || #{Writer := #{version := Version, index := Index}} <- [ByClient],
+            Version =:= Written,
+            T = #{index := Later} <- writers(Key, Written - 1, Written, Txns),
+            Later > Index
+        ].
 
 %% The acknowledged transactions that wrote `Key' at a commit version above
 %% `After' and at or below `UpTo'.

@@ -78,6 +78,7 @@ model one request. The Proxy answers when the Sequencer has answered and
 | Resolver | One for each epoch, with `lastCommit` of Algorithm 1 and the oldest version of the MVCC window |
 | Transaction | A read version, a set of read keys and a set of write keys |
 | Commit version | 1 to `MaxStep` above the last one, as with the clock of deadlift |
+| Batch | A transaction can join the batch of the last commit version. The Resolver checks the transactions of a batch in their order |
 | New epoch | A Resolver without history. The first version is the last version plus `Gap` |
 
 The model assumes that a recovery keeps every record. It does not contain
@@ -100,7 +101,7 @@ version for each key, for 3,000 random transactions.
 | Recovery | `ReadVersionOrder` | A read version is at or above every LSN that was acknowledged, in any epoch, before the client asked |
 | Recovery | `StorageSafe` | When the StorageServer has the version of a read version, it has no record of a client at or below that version that a recovery discarded |
 | Recovery | `StorageComplete` | At that time the StorageServer has every acknowledged record at or below that version |
-| Resolver | `NoConflict` | No committed transaction read a key that another committed transaction wrote between the read version and the commit version of the first one |
+| Resolver | `NoConflict` | No committed transaction read a key that another committed transaction wrote between the read version and the commit version of the first one, or at that commit version and earlier in the batch |
 | Resolver | `BlindWritesCommit` | A transaction without read keys is never rejected |
 
 ## Configs and results
@@ -119,9 +120,9 @@ processors, on 2026-11-22.
 | `RecoveryStorage` | 2 epochs, 6 versions | `StorageSafe`, `StorageComplete`, `BelowNextEpoch` | 3,580,158 | 37 s |
 | `RecoverySafeThreeEpochs` | 3 epochs, 6 versions | As `RecoverySafe` | 48,258,908 | 19 min 5 s |
 | `RecoveryStorageThreeEpochs` | 3 epochs, 6 versions | As `RecoveryStorage` | 713,242,009 | 3 h 34 min |
-| `ResolverSafe` | 2 epochs, 11 versions, `Gap` 3 | `NoConflict`, `BlindWritesCommit` | 597,573 | 2 s |
-| `ResolverSafeThreeEpochs` | 3 epochs, 15 versions, `Gap` 3 | As `ResolverSafe` | 2,871,577 | 7 s |
-| `ResolverSmallestGap` | 2 epochs, 10 versions, `Gap` 2 | As `ResolverSafe` | 597,573 | 2 s |
+| `ResolverSafe` | 2 epochs, 11 versions, `Gap` 3 | `NoConflict`, `BlindWritesCommit` | 970,557 | 3 s |
+| `ResolverSafeThreeEpochs` | 3 epochs, 15 versions, `Gap` 3 | As `ResolverSafe` | 4,445,361 | 14 s |
+| `ResolverSmallestGap` | 2 epochs, 10 versions, `Gap` 2 | As `ResolverSafe` | 970,557 | 3 s |
 
 Every config also checks `TypeOK`.
 
@@ -139,6 +140,7 @@ Each config must produce a counterexample.
 | `RecoveryNoRollback` | `Rollback = FALSE` | `StorageSafe` | 1 s |
 | `RecoveryNoInFlightLimit` | `LimitInFlight = FALSE` | `StorageSafe` | 5 s |
 | `ResolverNoCheck` | `Check = FALSE` | `NoConflict` | under 1 s |
+| `ResolverNoBatchCheck` | `CheckBatch = FALSE` | `NoConflict` | under 1 s |
 | `ResolverNoGap` | `Gap = 1` with a window of 3 | `NoConflict` | under 1 s |
 
 - **`RecoveryAckReplicasOnly`**. A Proxy answers a client after the `K`
@@ -172,6 +174,9 @@ Each config must produce a counterexample.
   defect before the model had a StorageServer.
 - **`ResolverNoCheck`**. The Resolver admits a transaction that read a
   key below a later write.
+- **`ResolverNoBatchCheck`**. Two transactions of one batch read and write
+  one key. The Resolver checks both against the versions before the batch,
+  and admits both.
 - **`ResolverNoGap`**. The Resolver of the new epoch has no history, and
   the read version of a transaction of the previous epoch is inside the
   MVCC window. The Resolver admits the transaction.
@@ -201,8 +206,10 @@ Each config must reach the state that its invariant says is never reached.
 | `ResolverReachTooOldInEpoch` | The Resolver rejects a transaction as too old in the epoch of its read version |
 | `ResolverReachTooOldAcrossEpochs` | The Resolver of a later epoch rejects a transaction with a read version of an earlier epoch as too old |
 | `ResolverReachCommitSecondEpoch` | A transaction with read keys commits in the second epoch |
+| `ResolverReachTwoInBatch` | Two transactions of one batch commit |
+| `ResolverReachConflictInBatch` | The Resolver rejects a transaction for a conflict with an earlier transaction of its batch, and for no other reason |
 
-All 10 configs reach their state in 1 s or less.
+All 12 configs reach their state in 1 s or less.
 
 ### A finding of the model
 
@@ -219,7 +226,7 @@ invariant now applies to the records of clients, and the comments in
 ```
 ./check.sh RecoverySafe            # one config that must pass
 ./check.sh RecoveryNoCas fail      # one config that must find a violation
-./check_all.sh resolver            # the Resolver configs, about 15 seconds
+./check_all.sh resolver            # the Resolver configs, about 30 seconds
 ./check_all.sh recovery            # the quick Recovery configs, about 5 minutes
 ./check_all.sh quick               # resolver and recovery
 ./check_all.sh long                # the Recovery configs with 3 epochs, about 4 hours
@@ -234,7 +241,7 @@ every config. The rule is:
 |---|---|---|
 | Code, tests or documents, and no file in `formal/` | None | 0 |
 | A comment in a model | None | 0 |
-| `Resolver.tla` or `MCResolver.tla` | `./check_all.sh resolver` | about 15 seconds |
+| `Resolver.tla` or `MCResolver.tla` | `./check_all.sh resolver` | about 30 seconds |
 | `Recovery.tla` or `MCRecovery.tla` | `./check_all.sh recovery` | about 5 minutes |
 | `Recovery.tla`, before the end of a milestone or before a release | `./check_all.sh long`, as a background job | about 4 hours |
 

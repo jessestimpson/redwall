@@ -8,6 +8,7 @@ storage_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun(Ids) -> {timeout, 30, fun() -> reads(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> read_waits(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> batch(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> epochs(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> rollback(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end
@@ -94,6 +95,31 @@ reads(Ids) ->
     ?assertEqual(not_found, deadlift_storage:read(Storage, x, 1)),
     ok = await_version(Storage, 5),
     ?assertMatch(#{version := 5, epoch := 1, rollbacks := 0}, deadlift_storage:info(Storage)).
+
+%% Two transactions of one batch write the key `x'. A read returns the
+%% write of the transaction with the higher index.
+batch(Ids) ->
+    Options = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0},
+    {ok, Sequencer} = deadlift_sequencer:start(Options),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300}),
+    Storage = storage(Ids),
+    Self = self(),
+    Clients = [
+        spawn_link(fun() -> Self ! {self(), deadlift_proxy:commit_with_index(Proxy, #{writes => [{x, N}, {N, N}]}, 5000)} end)
+     || N <- [1, 2, 3]
+    ],
+    Answers = [
+        receive
+            {Client, Answer} -> Answer
+        after 5000 -> error(no_answer)
+        end
+     || Client <- Clients
+    ],
+    ?assertEqual([{ok, 2, 0}, {ok, 2, 1}, {ok, 2, 2}], lists:sort(Answers)),
+    [Last] = [N || {N, {ok, 2, 2}} <- lists:zip([1, 2, 3], Answers)],
+    ?assertEqual({ok, Last, 2}, deadlift_storage:read_with_version(Storage, x, 2, 5000)),
+    ?assertEqual({ok, [{1, 1}, {2, 2}, {3, 3}]}, deadlift_storage:read_range(Storage, 1, 4, 2)),
+    ?assertEqual(not_found, deadlift_storage:read(Storage, x, 1)).
 
 %% A read at a version that the StorageServer does not have waits for the
 %% version.

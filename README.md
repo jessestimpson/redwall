@@ -186,6 +186,9 @@ the range.
   range.
 - A transaction with read keys or read ranges and a read version below
   the MVCC window is too old.
+- A request has the transactions of one batch of the Proxy. The Resolver
+  checks them in the order of the batch. A transaction has a conflict
+  with an earlier transaction of the batch that the Resolver admitted.
 - `deadlift_storage:read_range/4` reads the keys of a range at a read
   version.
 - The Resolver handles the commit versions in their order. A request that
@@ -193,22 +196,51 @@ the range.
 
 ### The Proxy
 
-A Proxy commits a transaction in five steps (paper, sections 2.4.1 and
-2.4.3):
+A Proxy commits a batch of transactions in five steps (paper, sections
+2.4.1 and 2.4.3):
 
-1. The Proxy asks the Sequencer for an LSN and the previous LSN.
+1. When the Proxy closes a batch, it asks the Sequencer for an LSN and
+   the previous LSN.
 2. The Proxy sends the read version, the read keys, the read ranges and
-   the write keys to the Resolver. If the Resolver rejects the transaction, the Proxy
-   answers the client with an error.
-3. The Proxy sends the record to every LogServer of the epoch. The k
-   LogServers that replicate the record receive the body.
+   the write keys of each transaction of the batch to the Resolver. If
+   the Resolver rejects a transaction, the Proxy answers the client of
+   that transaction with an error.
+3. The Proxy sends one record to every LogServer of the epoch. The record
+   has the writes of the admitted transactions, in the order of the
+   batch. The k LogServers that replicate the record receive the body.
 4. When every LogServer of the epoch has answered, the Proxy raises its
    KCV to the LSN and reports the LSN to the Sequencer as committed.
-5. When the Sequencer has answered, the Proxy answers the client.
+5. When the Sequencer has answered, the Proxy answers the clients of the
+   admitted transactions.
 
-The Proxy also sends a record for a rejected transaction, without the
-writes. A LogServer stores a record only after the record with the
+The Proxy also sends the record when the Resolver admitted no transaction
+of the batch. A LogServer stores a record only after the record with the
 previous LSN, so every LSN must reach the LogServers.
+
+#### Batches
+
+The Proxy collects the transactions of a short time into one batch
+(paper, section 2.4.1). A batch has one commit version and is one log
+record.
+
+| Rule | In deadlift | In the FoundationDB source |
+|---|---|---|
+| A batch closes after a time | `batch_ms`, default 1 ms, fixed | A time that changes with the load (`commitBatcher` in `fdbserver/CommitProxyServer.actor.cpp`) |
+| A batch closes at a number of transactions | `batch_max`, default 1,000 | `COMMIT_TRANSACTION_BATCH_COUNT_MAX` |
+| A batch closes at a number of bytes | No limit | A limit that depends on the number of CommitProxies |
+| One commit version for each batch | Yes | Yes (`preresolutionProcessing`) |
+| The Resolver checks a transaction against the earlier admitted transactions of its batch | Yes | Yes (`checkIntraBatchConflicts` in `fdbserver/SkipList.cpp`) |
+| The writes of a rejected transaction give no conflict | Yes | Yes |
+
+- The index of a transaction is its position in the batch, from 0.
+  `deadlift_proxy:commit_with_index/3` returns the LSN and the index. The
+  pair of the LSN and the index gives the order of all committed
+  transactions.
+- When two transactions of a batch write one key, the StorageServer keeps
+  the value of the transaction with the higher index.
+- The rules in the table are taken from the named functions of
+  FoundationDB 7.3. The default values of the knobs of FoundationDB are
+  not taken from the source.
 
 Because of step 4, the Sequencer knows that an LSN is committed before any
 client does. A client that starts after an answer gets a read version at
@@ -328,9 +360,8 @@ through the registry. They send a request only to a LogServer that runs.
 - A registry on each node finds the process of a LogServer. In
   FoundationDB the ClusterController has this function. This part is not
   in the paper.
-- The Proxy sends one record for each commit, and the Resolver checks one
-  transaction for each request. FoundationDB collects transactions into a
-  batch with one commit version.
+- The time of a batch is fixed, and a batch has no limit in bytes. The
+  time of a batch of FoundationDB changes with the load.
 - The Proxy chooses the LogServers that receive the body of a record from
   the LSN. FoundationDB chooses them from the tags of the record.
 
@@ -343,7 +374,7 @@ through the registry. They send a request only to a LogServer that runs.
 | Model checking | The logging protocol, the recovery, the read versions, the StorageServer and the Resolver, with 2 epochs | `make tlc` | about 5 minutes |
 | Model checking | The logging protocol, the recovery and the StorageServer, with 3 epochs | `make tlc-long` | about 4 hours |
 
-The models have 9 planted bugs. TLC finds a counterexample for each. See
+The models have 10 planted bugs. TLC finds a counterexample for each. See
 [formal/README.md](formal/README.md).
 
 ### Simulation
@@ -394,17 +425,18 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 11,572 acknowledged transactions, of which 2,747 with a read range, 8,398 rejected for a conflict, 1,887 too old, 22,141 transactions with reads from the StorageServer, of which 6,532 with a read of a range, 2,209 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 2,940 acknowledged transactions, of which 541 with a read range, 3,382 rejected for a conflict, 3,441 too old, 22,101 transactions with reads from the StorageServer, of which 6,538 with a read of a range, 657 rollbacks of the StorageServer, 6,182 recoveries, 2,944 kills, 725 partitions |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 4, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
-| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
+| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 9,558 acknowledged transactions, of which 2,223 with a read range and 2,169 in a batch with another acknowledged transaction, 9,265 rejected for a conflict, 1,887 too old, 22,132 transactions with reads from the StorageServer, 2,279 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 2,407 acknowledged transactions, of which 457 with a read range and 398 in a batch with another acknowledged transaction, 3,234 rejected for a conflict, 3,258 too old, 23,772 transactions with reads from the StorageServer, 419 rollbacks of the StorageServer, 5,989 recoveries, 2,946 kills, 685 partitions |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 3, `durable`, the counterexample of `RecoveryAckReplicasOnly`. In 40 seeds the defect also violates `kcv_below_dv` |
+| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 4, `durable` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
 | Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 2, `no_conflict` |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` between a transaction of epoch 12 and a write of epoch 11 |
+| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 3, `no_conflict` between the transactions with the indexes 0 and 1 of one batch |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 3, `no_conflict` between a transaction of epoch 15 and a write of epoch 12 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 7, `read_version_order`: a Proxy of epoch 13 gave a read version below a commit of epoch 14 |
-| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 2, `storage_rollback` |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 1, `read_version_order`: a Proxy of epoch 12 gave a read version below a commit of epoch 13 |
+| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 3, `storage_rollback` |
 
 The suite takes about 10 minutes. A run has about 5,000 steps. Before the
 StorageServer, a run had about 2,750 steps and the suite took about 4.5
@@ -461,6 +493,9 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 
 ## Limitations
 
+- A commit waits for the time of a batch, 1 ms by default, also when no
+  other transaction arrives. The time does not change with the load.
+- A batch has no limit in bytes.
 - deadlift has no client library. A caller gets the read version, reads
   and commits with separate calls, and repeats a transaction itself.
 - The StorageServer keeps every version of every key in memory, and loses

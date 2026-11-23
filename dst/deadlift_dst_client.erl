@@ -39,7 +39,7 @@ recover(Tab, N, CState, Mode) ->
     end,
     %% The Resolver of the epoch runs on a node of its own.
     RecruitResolver = fun(Resolver) ->
-        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check}) of
+        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check}) of
             {ok, Pid} ->
                 ok = eta_net:place(resolver_node(N), [Pid]),
                 true = ets:insert(Tab, {{node, resolver_node(N)}, true}),
@@ -73,7 +73,15 @@ recover(Tab, N, CState, Mode) ->
                     ack_replicas -> replicas;
                     _ -> all
                 end,
-            {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, ack => Ack, report => Mode =/= no_report, confirm => Mode =/= no_confirm}),
+            %% The batch time of the Proxy is 0 ms, 5 ms or 50 ms of the
+            %% virtual clock.
+            {ok, Proxy} = deadlift_proxy:start(#{
+                sequencer => Sequencer,
+                ack => Ack,
+                report => Mode =/= no_report,
+                confirm => Mode =/= no_confirm,
+                batch_ms => lists:nth(N rem 3 + 1, [0, 5, 50])
+            }),
             ok = eta_net:place(proxy_node(N), [Proxy]),
             true = ets:insert(Tab, {{node, proxy_node(N)}, true}),
             true = ets:insert(Tab, {{proxy, N}, Proxy, Epoch}),
@@ -109,6 +117,10 @@ recover(Tab, N, CState, Mode) ->
 %% that time. After the wait the client commits through the Proxy of the
 %% highest epoch that runs. These clients bring a read version of an ended
 %% epoch to the Resolver of a later epoch.
+%%
+%% A Proxy collects the commits of a short time into one batch, so two
+%% clients can receive one LSN. The client records the index of its
+%% transaction in the batch.
 %%
 %% The table of the run has a counter, `stamp'. The client takes a stamp
 %% before it asks for the read version, and with the answer to the commit.
@@ -208,8 +220,8 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
         read_ranges => Ranges,
         writes => [{Key, {client, C}} || Key <- Writes]
     },
-    case deadlift_proxy:commit(Proxy, Transaction) of
-        {ok, LSN} ->
+    case deadlift_proxy:commit_with_index(Proxy, Transaction, 5000) of
+        {ok, LSN, Index} ->
             End = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
             true = ets:insert(Tab, {{txn, C}, #{
                 read_version => ReadVersion,
@@ -218,6 +230,8 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
                 reads => lists:usort(Reads ++ lists:append([keys_in(Range) || Range <- Ranges])),
                 writes => Writes,
                 ranges => Ranges,
+                %% The position of the transaction in its batch.
+                index => Index,
                 start => Start,
                 'end' => End
             }}),

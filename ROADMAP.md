@@ -64,8 +64,10 @@ commits and recoveries, and no run violates an invariant.
 - [ ] Add an operation that clears a key range: a mutation in the log
       record, a write range for the Resolver, and the removal of the keys
       in the StorageServer.
-- [ ] Collect the transactions of a short time into one batch with one
+- [x] Collect the transactions of a short time into one batch with one
       commit version in the Proxy.
+- [ ] Change the time of a batch with the load, as FoundationDB does, and
+      limit the bytes of a batch.
 - [x] Kill the Resolver in the simulation.
 - [x] Implement a StorageServer that pulls records from the LogServers,
       answers reads at a version, and discards the records above the

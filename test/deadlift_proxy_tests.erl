@@ -8,6 +8,8 @@ proxy_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun(Ids) -> {timeout, 30, fun() -> commit(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> commits_at_once(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> batches(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> conflict_in_batch(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> recovery_keeps_commits(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> log_down(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> sequencer_down(Ids) end} end,
@@ -55,10 +57,17 @@ epoch(Ids, Options) ->
 info(Log) ->
     deadlift_log:info(deadlift_log:ref(Log)).
 
-%% The bodies of the records on the LogServer `Log', as `{LSN, Body}'.
+%% The bodies of the records on the LogServer `Log', as `{LSN, Body}'. A
+%% batch gives `{LSN, Entry}' for each entry.
 bodies(Log) ->
     {ok, Records} = deadlift_log:peek(deadlift_log:ref(Log), 0, infinity),
-    [{LSN, Body} || {LSN, _Prev, {body, Body}} <- Records].
+    lists:append([
+        case Body of
+            {batch, Entries} -> [{LSN, Entry} || Entry <- Entries];
+            _ -> [{LSN, Body}]
+        end
+     || {LSN, _Prev, {body, Body}} <- Records
+    ]).
 
 %% Returns the reason of the stop of a process. `Monitor' is a monitor that
 %% the test started before the stop.
@@ -85,21 +94,87 @@ commit(Ids) ->
     ],
     ?assertEqual(8, length(All)).
 
-%% 50 clients commit at the same time. Each client gets its own LSN.
-commits_at_once(Ids) ->
-    {_Sequencer, Proxy, Logs} = epoch(Ids),
+%% Sends one commit from each of `N' clients at the same time. Returns the
+%% answers in the order of the clients.
+commit_at_once(Proxy, Transactions) ->
     Self = self(),
-    Clients = [spawn_link(fun() -> Self ! {self(), deadlift_proxy:commit(Proxy, N)} end) || N <- lists:seq(1, 50)],
-    LSNs = [
+    Clients = [spawn_link(fun() -> Self ! {self(), deadlift_proxy:commit_with_index(Proxy, T, 5000)} end) || T <- Transactions],
+    [
         receive
-            {Client, {ok, LSN}} -> LSN
+            {Client, Answer} -> Answer
         after 5000 -> error(no_answer)
         end
      || Client <- Clients
+    ].
+
+%% 50 clients commit at the same time. Each client gets its own pair of an
+%% LSN and an index. The indexes of each LSN start at 0 and have no gap.
+commits_at_once(Ids) ->
+    {_Sequencer, Proxy, Logs} = epoch(Ids),
+    Answers = commit_at_once(Proxy, lists:seq(1, 50)),
+    Pairs = lists:sort([{LSN, Index} || {ok, LSN, Index} <- Answers]),
+    ?assertEqual(50, length(lists:usort(Pairs))),
+    LSNs = lists:usort([LSN || {LSN, _Index} <- Pairs]),
+    Last = lists:last(LSNs),
+    ?assertEqual(lists:seq(2, Last), LSNs),
+    [
+        ?assertEqual(lists:seq(0, length(Indexes) - 1), Indexes)
+     || LSN <- LSNs, Indexes <- [[Index || {L, Index} <- Pairs, L =:= LSN]]
     ],
-    ?assertEqual(lists:seq(2, 51), lists:sort(LSNs)),
-    ?assertMatch(#{kcv := 51, waiting := 0}, deadlift_proxy:info(Proxy)),
-    [?assertMatch(#{dv := 51}, info(L)) || L <- Logs].
+    ?assertMatch(#{kcv := Last, waiting := 0}, deadlift_proxy:info(Proxy)),
+    [?assertMatch(#{dv := Last}, info(L)) || L <- Logs].
+
+%% A Proxy with a batch time of 300 ms and at most 20 transactions in a
+%% batch. 50 commits at the same time give two batches of 20 transactions
+%% and, after the batch time, one batch of 10 transactions.
+batches(Ids) ->
+    {Sequencer, _Proxy, Logs} = epoch(Ids),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300, batch_max => 20}),
+    Answers = commit_at_once(Proxy, [#{writes => [{N, N}]} || N <- lists:seq(1, 50)]),
+    Pairs = lists:sort([{LSN, Index} || {ok, LSN, Index} <- Answers]),
+    Expected = [{2, I} || I <- lists:seq(0, 19)] ++ [{3, I} || I <- lists:seq(0, 19)] ++ [{4, I} || I <- lists:seq(0, 9)],
+    ?assertEqual(Expected, Pairs),
+    [?assertMatch(#{dv := 4}, info(L)) || L <- Logs],
+    %% A record has the writes of its batch in the order of the indexes.
+    Records = lists:usort(lists:append([element(2, deadlift_log:peek(deadlift_log:ref(L), 1, infinity)) || L <- Logs])),
+    lists:foreach(
+        fun({LSN, _Prev, {body, {batch, Entries}}}) ->
+            ?assertEqual(
+                [N || {{L, _Index}, {ok, _, _}, N} <- lists:sort(lists:zip3(order(Answers), Answers, lists:seq(1, 50))), L =:= LSN],
+                [N || [{N, N}] <- Entries]
+            )
+        end,
+        [Record || Record = {_LSN, _Prev, {body, _}} <- Records]
+    ),
+    %% One commit is a batch of one transaction after the batch time.
+    Start = erlang:monotonic_time(millisecond),
+    ?assertEqual({ok, 5, 0}, deadlift_proxy:commit_with_index(Proxy, #{writes => [{a, 1}]}, 5000)),
+    ?assert(erlang:monotonic_time(millisecond) - Start >= 300).
+
+order(Answers) ->
+    [{LSN, Index} || {ok, LSN, Index} <- Answers].
+
+%% Two transactions of one batch read and write one key. The Resolver admits
+%% the first one. The second one has a conflict with the first one.
+conflict_in_batch(Ids) ->
+    {Sequencer, _Proxy, Logs} = epoch(Ids),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300}),
+    {ok, 1} = deadlift_proxy:read_version(Proxy),
+    Answers = commit_at_once(Proxy, [
+        #{read_version => 1, reads => [x], writes => [{x, a}]},
+        #{read_version => 1, reads => [x], writes => [{x, b}]},
+        #{read_version => 1, reads => [y], writes => [{x, c}]}
+    ]),
+    %% The order of the batch is the order of the arrival. The first
+    %% transaction with a read of `x' is admitted, at the index 0 or 1.
+    ?assertEqual(1, length([x || {error, not_committed} <- Answers])),
+    ?assertEqual(2, length([x || {ok, 2, _Index} <- Answers])),
+    ?assertMatch({ok, 2, _}, lists:nth(3, Answers)),
+    [?assertMatch(#{dv := 2}, info(L)) || L <- Logs],
+    %% The record has 3 entries, and one of them has no transaction.
+    Entries = lists:usort([Entry || L <- Logs, {2, Entry} <- bodies(L)]),
+    ?assertEqual(3, length(Entries)),
+    ?assert(lists:member(no_transaction, Entries)).
 
 %% A recovery keeps every record that the Proxy acknowledged. The Proxy of
 %% the ended epoch stops at its next commit.

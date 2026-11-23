@@ -295,7 +295,7 @@ recovery_transaction(Recovered, First) ->
     } = Recovered,
     Replicas = deadlift_log:replicas(Logs, K, First),
     try
-        committed = call(deadlift_resolver:ref(Epoch), {resolve, Epoch, RV, First, #{read_version => 0, reads => [], writes => []}}),
+        [committed] = call(deadlift_resolver:ref(Epoch), {resolve, Epoch, RV, First, [#{read_version => 0, reads => [], writes => []}]}),
         lists:foreach(
             fun(Log) ->
                 Sent =

@@ -94,6 +94,9 @@ faults_test_() ->
         %% acknowledged.
         ?assert(maps:get(range_reads, Stats, 0) > 2000, Stats),
         ?assert(maps:get(range_acks, Stats, 0) > 300, Stats),
+        %% Acknowledged transactions had their LSN together with another
+        %% acknowledged transaction.
+        ?assert(maps:get(batched, Stats, 0) > 200, Stats),
         ?assert(maps:get(rollbacks, Stats, 0) > 10, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 100, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
@@ -151,6 +154,19 @@ no_range_check_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_range_check}) end),
         ?debugFmt("no_range_check: seed ~p, ~p", [Seed, Violation]),
         ?assertMatch(#{property := no_conflict}, Violation)
+    end}.
+
+%% A planted defect: the Resolver does not check a transaction against the
+%% earlier transactions of its batch. The two transactions of the violation
+%% have one commit version.
+no_batch_check_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_batch_check}) end),
+        ?debugFmt("no_batch_check: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := no_conflict}, Violation),
+        #{reader := #{version := Version, index := Index}, writer := #{version := Written, index := WriterIndex}} = Violation,
+        ?assertEqual(Version, Written),
+        ?assert(WriterIndex < Index, Violation)
     end}.
 
 %% A planted defect: the first commit version of an epoch is the Recovery

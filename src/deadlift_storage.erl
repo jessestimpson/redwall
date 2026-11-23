@@ -28,8 +28,13 @@
 %% StorageServer sends every request again, because a request or an answer
 %% can be lost.
 %%
-%% The body of a record is a list of `{Key, Value}'. A record with another
-%% body contains no write. The StorageServer keeps every version of every
+%% The body of a record of a Proxy is `{batch, Entries}', with one entry
+%% for each transaction of the batch, in the order of the batch. The entry
+%% of a transaction is a list of `{Key, Value}'. Another entry, and a
+%% record with another body, contain no write. The StorageServer applies
+%% the entries in their order. When two transactions of a batch write one
+%% key, the StorageServer keeps the value of the later transaction for the
+%% version of the batch. The StorageServer keeps every version of every
 %% key.
 %%
 %% == Epochs ==
@@ -445,16 +450,28 @@ apply_records(State = #state{version = Version, buffer = Buffer}) ->
             end
     end.
 
-write(Body, LSN, Data) when is_list(Body) ->
+write({batch, Entries}, LSN, Data) ->
+    lists:foldl(fun(Entry, Acc) -> write_entry(Entry, LSN, Acc) end, Data, Entries);
+write(_NoTransaction, _LSN, Data) ->
+    Data.
+
+write_entry(Entry, LSN, Data) when is_list(Entry) ->
     lists:foldl(
         fun
-            ({Key, Value}, Acc) -> maps:update_with(Key, fun(Versions) -> [{LSN, Value} | Versions] end, [{LSN, Value}], Acc);
-            (_Other, Acc) -> Acc
+            ({Key, Value}, Acc) ->
+                case Acc of
+                    %% An earlier transaction of the batch wrote the key.
+                    #{Key := [{LSN, _Earlier} | Versions]} -> Acc#{Key := [{LSN, Value} | Versions]};
+                    #{Key := Versions} -> Acc#{Key := [{LSN, Value} | Versions]};
+                    _ -> Acc#{Key => [{LSN, Value}]}
+                end;
+            (_Other, Acc) ->
+                Acc
         end,
         Data,
-        Body
+        Entry
     );
-write(_NoTransaction, _LSN, Data) ->
+write_entry(_NoTransaction, _LSN, Data) ->
     Data.
 
 %% ---------------------------------------------------------------------------

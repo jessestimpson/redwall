@@ -140,6 +140,33 @@ new_epoch_test() ->
     {too_old, H1} = deadlift_resolver:check(txn(LastEpochEnd, [a], [a]), First, H0),
     {committed, _} = deadlift_resolver:check(txn(First, [a], [a]), First + 1, H1).
 
+%% The transactions of a batch have one commit version. A transaction has a
+%% conflict with an earlier transaction of the batch that was admitted.
+batch_test() ->
+    H0 = deadlift_resolver:new(infinity),
+    {[committed, conflict, committed, conflict, committed], H1} = deadlift_resolver:check_batch(
+        [
+            txn(5, [a], [a]),
+            %% The first transaction wrote `a'.
+            txn(5, [a], [b]),
+            %% The second transaction was not admitted, so its write of `b'
+            %% gives no conflict.
+            txn(5, [b], [c]),
+            txn(5, [], [{b, d}], [d], []),
+            %% A transaction without read keys has no conflict.
+            txn(5, [], [a, c])
+        ],
+        10,
+        H0
+    ),
+    %% After the batch, `a' and `c' have the version 10, and `b' and `d'
+    %% have no version.
+    {[committed, committed, conflict, conflict], _} = deadlift_resolver:check_batch(
+        [txn(9, [b], []), txn(9, [d], []), txn(9, [a], []), txn(9, [c], [])],
+        11,
+        H1
+    ).
+
 %% The process handles the versions in their order.
 order_test_() ->
     {setup,
@@ -151,14 +178,14 @@ order_test_() ->
         fun() ->
             {ok, Resolver} = deadlift_resolver:start_link(#{epoch => 7, version => 100}),
             ?assertEqual(Resolver, deadlift_resolver:ref(7)),
-            ?assertEqual({error, {epoch, 7}}, gen_server:call(Resolver, {resolve, 6, 100, 101, txn(0, [], [])})),
+            ?assertEqual({error, {epoch, 7}}, gen_server:call(Resolver, {resolve, 6, 100, 101, [txn(0, [], [])]})),
             %% The request for version 102 arrives before the request for
             %% version 101, and waits.
-            R2 = gen_server:send_request(Resolver, {resolve, 7, 101, 102, txn(100, [a], [])}),
+            R2 = gen_server:send_request(Resolver, {resolve, 7, 101, 102, [txn(100, [a], [])]}),
             ?assertEqual(timeout, gen_server:wait_response(R2, 50)),
-            ?assertEqual(committed, gen_server:call(Resolver, {resolve, 7, 100, 101, txn(100, [], [a])})),
+            ?assertEqual([committed], gen_server:call(Resolver, {resolve, 7, 100, 101, [txn(100, [], [a])]})),
             %% The read of `a' at version 100 is below the write at 101.
-            ?assertEqual({reply, conflict}, gen_server:receive_response(R2, 1000)),
-            ?assertEqual({error, {handled, 101}}, gen_server:call(Resolver, {resolve, 7, 100, 101, txn(100, [], [a])})),
+            ?assertEqual({reply, [conflict]}, gen_server:receive_response(R2, 1000)),
+            ?assertEqual({error, {handled, 101}}, gen_server:call(Resolver, {resolve, 7, 100, 101, [txn(100, [], [a])]})),
             ok = deadlift_resolver:stop(Resolver)
         end}.

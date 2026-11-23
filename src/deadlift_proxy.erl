@@ -46,32 +46,61 @@
 %% of the epoch do not run, the epoch has ended or cannot commit, and the
 %% Proxy stops.
 %%
+%% == Batch ==
+%%
+%% The Proxy collects the transactions that arrive in a short time into
+%% one batch. A batch has one commit version and is one log record (paper,
+%% section 2.4.1). The Proxy closes a batch in two cases:
+%%
+%% <ul>
+%% <li>`batch_ms' milliseconds have passed since the first transaction of
+%%   the batch arrived. The default is 1 ms. With 0, the batch has the
+%%   transactions that are in the message queue of the Proxy at that
+%%   time.</li>
+%% <li>The batch has `batch_max' transactions. The default is 1,000.</li>
+%% </ul>
+%%
+%% The order of the transactions in a batch is the order of their arrival.
+%% The index of a transaction is its position in the batch, from 0.
+%% `commit_with_index/3' returns the index. The pair of the commit version
+%% and the index gives the order of all committed transactions.
+%% FoundationDB uses the same pair for a versionstamp.
+%%
+%% The CommitProxy of FoundationDB closes a batch after a time, at a number
+%% of transactions, or at a number of bytes (`commitBatcher' in
+%% `fdbserver/CommitProxyServer.actor.cpp'). The time of FoundationDB
+%% changes with the load. deadlift has a fixed time and no limit in bytes.
+%%
 %% == Commit ==
 %%
 %% <ol>
-%% <li>The Proxy asks the Sequencer for a commit version. The answer is an
-%%   LSN and the previous LSN.</li>
-%% <li>The Proxy sends the read version, the read keys and the write keys
-%%   of the transaction to the Resolver of the epoch. If the Resolver
-%%   answers `conflict' or `too_old', the Proxy answers the client with
-%%   `{error, not_committed}' or `{error, transaction_too_old}'.</li>
+%% <li>When the Proxy closes a batch, it asks the Sequencer for a commit
+%%   version. The answer is an LSN and the previous LSN.</li>
+%% <li>The Proxy sends the read version, the read keys, the read ranges and
+%%   the write keys of each transaction of the batch to the Resolver of the
+%%   epoch, in one request. For a transaction with the answer `conflict' or
+%%   `too_old', the Proxy answers the client with `{error, not_committed}'
+%%   or `{error, transaction_too_old}'.</li>
 %% <li>The Proxy sends a record to every LogServer of the epoch, with the
 %%   LSN, the previous LSN and the Known Committed Version (KCV) of the
-%%   Proxy. The k LogServers that replicate the record receive the body.
-%%   The other LogServers receive an empty body.</li>
+%%   Proxy. The body is `{batch, Entries}', with one entry for each
+%%   transaction of the batch in the order of the batch. The entry of an
+%%   admitted transaction has the writes of the transaction. The entry of
+%%   another transaction is `no_transaction'. The k LogServers that
+%%   replicate the record receive the body. The other LogServers receive
+%%   an empty body.</li>
 %% <li>When every LogServer of the epoch has answered, the Proxy raises its
 %%   KCV to the LSN, and reports the LSN to the Sequencer as committed. The
-%%   Proxy also reports the LSN of a record without a transaction.</li>
-%% <li>When the Sequencer has answered, the Proxy answers the client with
-%%   `{ok, LSN}'.</li>
+%%   Proxy also reports the LSN of a record without an admitted
+%%   transaction.</li>
+%% <li>When the Sequencer has answered, the Proxy answers the client of
+%%   each admitted transaction with `{ok, LSN}'.</li>
 %% </ol>
 %%
-%% The Proxy also sends a record for a transaction that the Resolver did
-%% not admit. The body of that record is `no_transaction'. A LogServer
-%% stores a record only after the record with the previous LSN, so every
-%% LSN that the Sequencer assigns must reach the LogServers. FoundationDB
-%% sends the commit version of a batch to the LogServers in the same way
-%% when every transaction of the batch has a conflict.
+%% The Proxy also sends the record when the Resolver admitted no
+%% transaction of the batch. A LogServer stores a record only after the
+%% record with the previous LSN, so every LSN that the Sequencer assigns
+%% must reach the LogServers.
 %%
 %% Step 4 gives the order that a read version needs: the Sequencer knows
 %% that an LSN is committed before any client does. A client that starts
@@ -83,8 +112,8 @@
 %% `RecoveryAckReplicasOnly' of the model shows that a Proxy that waits for
 %% k LogServers lets a recovery discard an acknowledged record.
 %%
-%% The Proxy handles several commits at the same time. It does not wait for
-%% the answer to one commit before it starts the next commit.
+%% The Proxy handles several batches at the same time. It does not wait
+%% for the answer to one batch before it closes the next batch.
 %%
 %% == Failure ==
 %%
@@ -104,9 +133,8 @@
 %% == Departures from the paper ==
 %%
 %% <ul>
-%% <li>The Proxy sends one record for each commit. FoundationDB collects
-%%   the transactions of a short time into one batch with one commit
-%%   version.</li>
+%% <li>The time of a batch is fixed, and a batch has no limit in bytes.
+%%   The time of a batch of FoundationDB changes with the load.</li>
 %% <li>The Proxy chooses the LogServers that receive the body from the LSN
 %%   (`deadlift_log:replicas/3'). FoundationDB chooses them from the tags of
 %%   the record.</li>
@@ -122,7 +150,7 @@
 -include("deadlift_eta.hrl").
 
 -export([start/1, start_link/1, stop/1]).
--export([commit/2, commit/3, read_version/1, read_version/2, info/1]).
+-export([commit/2, commit/3, commit_with_index/3, read_version/1, read_version/2, info/1]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([transaction/0]).
@@ -144,7 +172,11 @@
     sequencer := gen_server:server_ref(),
     ack => all | replicas,
     report => boolean(),
-    confirm => boolean()
+    confirm => boolean(),
+    %% The time of a batch in milliseconds, and the highest number of
+    %% transactions in a batch.
+    batch_ms => non_neg_integer(),
+    batch_max => pos_integer()
 }.
 
 %% A transaction. `reads' are the keys that the transaction read at
@@ -160,12 +192,14 @@
     writes => [{term(), term()}]
 }.
 
-%% A commit that the Proxy has not finished.
+%% A batch that the Proxy has closed and has not finished.
 -record(commit, {
-    %% The client, or `none' after the Proxy has answered it.
-    from :: gen_server:from() | none,
+    %% The clients that the Proxy has not answered, each with the index of
+    %% its transaction in the batch.
+    clients :: [{non_neg_integer(), gen_server:from()}],
     prev :: version(),
-    body :: term(),
+    %% The entries of the batch, in the order of the batch.
+    entries :: [term()],
     %% The number of LogServers that have not answered.
     left = 0 :: non_neg_integer()
 }).
@@ -195,6 +229,12 @@
     %% `{confirm, Id}'. `Id' is the number of a request for a read version.
     requests :: gen_server:request_id_collection(),
     commits = #{} :: #{version() => #commit{}},
+    batch_ms = 1 :: non_neg_integer(),
+    batch_max = 1000 :: pos_integer(),
+    %% The open batch: the client, the part for the Resolver and the entry
+    %% of each transaction, with the last transaction first.
+    batch = [] :: [{gen_server:from(), deadlift_resolver:transaction(), term()}],
+    batch_timer :: reference() | undefined,
     reads = #{} :: #{pos_integer() => #read{}},
     next_read = 1 :: pos_integer()
 }).
@@ -244,6 +284,17 @@ commit(Proxy, Transaction) ->
 -spec commit(gen_server:server_ref(), transaction() | term(), timeout()) ->
     {ok, version()} | {error, not_committed | transaction_too_old | commit_unknown_result}.
 commit(Proxy, Transaction, Timeout) ->
+    case commit_with_index(Proxy, Transaction, Timeout) of
+        {ok, LSN, _Index} -> {ok, LSN};
+        Error -> Error
+    end.
+
+%% @doc Commits as `commit/3' does. The result also has the index of the
+%% transaction in its batch. Of two committed transactions with one LSN,
+%% the transaction with the lower index is the earlier one.
+-spec commit_with_index(gen_server:server_ref(), transaction() | term(), timeout()) ->
+    {ok, version(), non_neg_integer()} | {error, not_committed | transaction_too_old | commit_unknown_result}.
+commit_with_index(Proxy, Transaction, Timeout) ->
     try
         gen_server:call(Proxy, {commit, Transaction}, Timeout)
     catch
@@ -282,6 +333,8 @@ init(Options = #{sequencer := Sequencer}) ->
         ack = maps:get(ack, Options, all),
         report = maps:get(report, Options, true),
         confirm = maps:get(confirm, Options, true),
+        batch_ms = maps:get(batch_ms, Options, 1),
+        batch_max = maps:get(batch_max, Options, 1000),
         requests = gen_server:reqids_new()
     },
     {ok, State, {continue, start}}.
@@ -303,34 +356,16 @@ handle_continue(start, State = #state{sequencer = Sequencer}) ->
     end.
 
 %% @private
-handle_call({commit, Transaction}, From, State = #state{sequencer = Sequencer, epoch = Epoch}) ->
-    {Resolved, Body} = split(Transaction),
-    try deadlift_sequencer:commit_version(Sequencer) of
-        {ok, Epoch, Prev, LSN} ->
-            Commit = #commit{from = From, prev = Prev, body = Body},
-            State1 = State#state{commits = (State#state.commits)#{LSN => Commit}},
-            %% The Proxy sends to a process only if the process runs. A
-            %% request to a process that does not run would be answered by
-            %% a `DOWN' message from the VM.
-            case deadlift_resolver:ref(Epoch) of
-                undefined ->
-                    fail({shutdown, {resolver, LSN, noproc}}, State1);
-                Resolver ->
-                    Request = {resolve, Epoch, Prev, LSN, Resolved},
-                    Requests = gen_server:send_request(Resolver, Request, {resolve, LSN}, State1#state.requests),
-                    {noreply, State1#state{requests = Requests}}
-            end;
-        {error, Reason} ->
-            %% The Sequencer has assigned no version to this commit.
-            Commit0 = #commit{from = From, prev = 0, body = Body},
-            fail({shutdown, {sequencer, Reason}}, State#state{commits = (State#state.commits)#{0 => Commit0}})
-    catch
-        exit:Reason ->
-            %% The Sequencer has assigned no version to this commit, or the
-            %% Proxy has not received the version. No LogServer has the
-            %% record.
-            Commit0 = #commit{from = From, prev = 0, body = Body},
-            fail({shutdown, {sequencer, Reason}}, State#state{commits = (State#state.commits)#{0 => Commit0}})
+handle_call({commit, Transaction}, From, State = #state{batch = Batch, batch_ms = Ms, batch_max = Max}) ->
+    {Resolved, Entry} = split(Transaction),
+    State1 = State#state{batch = [{From, Resolved, Entry} | Batch]},
+    case length(Batch) + 1 of
+        Max ->
+            close_batch(State1);
+        1 ->
+            {noreply, State1#state{batch_timer = erlang:send_after(Ms, self(), close_batch)}};
+        _ ->
+            {noreply, State1}
     end;
 handle_call(read_version, From, State = #state{sequencer = Sequencer, epoch = Epoch, logs = Logs, replication = K}) ->
     #state{requests = Requests, reads = Reads, next_read = Id} = State,
@@ -364,6 +399,11 @@ handle_cast(_Message, State) ->
     {noreply, State}.
 
 %% @private
+handle_info(close_batch, State = #state{batch = []}) ->
+    %% The batch of this timer was closed at `batch_max' transactions.
+    {noreply, State};
+handle_info(close_batch, State) ->
+    close_batch(State);
 handle_info(Message, State = #state{requests = Requests}) ->
     case gen_server:check_response(Message, Requests, true) of
         {{reply, Reply}, Label, Requests1} ->
@@ -385,6 +425,42 @@ handle_info(Message, State = #state{requests = Requests}) ->
             {noreply, State}
     end.
 
+%% Closes the open batch: asks the Sequencer for the commit version, and
+%% sends the transactions to the Resolver.
+close_batch(State0 = #state{sequencer = Sequencer, epoch = Epoch, batch = Batch0, batch_timer = Timer}) ->
+    _ = is_reference(Timer) andalso erlang:cancel_timer(Timer),
+    Batch = lists:reverse(Batch0),
+    State = State0#state{batch = [], batch_timer = undefined},
+    Clients = lists:enumerate(0, [From || {From, _Resolved, _Entry} <- Batch]),
+    Entries = [Entry || {_From, _Resolved, Entry} <- Batch],
+    try deadlift_sequencer:commit_version(Sequencer) of
+        {ok, Epoch, Prev, LSN} ->
+            Commit = #commit{clients = Clients, prev = Prev, entries = Entries},
+            State1 = State#state{commits = (State#state.commits)#{LSN => Commit}},
+            %% The Proxy sends to a process only if the process runs. A
+            %% request to a process that does not run would be answered by
+            %% a `DOWN' message from the VM.
+            case deadlift_resolver:ref(Epoch) of
+                undefined ->
+                    fail({shutdown, {resolver, LSN, noproc}}, State1);
+                Resolver ->
+                    Request = {resolve, Epoch, Prev, LSN, [Resolved || {_From, Resolved, _Entry} <- Batch]},
+                    Requests = gen_server:send_request(Resolver, Request, {resolve, LSN}, State1#state.requests),
+                    {noreply, State1#state{requests = Requests}}
+            end;
+        {error, Reason} ->
+            %% The Sequencer has assigned no version to this batch.
+            Commit0 = #commit{clients = Clients, prev = 0, entries = Entries},
+            fail({shutdown, {sequencer, Reason}}, State#state{commits = (State#state.commits)#{0 => Commit0}})
+    catch
+        exit:Reason ->
+            %% The Sequencer has assigned no version to this batch, or the
+            %% Proxy has not received the version. No LogServer has the
+            %% record.
+            Commit1 = #commit{clients = Clients, prev = 0, entries = Entries},
+            fail({shutdown, {sequencer, Reason}}, State#state{commits = (State#state.commits)#{0 => Commit1}})
+    end.
+
 role(resolve) -> resolver;
 role(push) -> log;
 role(report) -> sequencer.
@@ -400,8 +476,8 @@ split(Transaction) when is_map(Transaction) ->
         writes => [Key || {Key, _Value} <- Writes]
     },
     {Resolved, Writes};
-split(Body) ->
-    {#{read_version => 0, reads => [], writes => []}, Body}.
+split(Entry) ->
+    {#{read_version => 0, reads => [], writes => []}, Entry}.
 
 %% Answers the request for a read version `Id' when the Sequencer and
 %% enough LogServers have answered. Stops the Proxy when more than m - k
@@ -438,18 +514,30 @@ answered({confirm, _Id}, {error, Reason}, State) ->
     %% A Sequencer of a later epoch has locked the LogServer. The epoch of
     %% the Proxy has ended.
     fail({shutdown, {log, read_version, Reason}}, State);
-answered({resolve, LSN}, committed, State) ->
-    push(LSN, State);
-answered({resolve, LSN}, Rejected, State = #state{commits = Commits}) when Rejected =:= conflict; Rejected =:= too_old ->
-    #{LSN := Commit = #commit{from = From}} = Commits,
-    Error =
-        case Rejected of
-            conflict -> not_committed;
-            too_old -> transaction_too_old
+answered({resolve, LSN}, Results, State = #state{commits = Commits}) when is_list(Results) ->
+    #{LSN := Commit = #commit{clients = Clients, entries = Entries}} = Commits,
+    %% The Proxy answers the client of each transaction that the Resolver
+    %% did not admit. The entry of that transaction has no write.
+    Resolved = lists:zipwith3(
+        fun
+            (Client, Entry, committed) ->
+                {[Client], Entry};
+            ({_Index, From}, _Entry, Rejected) ->
+                Error =
+                    case Rejected of
+                        conflict -> not_committed;
+                        too_old -> transaction_too_old
+                    end,
+                gen_server:reply(From, {error, Error}),
+                {[], no_transaction}
         end,
-    gen_server:reply(From, {error, Error}),
-    %% The LSN still goes to the LogServers, without a transaction.
-    push(LSN, State#state{commits = Commits#{LSN := Commit#commit{from = none, body = no_transaction}}});
+        Clients,
+        Entries,
+        Results
+    ),
+    {Admitted, Entries1} = lists:unzip(Resolved),
+    %% The LSN goes to the LogServers also when no transaction is admitted.
+    push(LSN, State#state{commits = Commits#{LSN := Commit#commit{clients = lists:append(Admitted), entries = Entries1}}});
 answered({resolve, LSN}, {error, Reason}, State) ->
     fail({shutdown, {resolver, LSN, Reason}}, State);
 answered({push, LSN}, {ok, _DV}, State) ->
@@ -458,20 +546,20 @@ answered({push, LSN}, {error, Reason}, State) ->
     fail({shutdown, {log, LSN, Reason}}, State);
 answered({report, LSN}, ok, State = #state{commits = Commits}) ->
     case maps:take(LSN, Commits) of
-        {#commit{from = none}, Commits1} ->
-            %% A record without a transaction. No client waits.
-            {noreply, State#state{commits = Commits1}};
-        {#commit{from = From}, Commits1} ->
-            gen_server:reply(From, {ok, LSN}),
+        {#commit{clients = Clients}, Commits1} ->
+            ok = reply_committed(LSN, Clients),
             {noreply, State#state{commits = Commits1}};
         error ->
             {noreply, State}
     end.
 
+reply_committed(LSN, Clients) ->
+    lists:foreach(fun({Index, From}) -> gen_server:reply(From, {ok, LSN, Index}) end, Clients).
+
 %% Sends the record to every LogServer of the epoch.
 push(LSN, State) ->
     #state{epoch = Epoch, logs = Logs, replication = K, kcv = KCV, requests = Requests, commits = Commits} = State,
-    #{LSN := Commit = #commit{prev = Prev, body = Body}} = Commits,
+    #{LSN := Commit = #commit{prev = Prev, entries = Entries}} = Commits,
     Pids = [{Log, deadlift_log:ref(Log)} || Log <- Logs],
     case lists:keymember(undefined, 2, Pids) of
         true ->
@@ -482,7 +570,7 @@ push(LSN, State) ->
                 fun({Log, Pid}, Acc) ->
                     Sent =
                         case lists:member(Log, Replicas) of
-                            true -> {body, Body};
+                            true -> {body, {batch, Entries}};
                             false -> empty
                         end,
                     gen_server:send_request(Pid, {push, Epoch, Prev, LSN, KCV, Sent}, {push, LSN}, Acc)
@@ -501,9 +589,9 @@ push(LSN, State) ->
 %% One LogServer has stored the record `LSN'.
 stored(LSN, State = #state{sequencer = Sequencer, kcv = KCV, requests = Requests, commits = Commits}) ->
     case Commits of
-        #{LSN := #commit{from = From, left = 1}} when not State#state.report ->
+        #{LSN := #commit{clients = Clients, left = 1}} when not State#state.report ->
             %% The planted defect `report => false'.
-            From =:= none orelse gen_server:reply(From, {ok, LSN}),
+            ok = reply_committed(LSN, Clients),
             {noreply, State#state{kcv = max(KCV, LSN), commits = maps:remove(LSN, Commits)}};
         #{LSN := Commit = #commit{left = 1}} ->
             %% The Sequencer learns that the LSN is committed before the
@@ -526,12 +614,11 @@ stored(LSN, State = #state{sequencer = Sequencer, kcv = KCV, requests = Requests
 fail(Reason, State) ->
     {stop, Reason, unknown(State)}.
 
-unknown(State = #state{commits = Commits}) ->
-    maps:foreach(
-        fun
-            (_LSN, #commit{from = none}) -> ok;
-            (_LSN, #commit{from = From}) -> gen_server:reply(From, {error, commit_unknown_result})
-        end,
-        Commits
-    ),
-    State#state{commits = #{}}.
+%% Answers every client that waits: the clients of the closed batches and
+%% the clients of the open batch.
+unknown(State = #state{commits = Commits, batch = Batch}) ->
+    Waiting =
+        [From || #commit{clients = Clients} <- maps:values(Commits), {_Index, From} <- Clients] ++
+            [From || {From, _Resolved, _Entry} <- Batch],
+    lists:foreach(fun(From) -> gen_server:reply(From, {error, commit_unknown_result}) end, Waiting),
+    State#state{commits = #{}, batch = []}.
