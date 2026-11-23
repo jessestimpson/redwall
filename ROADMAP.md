@@ -158,10 +158,17 @@ has the basic functions. The remaining parts, in the planned order:
       ClusterController starts a Sequencer when a Sequencer, a LogServer,
       the Resolver or the Proxy fails.
 - [x] Recruit LogServers on other nodes, through a worker on each node.
-- [ ] Send the processes of the LogServers and of the Resolver in the
-      information of the ClusterController about the database, and read
-      them in the Proxy, the Sequencer and the StorageServer. This step
-      replaces the registry and its three waits.
+- [x] Make the Sequencer, the Resolver and the Proxy of an epoch one
+      process. The process recruits its LogServers itself, so the wait of
+      the Proxy for the names of its epoch is removed.
+- [ ] Send the processes of the LogServers in the information of the
+      ClusterController about the database, and read them in the recovery
+      and in the StorageServer. This step replaces the registry and its
+      remaining wait, in the recovery.
+- [ ] Make the worker and the candidate for the ClusterController one
+      process for each node.
+- [x] Name the module of the process of an epoch `deadlift_epoch`. Its
+      earlier name was `deadlift_proxy`.
 - [ ] Decide whether a candidate replaces the ClusterController only
       after a majority of the coordinators has no heartbeat, as in
       FoundationDB. Today one candidate without a connection to the
@@ -189,7 +196,10 @@ has the basic functions. The remaining parts, in the planned order:
         the model.
   - [ ] The shard map in system keys, changed by transactions, and the
         move of a shard between StorageServers.
-- [ ] Run more than one Proxy and more than one Resolver.
+- [ ] Decide how deadlift scales the conflict check and the entry point
+      for clients. The Sequencer, the Resolver and the Proxy of an epoch
+      are one process, so the items "more than one Proxy" and "more than
+      one Resolver" of FoundationDB do not apply in their form.
 - [ ] Write the records of a LogServer to disk, and start a LogServer
       again from the disk.
 - [ ] Discard the records of a LogServer that every StorageServer has

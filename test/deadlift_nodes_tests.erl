@@ -21,8 +21,7 @@ two_nodes() ->
     {ok, Ids, []} = peace:start_cluster(Ids, deadlift_cstate:machine(), Opts),
     ok = await_read(Ids, 50),
     Options = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0},
-    {ok, Sequencer} = deadlift_sequencer:start(Options),
-    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer}),
+    {ok, Proxy} = deadlift_epoch:start(Options),
     {ok, First} = deadlift_storage:start(#{coordinators => Ids, poll_ms => 5}),
     %% The test controls the second node through its standard input and
     %% output. The processes of the two nodes use Erlang distribution.
@@ -86,7 +85,7 @@ controller() ->
     Args = ["-setcookie", atom_to_list(erlang:get_cookie()), "-pa" | [Path || Path <- code:get_path(), filelib:is_dir(Path)]],
     {ok, Peer, Node} = peer:start_link(#{name => peer:random_name(), connection => standard_io, args => Args}),
     true = net_kernel:connect_node(Node),
-    Options = #{coordinators => Ids, poll_ms => 50, retry_ms => 20, min_workers => 2, sequencer => #{lock_timeout_ms => 200, versions_per_second => 0}},
+    Options = #{coordinators => Ids, poll_ms => 50, retry_ms => 20, min_workers => 2, proxy => #{lock_timeout_ms => 200, versions_per_second => 0}},
     {ok, Worker} = deadlift_worker:start(#{coordinators => Ids, class => stateless, poll_ms => 50}),
     {ok, A} = deadlift_cluster_controller:start(Options),
     try
@@ -99,8 +98,8 @@ controller() ->
         %% node and 1 is on the first node.
         ok = await(fun() -> epoch(deadlift_worker:db_info()) =:= 1 end, 300),
         ?assertMatch(#{role := leader, term := 1, workers := [_, _]}, deadlift_cluster_controller:info(A)),
-        Info1 = #{sequencer := Sequencer1, proxies := [Proxy1]} = deadlift_worker:db_info(),
-        ?assertEqual([node(), node()], [node(Sequencer1), node(Proxy1)]),
+        Info1 = #{proxies := [Proxy1]} = deadlift_worker:db_info(),
+        ?assertEqual(node(), node(Proxy1)),
         ?assertEqual(lists:sort([Node, Node, node()]), lists:sort([node(peer:call(Peer, deadlift_log, ref, [{1, Index}])) || Index <- [1, 2, 3]])),
         %% The worker of the second node has the same information.
         ok = await(fun() -> peer:call(Peer, deadlift_worker, db_info, []) =:= Info1 end, 100),
@@ -133,7 +132,7 @@ controller() ->
         ok = await(fun() -> maps:get(role, deadlift_cluster_controller:info(C)) =:= leader end, 300),
         ok = await(fun() -> maps:get(workers, deadlift_cluster_controller:info(C)) =:= [node()] end, 300),
         ?assertMatch(#{term := 3, db_info := #{epoch := undefined}}, deadlift_cluster_controller:info(C)),
-        ok = await(fun() -> deadlift_worker:db_info() =:= #{term => 3, epoch => undefined, sequencer => undefined, proxies => []} end, 100),
+        ok = await(fun() -> deadlift_worker:db_info() =:= #{term => 3, epoch => undefined, proxies => []} end, 100),
         exit(C, kill),
         ok = deadlift_storage:stop(Storage)
     after

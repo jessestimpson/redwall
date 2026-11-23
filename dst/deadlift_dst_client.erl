@@ -8,20 +8,20 @@
 
 -include("deadlift_eta.hrl").
 
--export([recover/4, transaction/5, join/2, start_log/3, start_resolver/3, start_proxy/3]).
+-export([recover/4, transaction/5, join/2, start_log/3]).
 -export([worker/5, force_recovery/1, worker_node/1]).
--export([sequencer_node/1, proxy_node/1, log_node/1, resolver_node/1, storage_node/1, keys/0]).
+-export([sequencer_node/1, log_node/1, storage_node/1, keys/0]).
 
-%% Starts a Sequencer, waits for the end of its recovery, and starts a
-%% Proxy for the new epoch. This is the work of a ClusterController. The
-%% runs without the config key `controller' use this function.
+%% Starts the process of a new epoch and waits for the end of its
+%% recovery. This is the work of a ClusterController. The runs without the
+%% config key `controller' use this function.
 %%
 %% `N' is the number of the operation. `Mode' selects a planted defect.
 recover(Tab, N, CState, Mode) ->
     ok = join(Tab, Mode),
-    %% Each LogServer runs on a simulated node of its own. The Sequencer
-    %% starts the LogServer on that node through `erpc'. The call has a
-    %% limit of time, because the network can lose the request.
+    %% Each LogServer runs on a simulated node of its own. The process of
+    %% the epoch starts the LogServer on that node through `erpc'. The call
+    %% has a limit of time, because the network can lose the request.
     Recruit = fun(Log = #{id := Id}) ->
         Log1 =
             case Mode of
@@ -38,69 +38,24 @@ recover(Tab, N, CState, Mode) ->
             Class:Reason -> {error, {Class, Reason}}
         end
     end,
-    %% The Resolver of the epoch runs on a node of its own.
-    RecruitResolver = fun(Resolver) ->
-        Options = Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range},
-        ok = eta_net:place(resolver_node(N), []),
-        try
-            erpc:call(resolver_node(N), ?MODULE, start_resolver, [Tab, Options, Mode], 1000)
-        catch
-            error:{erpc, Reason} -> {error, {erpc, Reason}};
-            Class:Reason -> {error, {Class, Reason}}
-        end
-    end,
-    Options0 = #{
+    Options = (proxy_options(N, Mode))#{
         coordinators => {local, CState},
         logs => 3,
         replication => 2,
         lock_timeout_ms => 200,
-        recruit => Recruit,
-        recruit_resolver => RecruitResolver
+        recruit => Recruit
     },
-    Options =
-        case Mode of
-            %% The planted defect: the first commit version of an epoch is
-            %% the Recovery Version plus 1, inside the MVCC window.
-            no_gap -> Options0#{epoch_gap => 1};
-            _ -> Options0
-        end,
-    %% The Sequencer starts on the node of this process.
-    {ok, Sequencer} = deadlift_sequencer:start(Options),
-    true = ets:insert(Tab, {{sequencer, N}, Sequencer}),
-    try deadlift_sequencer:recovered(Sequencer) of
+    %% The process starts on the node of this process.
+    {ok, Proxy} = deadlift_epoch:start(Options),
+    true = ets:insert(Tab, {{sequencer, N}, Proxy}),
+    try deadlift_epoch:recovered(Proxy) of
         {ok, #{epoch := Epoch, recovery_version := RV, previous_epoch_end_version := PEV}} ->
-            Ack =
-                case Mode of
-                    ack_replicas -> replicas;
-                    _ -> all
-                end,
-            %% The batch time of the Proxy is 0 ms, 5 ms or 50 ms of the
-            %% virtual clock. The Proxy starts on a node of its own.
-            ProxyOptions = #{
-                sequencer => Sequencer,
-                ack => Ack,
-                report => Mode =/= no_report,
-                confirm => Mode =/= no_confirm,
-                batch_ms => lists:nth(N rem 3 + 1, [0, 5, 50]),
-                %% 1 Proxy in 2 closes a batch at once when no batch is
-                %% in progress, and 1 Proxy in 2 shares the confirmations
-                %% for read versions.
-                batch_idle => N rem 2 =:= 0,
-                read_version_share => N div 2 rem 2 =:= 0
-            },
-            ok = eta_net:place(proxy_node(N), []),
-            try erpc:call(proxy_node(N), ?MODULE, start_proxy, [Tab, ProxyOptions, Mode], 1000) of
-                {ok, Proxy} -> true = ets:insert(Tab, {{proxy, N}, Proxy, Epoch})
-            catch
-                %% The epoch has no Proxy.
-                _:_ -> true = ets:insert(Tab, {{no_proxy, N}, Epoch})
-            end,
-            true = ets:insert(Tab, {{recovered, N}, Epoch, PEV, RV})
+            true = ets:insert(Tab, [{{proxy, N}, Proxy, Epoch}, {{recovered, N}, Epoch, PEV, RV}])
     catch
         exit:{{shutdown, {recovery, Reason}}, _Call} ->
             true = ets:insert(Tab, {{recovery_failed, N}, Reason});
         exit:Reason ->
-            %% The Sequencer was killed, or did not answer in time.
+            %% The process was killed, or did not answer in time.
             true = ets:insert(Tab, {{recovery_failed, N}, {exit, reason(Reason)}})
     end.
 
@@ -117,25 +72,13 @@ worker(Tab, CState, Mode, Class, Candidate) ->
     true = ets:insert(Tab, {{worker, Node}, Worker, Class}),
     case Candidate of
         true ->
-            Sequencer0 = #{lock_timeout_ms => 200},
-            Sequencer =
-                case Mode of
-                    no_gap -> Sequencer0#{epoch_gap => 1};
-                    _ -> Sequencer0
-                end,
-            Ack =
-                case Mode of
-                    ack_replicas -> replicas;
-                    _ -> all
-                end,
             {ok, Controller} = deadlift_cluster_controller:start(#{
                 coordinators => Coordinators,
                 logs => 3,
                 replication => 2,
                 %% Each LogServer of an epoch is on a node of its own.
                 min_workers => 3,
-                sequencer => Sequencer,
-                proxy => #{ack => Ack, report => Mode =/= no_report, confirm => Mode =/= no_confirm},
+                proxy => #{lock_timeout_ms => 200},
                 poll_ms => 200,
                 retry_ms => 50,
                 recovery_timeout_ms => 2000,
@@ -156,19 +99,13 @@ start_role(Tab, Node, Mode, Role, Options0) ->
     Options =
         case {Role, Mode} of
             {log, no_copy} -> Options0#{records := []};
-            {resolver, _} -> Options0#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range};
-            %% 1 Proxy in 2 closes a batch at once when no batch is in
-            %% progress, and 1 Proxy in 2 shares the confirmations for
-            %% read versions.
-            {proxy, _} -> Options0#{batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50]), batch_idle => Count rem 2 =:= 0, read_version_share => Count div 2 rem 2 =:= 0};
+            {proxy, _} -> maps:merge(Options0, proxy_options(Count, Mode));
             _ -> Options0
         end,
     Start =
         case Role of
             log -> fun deadlift_log:start/1;
-            resolver -> fun deadlift_resolver:start/1;
-            proxy -> fun deadlift_proxy:start/1;
-            sequencer -> fun deadlift_sequencer:start/1
+            proxy -> fun deadlift_epoch:start/1
         end,
     case Start(Options) of
         {ok, Pid} ->
@@ -177,9 +114,15 @@ start_role(Tab, Node, Mode, Role, Options0) ->
                     #{id := Id} when Role =:= log -> {log, Id};
                     _ -> {Role, Count}
                 end,
-            %% The row of a Proxy has the epoch, so the function `event/3'
-            %% inserts it after the recovery.
-            _ = Role =/= proxy andalso ets:insert(Tab, {Key, Pid}),
+            %% The row `{proxy, _}' of the process of an epoch has the
+            %% epoch, so the function `event/3' inserts it after the
+            %% recovery. The row `{sequencer, _}' has each such process
+            %% from its start.
+            _ =
+                case Role of
+                    proxy -> ets:insert(Tab, {{sequencer, {controller, Count}}, Pid});
+                    log -> ets:insert(Tab, {Key, Pid})
+                end,
             true = ets:insert(Tab, {{at, Pid}, Node, Role}),
             {ok, Pid};
         Error ->
@@ -216,6 +159,34 @@ force_recovery(Tab) ->
         lists:sort(ets:match(Tab, {{controller, '_'}, '$1'}))
     ).
 
+%% The options of the process of an epoch for a planted defect. `Count'
+%% selects the batch time of 0 ms, 5 ms or 50 ms of the virtual clock.
+%% 1 process in 2 closes a batch at once when no batch is in progress, and
+%% 1 process in 2 shares the confirmations for read versions.
+proxy_options(Count, Mode) ->
+    Options = #{
+        ack =>
+            case Mode of
+                ack_replicas -> replicas;
+                _ -> all
+            end,
+        report => Mode =/= no_report,
+        confirm => Mode =/= no_confirm,
+        check => Mode =/= no_check,
+        check_ranges => Mode =/= no_range_check,
+        check_batch => Mode =/= no_batch_check,
+        check_write_ranges => Mode =/= no_write_range,
+        batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50]),
+        batch_idle => Count rem 2 =:= 0,
+        read_version_share => Count div 2 rem 2 =:= 0
+    },
+    case Mode of
+        %% The planted defect: the first commit version of an epoch is the
+        %% Recovery Version plus 1, inside the MVCC window.
+        no_gap -> Options#{epoch_gap => 1};
+        _ -> Options
+    end.
+
 %% Starts the registry of the node of the caller, and connects the node to
 %% every node of the run that has a registry. The function does nothing if
 %% the node has a registry. With the planted defect `no_exchange', the
@@ -242,16 +213,6 @@ start_log(Tab, Log = #{id := Id}, Mode) ->
         Error ->
             Error
     end.
-
-%% Starts a Resolver on the node of the caller.
-start_resolver(Tab, Options, Mode) ->
-    ok = join(Tab, Mode),
-    deadlift_resolver:start(Options).
-
-%% Starts a Proxy on the node of the caller.
-start_proxy(Tab, Options, Mode) ->
-    ok = join(Tab, Mode),
-    deadlift_proxy:start(Options).
 
 %% Runs one transaction. `C' is the number of the client.
 %%
@@ -322,7 +283,7 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
     Start = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
     %% The client asks the Proxy `Reader' for the read version itself,
     %% because the Proxy of the commit can be another one.
-    case deadlift_proxy:read_version(Reader) of
+    case deadlift_epoch:read_version(Reader) of
         {ok, ReadVersion} ->
             ok = deadlift:set_read_version(Tx, ReadVersion),
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
@@ -456,9 +417,7 @@ sequencer_node(N) -> list_to_atom("sequencer_" ++ integer_to_list(N)).
 
 worker_node(N) -> list_to_atom("worker_" ++ integer_to_list(N)).
 
-proxy_node(N) -> list_to_atom("proxy_" ++ integer_to_list(N)).
 
-resolver_node(N) -> list_to_atom("resolver_" ++ integer_to_list(N)).
 
 %% The node of the StorageServer of the place `Slot' that the operation
 %% `N' started. The first StorageServer of a place has the number 0.

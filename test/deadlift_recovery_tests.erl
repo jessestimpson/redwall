@@ -161,40 +161,57 @@ two_recoveries_at_once(Ids) ->
     ?assertEqual(3, length(Recruited)),
     [?assertNot(is_process_alive(L)) || L <- Recruited].
 
-%% Two Sequencers, one after the other. Each Sequencer commits the recovery
-%% transaction of its epoch, and assigns the LSNs above it.
+%% The processes of two epochs, one after the other. Each process commits
+%% the recovery transaction of its epoch, and assigns the LSNs above it.
 sequencer(Ids) ->
-    {ok, S1} = deadlift_sequencer:start_link(options(Ids)),
+    {ok, P1} = deadlift_epoch:start_link(options(Ids)),
     %% The recovery transaction of epoch 1 has the LSN 1.
-    ?assertEqual({ok, 1, 1, 2}, deadlift_sequencer:commit_version(S1)),
-    ?assertEqual({ok, 1, 2, 3}, deadlift_sequencer:commit_version(S1)),
-    {ok, #{epoch := 1, log_system := #{logs := Logs}, recovery_transaction_version := 1}} = deadlift_sequencer:recovered(S1),
+    {ok, #{epoch := 1, log_system := #{logs := Logs}, recovery_transaction_version := 1}} = deadlift_epoch:recovered(P1),
     [?assertMatch(#{dv := 1, kcv := 0}, deadlift_log:info(deadlift_log:ref(L))) || L <- Logs],
     ?assertEqual(
         2,
         length([L || L <- Logs, {ok, [{1, 0, {body, recovery_transaction}}]} =:= deadlift_log:peek(deadlift_log:ref(L), 0, infinity)])
     ),
-    {ok, S2} = deadlift_sequencer:start_link(options(Ids)),
-    %% The recovery transaction of epoch 2 has the LSN 1001: the Recovery
+    ?assertEqual({ok, 1}, deadlift_epoch:read_version(P1)),
+    ?assertEqual({ok, 2}, deadlift_epoch:commit(P1, a)),
+    ?assertEqual({ok, 3}, deadlift_epoch:commit(P1, b)),
+    {ok, P2} = deadlift_epoch:start_link(options(Ids)),
+    %% The recovery transaction of epoch 2 has the LSN 1003: the Recovery
     %% Version plus the versions in flight.
-    ?assertEqual({ok, 2, 1001, 1002}, deadlift_sequencer:commit_version(S2)),
-    ?assertMatch({ok, #{epoch := 2, recovery_version := 1, recovery_transaction_version := 1001}}, deadlift_sequencer:recovered(S2)),
-    ?assertEqual({ok, 1001}, deadlift_sequencer:read_version(S2)),
-    %% The Sequencer assigns no version that is 1000 or more above the read
-    %% version.
-    [{ok, 2, _, _} = deadlift_sequencer:commit_version(S2) || _ <- lists:seq(1003, 2000)],
-    ?assertEqual({error, versions_in_flight}, deadlift_sequencer:commit_version(S2)),
-    %% The Sequencer of the ended epoch still assigns versions. The
-    %% LogServers of the ended epoch store no record.
-    ?assertEqual({ok, 1, 3, 4}, deadlift_sequencer:commit_version(S1)),
-    ?assertEqual({error, stopped}, deadlift_log:push(deadlift_log:ref(hd(Logs)), 1, 1, 2, 0, empty)),
-    %% A Sequencer whose recovery fails stops.
+    ?assertMatch({ok, #{epoch := 2, recovery_version := 3, recovery_transaction_version := 1003}}, deadlift_epoch:recovered(P2)),
+    ?assertEqual({ok, 1003}, deadlift_epoch:read_version(P2)),
+    ?assertEqual({ok, 1004}, deadlift_epoch:commit(P2, c)),
+    %% The LogServers of the ended epoch store no record.
+    ?assertEqual({error, stopped}, deadlift_log:push(deadlift_log:ref(hd(Logs)), 1, 3, 4, 0, empty)),
+    %% A process whose recovery fails stops.
     process_flag(trap_exit, true),
-    {ok, S3} = deadlift_sequencer:start_link((options(Ids))#{recruit => fun(_) -> {error, none} end}),
+    {ok, P3} = deadlift_epoch:start_link((options(Ids))#{recruit => fun(_) -> {error, none} end}),
     receive
-        {'EXIT', S3, Reason} -> ?assertEqual({shutdown, {recovery, {recruit, none}}}, Reason)
-    after 5000 -> error(sequencer_did_not_stop)
+        {'EXIT', P3, Reason} -> ?assertEqual({shutdown, {recovery, {recruit, none}}}, Reason)
+    after 5000 -> error(process_did_not_stop)
     end,
     process_flag(trap_exit, false),
-    ok = deadlift_sequencer:stop(S1),
-    ok = deadlift_sequencer:stop(S2).
+    unlink(P1),
+    unlink(P2),
+    exit(P1, kill),
+    exit(P2, kill).
+
+%% The rules of the Sequencer for the versions.
+versions_test() ->
+    Options = #{versions_per_second => 0},
+    %% The first version of an epoch is 1, or the Recovery Version plus the
+    %% versions in flight, or plus `epoch_gap'.
+    ?assertEqual(1, deadlift_sequencer:first_version(0, Options)),
+    ?assertEqual(1007, deadlift_sequencer:first_version(7, Options)),
+    ?assertEqual(100000007, deadlift_sequencer:first_version(7, #{})),
+    ?assertEqual(8, deadlift_sequencer:first_version(7, #{epoch_gap => 1})),
+    %% Without a clock, each version is the previous one plus 1.
+    ?assertEqual({ok, 11}, deadlift_sequencer:next_version(10, 0, 5000000, 10, Options)),
+    %% No version is 1,000 or more above the read version.
+    ?assertEqual({ok, 1009}, deadlift_sequencer:next_version(1008, 0, 0, 10, Options)),
+    ?assertEqual({error, versions_in_flight}, deadlift_sequencer:next_version(1009, 0, 0, 10, Options)),
+    %% With the clock, a version adds the versions of the time since the
+    %% last version: at least 1, and at most the versions of 5 seconds.
+    ?assertEqual({ok, 11}, deadlift_sequencer:next_version(10, 1000, 1000, 10, #{})),
+    ?assertEqual({ok, 20010}, deadlift_sequencer:next_version(10, 1000, 21000, 10, #{})),
+    ?assertEqual({ok, 5000010}, deadlift_sequencer:next_version(10, 0, 60000000, 10, #{})).

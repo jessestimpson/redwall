@@ -9,7 +9,7 @@
 %%   run has no peace cluster. The process applies one value at a time,
 %%   which is the register with atomic operations of
 %%   `formal/Recovery.tla'.</li>
-%% <li>Each simulated node with a Sequencer, a LogServer, a Proxy or a
+%% <li>Each simulated node with the process of an epoch, a LogServer or a
 %%   StorageServer has its own `deadlift_registry' process, with its own
 %%   table of names. The registries exchange the names in messages of
 %%   the simulated network.</li>
@@ -18,9 +18,9 @@
 %%   other in this way by default (`connect_all' of the kernel
 %%   application). eta connects two nodes only on request or with a
 %%   message.</li>
-%% <li>A `recover' operation starts a Sequencer. When the recovery of the
-%%   Sequencer ends, the operation starts a Proxy for the new epoch. This
-%%   is the work of a ClusterController. In these runs the harness does
+%% <li>A `recover' operation starts the process of a new epoch
+%%   (`deadlift_epoch'), which does the work of the Sequencer, of the
+%%   Resolver and of the Proxy. This is the work of a ClusterController. In these runs the harness does
 %%   this work at times that the seed selects, so two recoveries overlap
 %%   more often than with a ClusterController.</li>
 %% <li>A recovery recruits 3 LogServers with a replication degree of
@@ -31,8 +31,8 @@
 %%   the StorageServer, each Sequencer, each Proxy, each Resolver and each
 %%   LogServer run on a simulated node of their own. All clients share one node. The network policy of the
 %%   run can lose or delay a message between two nodes.</li>
-%% <li>A LogServer and a Proxy start on their own node, through `erpc'
-%%   from the node of the Sequencer.</li>
+%% <li>A LogServer starts on its own node, through `erpc' from the node
+%%   of the process of the epoch.</li>
 %% </ul>
 %%
 %% == Runs with ClusterControllers ==
@@ -73,7 +73,7 @@
 %%   is the leader.</li>
 %% <li>`stale_leader' - no other process is a leader.</li>
 %% <li>`epoch' - the leader has the current epoch of the coordinated
-%%   state, and the Sequencer and the Proxy of the epoch run.</li>
+%%   state, and the process of the epoch runs.</li>
 %% <li>`worker_db_info' - each worker that runs has the information of
 %%   the leader about the database.</li>
 %% </ul>
@@ -81,7 +81,7 @@
 %% == Workload ==
 %%
 %% <ul>
-%% <li>`recover': start a Sequencer and, after its recovery, a Proxy.</li>
+%% <li>`recover': start the process of a new epoch.</li>
 %% <li>`{transaction, R1, R2}': a client runs one transaction. It gets a
 %%   read version from one Proxy, and commits through a Proxy that can be
 %%   another one. Between the two steps, the client reads its read keys
@@ -98,10 +98,14 @@
 %%   harness kills at most 1 LogServer of each epoch, because the design
 %%   tolerates the loss of k - 1 LogServers of an epoch, and a LogServer of
 %%   deadlift keeps its records in memory.</li>
-%% <li>`{kill_sequencer, R}': kill one Sequencer. The Sequencer can be in
-%%   the middle of a recovery.</li>
-%% <li>`{kill_proxy, R}': kill one Proxy.</li>
-%% <li>`{kill_resolver, R}': kill the Resolver of one epoch.</li>
+%% <li>`{kill_sequencer, R}': kill the process of one epoch. The process
+%%   can be in the middle of its recovery.</li>
+%% <li>`{kill_proxy, R}': kill the process of one epoch whose recovery
+%%   has ended.</li>
+%% <li>`{kill_resolver, R}': kill the process of one epoch whose recovery
+%%   has ended, at most once for each epoch. The three operations are
+%%   from the time when the Sequencer, the Proxy and the Resolver were
+%%   three processes.</li>
 %% <li>`{kill_storage, R}': kill one StorageServer, and start a new
 %%   StorageServer without data on a new node. The new StorageServer reads
 %%   every record from the LogServers of every epoch. In a run with
@@ -478,18 +482,20 @@ execute({transaction, R1, R2}, N, S = #{tab := Tab}) ->
     end;
 execute({Kill, R}, _N, S = #{tab := Tab, controller := true}) when Kill =:= kill_log; Kill =:= kill_sequencer; Kill =:= kill_proxy; Kill =:= kill_resolver ->
     %% With ClusterControllers, a kill stops the worker node of a role
-    %% that runs, with every role on the node.
-    Role =
+    %% that runs, with every role on the node. The process of an epoch
+    %% does the work of the Sequencer, of the Resolver and of the Proxy,
+    %% so the three kills stop the node of such a process.
+    {Role, Name} =
         case Kill of
-            kill_log -> log;
-            kill_sequencer -> sequencer;
-            kill_proxy -> proxy;
-            kill_resolver -> resolver
+            kill_log -> {log, log};
+            kill_sequencer -> {proxy, sequencer};
+            kill_proxy -> {proxy, proxy};
+            kill_resolver -> {proxy, resolver}
         end,
     Nodes = lists:usort([Node || [Pid, Node] <- ets:match(Tab, {{at, '$1'}, '$2', Role}), is_process_alive(Pid)]),
     case pick(R, Nodes) of
         none -> S;
-        Node -> kill_worker(Node, Role, S)
+        Node -> kill_worker(Node, Name, S)
     end;
 execute({kill_log, R}, _N, S = #{tab := Tab, cstate := CState}) ->
     case current(CState) of
@@ -518,7 +524,7 @@ execute({kill_sequencer, R}, _N, S = #{tab := Tab}) ->
 execute({kill_proxy, R}, _N, S = #{tab := Tab}) ->
     case pick(R, [N || [N, Pid] <- ets:match(Tab, {{proxy, '$1'}, '$2', '_'}), is_process_alive(Pid)]) of
         none -> S;
-        N -> kill(deadlift_dst_client:proxy_node(N), kills_proxy, S)
+        N -> kill(deadlift_dst_client:sequencer_node(N), kills_proxy, S)
     end;
 execute({kill_resolver, R}, _N, S = #{tab := Tab}) ->
     Running = [N || [N] <- ets:match(Tab, {{recovered, '$1'}, '_', '_', '_'}), not ets:member(Tab, {killed_resolver, N})],
@@ -527,7 +533,7 @@ execute({kill_resolver, R}, _N, S = #{tab := Tab}) ->
             S;
         N ->
             true = ets:insert(Tab, {{killed_resolver, N}, true}),
-            kill(deadlift_dst_client:resolver_node(N), kills_resolver, S)
+            kill(deadlift_dst_client:sequencer_node(N), kills_resolver, S)
     end;
 execute({kill_storage, R}, N, S = #{tab := Tab, cstate := CState, mode := Mode, window := Window, storage_count := Count}) ->
     Slot = R rem Count + 1,
@@ -627,8 +633,7 @@ one_leader(Tab) ->
 %%   is the leader of the term of the coordinated state.</li>
 %% <li>`stale_leader' - no other process is a leader.</li>
 %% <li>`epoch' - the leader has an epoch, which is the current epoch of
-%%   the coordinated state, and the Sequencer and the Proxy of the epoch
-%%   run.</li>
+%%   the coordinated state, and the process of the epoch runs.</li>
 %% <li>`worker_db_info' - each worker that runs has the information of
 %%   the leader about the database.</li>
 %% </ul>
@@ -656,8 +661,8 @@ check_final(_Settled, #{tab := Tab, cstate := CState, controller := true, last_o
                 end,
                 fun() ->
                     case Info of
-                        #{epoch := Epoch, sequencer := Sequencer, proxies := [Proxy]} ->
-                            case Alive(Sequencer) andalso Alive(Proxy) of
+                        #{epoch := Epoch, proxies := [Proxy]} ->
+                            case Alive(Proxy) of
                                 true -> ok;
                                 false -> violation(epoch, #{epoch => Epoch, reason => role_down})
                             end;

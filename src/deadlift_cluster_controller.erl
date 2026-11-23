@@ -1,7 +1,10 @@
 %% @doc The ClusterController.
 %%
 %% The ClusterController monitors the roles of the transaction system and
-%% recruits a new Sequencer when a role fails. See section 2.3.1 of Zhou
+%% recruits a new Sequencer when a role fails. In deadlift, the Sequencer,
+%% the Resolver and the Proxy of an epoch are one process
+%% ({@link deadlift_epoch}), which this module calls the process of the
+%% epoch. See section 2.3.1 of Zhou
 %% et al., "FoundationDB: A Distributed Unbundled Transactional Key Value
 %% Store", SIGMOD 2021, and `fdbserver/ClusterController.actor.cpp' and
 %% `design/recovery-internals.md' of FoundationDB 7.3.
@@ -55,32 +58,26 @@
 %%   different worker in each attempt. For the LogServers, the workers of
 %%   the class `log' come first and the workers of the class `stateless'
 %%   last. The first `logs' workers of this order receive one LogServer
-%%   each. For the Sequencer, the Resolver and the Proxy, the workers of
-%%   the class `stateless' come first and the workers of the class `log'
-%%   last. The first three workers of this order receive one of these
-%%   roles each. With fewer workers, a worker receives several roles.
-%%   With the option `stateless => together', the first worker of this
-%%   order receives the three roles. A message between two of them then
-%%   stays inside one node. The failure of each of the three roles starts
-%%   a recovery in both cases.</li>
-%% <li>The leader starts the Sequencer. The Sequencer performs the
-%%   recovery, and starts the LogServers and the Resolver on the chosen
-%%   workers.</li>
-%% <li>After the recovery, the leader starts the Proxy.</li>
+%%   each. For the process of the epoch, the workers of the class
+%%   `stateless' come first and the workers of the class `log' last. The
+%%   first worker of this order receives the process. With fewer workers,
+%%   a worker receives several roles.</li>
+%% <li>The leader starts the process of the epoch. The process performs
+%%   the recovery, and starts the LogServers on the chosen workers.</li>
 %% <li>The leader sends the information about the database to every
 %%   worker (see {@link deadlift_worker}).</li>
 %% </ol>
 %%
-%% The leader monitors the Sequencer, the LogServers, the Resolver and the
-%% Proxy of the attempt. When one of them stops, or the connection to its
-%% node ends, or the recovery fails, the leader abandons the attempt and
-%% recruits again after `retry_ms' (default 500 ms).
+%% The leader monitors the process of the epoch and the LogServers of the
+%% attempt. When one of them stops, or the connection to its node ends, or
+%% the recovery fails, the leader abandons the attempt and recruits again
+%% after `retry_ms' (default 500 ms).
 %%
 %% The leader also compares the recovery count of the coordinated state
-%% with its epoch at every read. If the count is above the epoch, another
-%% Sequencer has started a recovery, and the leader recruits again. In
-%% FoundationDB, the roles of an ended epoch stop, and the
-%% ClusterController learns it from their failure.
+%% with its epoch at every read. If the count is above the epoch, the
+%% process of another epoch has started a recovery, and the leader
+%% recruits again. In FoundationDB, the roles of an ended epoch stop, and
+%% the ClusterController learns it from their failure.
 %%
 %% == Departures from FoundationDB ==
 %%
@@ -92,10 +89,11 @@
 %%   detects the failure of the leader with an Erlang monitor. This part
 %%   is not in the paper.</li>
 %% <li>In FoundationDB 7.3 the recovery runs in the process of the
-%%   ClusterController. In deadlift the Sequencer performs the recovery,
-%%   as in the paper.</li>
-%% <li>In the paper, the Sequencer recruits the Proxies. In deadlift the
-%%   ClusterController starts the Proxy after the recovery.</li>
+%%   ClusterController. In deadlift the process of the epoch performs the
+%%   recovery, as the Sequencer of the paper does.</li>
+%% <li>The ClusterController recruits one process for the Sequencer, the
+%%   Resolver and the Proxy. FoundationDB recruits a process for each
+%%   role.</li>
 %% </ul>
 %%
 %% == Limitations ==
@@ -105,14 +103,13 @@
 %%   leader ends. If two candidates cannot connect to each other and both
 %%   can connect to the coordinators, each election replaces the leader,
 %%   and each new leader starts a recovery.</li>
-%% <li>The leader does not stop the roles of an abandoned epoch. A
-%%   Sequencer and a Proxy of an ended epoch continue to run.</li>
-%% <li>The leader learns the Sequencer of an attempt in a message. If the
+%% <li>The leader does not stop the process of an abandoned epoch whose
+%%   recovery has ended. The process continues to run.</li>
+%% <li>The leader learns the process of an attempt in a message. If the
 %%   leader abandons the attempt before that message, the leader stops
-%%   the Sequencer when the message arrives. If the network loses the
-%%   message, the Sequencer continues, and the recovery of the next
-%%   attempt can fail on the recovery count. The leader then recruits
-%%   again.</li>
+%%   the process when the message arrives. If the network loses the
+%%   message, the process continues, and the recovery of the next attempt
+%%   can fail on the recovery count. The leader then recruits again.</li>
 %% <li>The leader keeps the workers and the epoch in memory. A new leader
 %%   starts a recovery, also when the roles of the current epoch run.
 %%   FoundationDB has the same property.</li>
@@ -134,19 +131,14 @@
 
 -export_type([options/0, event/0]).
 
-%% `sequencer' holds further options of the Sequencer, and `proxy' further
-%% options of the Proxy. `notify' receives the events of the process. A
+%% `proxy' holds further options of the process of the epoch. `notify' receives the events of the process. A
 %% test uses it.
 -type options() :: #{
     coordinators := deadlift_cstate:servers(),
     logs => pos_integer(),
     replication => pos_integer(),
     min_workers => pos_integer(),
-    %% `spread' places the Sequencer, the Resolver and the Proxy on three
-    %% workers. `together' places them on one worker. The default is
-    %% `spread'.
-    stateless => spread | together,
-    sequencer => map(),
+
     proxy => map(),
     poll_ms => pos_integer(),
     retry_ms => non_neg_integer(),
@@ -170,13 +162,14 @@
     | {role_failed, deadlift_worker:role(), pid()}
     | {superseded, Epoch :: pos_integer(), Count :: pos_integer()}.
 %% `{recovered, Result}' has the result of the recovery
-%% (`deadlift_recovery:result()') with the keys `sequencer' and `proxy'.
+%% (`deadlift_recovery:result()') with the key `proxy'.
 
 -record(generation, {
     attempt :: pos_integer(),
     %% The process that waits for the recovery, with its monitor.
     recruiter :: {pid(), reference()} | undefined,
-    sequencer :: pid() | undefined,
+    %% The process of the epoch.
+    proxy :: pid() | undefined,
     %% The monitored roles of the attempt.
     roles = #{} :: #{reference() => {deadlift_worker:role(), pid()}},
     recovered = false :: boolean()
@@ -284,26 +277,22 @@ handle_info({recruited, Attempt, Role, Pid}, State = #state{role = leader, gener
     Generation1 = Generation#generation{roles = Roles#{erlang:monitor(process, Pid) => {Role, Pid}}},
     Generation2 =
         case Role of
-            sequencer -> Generation1#generation{sequencer = Pid};
+            proxy -> Generation1#generation{proxy = Pid};
             _ -> Generation1
         end,
     {noreply, State#state{generation = Generation2}};
-handle_info({recruited, _Attempt, sequencer, Pid}, State = #state{role = leader}) ->
-    %% The Sequencer of an attempt that the leader has abandoned. The
+handle_info({recruited, _Attempt, proxy, Pid}, State = #state{role = leader}) ->
+    %% The process of an attempt that the leader has abandoned. The
     %% clause above handles the attempt of the generation.
     exit(Pid, kill),
     {noreply, State};
 handle_info({recovered, Attempt, Result, Proxy}, State = #state{role = leader, generation = Generation = #generation{attempt = Attempt}}) ->
     #state{term = Term} = State,
-    #generation{recruiter = {_Pid, Monitor}, sequencer = Sequencer, roles = Roles} = Generation,
+    #generation{recruiter = {_Pid, Monitor}} = Generation,
     true = erlang:demonitor(Monitor, [flush]),
-    Generation1 = Generation#generation{
-        recruiter = undefined,
-        roles = Roles#{erlang:monitor(process, Proxy) => {proxy, Proxy}},
-        recovered = true
-    },
-    Info = #{term => Term, epoch => maps:get(epoch, Result), sequencer => Sequencer, proxies => [Proxy]},
-    ok = notify({recovered, Result#{sequencer => Sequencer, proxy => Proxy}}, State),
+    Generation1 = Generation#generation{recruiter = undefined, proxy = Proxy, recovered = true},
+    Info = #{term => Term, epoch => maps:get(epoch, Result), proxies => [Proxy]},
+    ok = notify({recovered, Result#{proxy => Proxy}}, State),
     {noreply, broadcast(State#state{generation = Generation1, db_info = Info})};
 handle_info({recruit_failed, Attempt, Reason}, State = #state{role = leader, generation = #generation{attempt = Attempt}}) ->
     ok = notify({recovery_failed, Reason}, State),
@@ -325,9 +314,9 @@ handle_info({'DOWN', Monitor, process, Pid, Reason}, State = #state{workers = Wo
         {_, #generation{recruiter = {Pid, Monitor}}} ->
             ok = notify({recovery_failed, {recruiter, Reason}}, State),
             {noreply, retry(abandon(State))};
-        {_, #generation{roles = Roles = #{Monitor := {sequencer, Pid}}, recovered = false, recruiter = {_, _}}} ->
-            %% The Sequencer stopped during its recovery. The recruiter
-            %% waits for the Sequencer and reports the reason.
+        {_, #generation{roles = Roles = #{Monitor := {proxy, Pid}}, recovered = false, recruiter = {_, _}}} ->
+            %% The process of the epoch stopped during its recovery. The
+            %% recruiter waits for the process and reports the reason.
             {noreply, State#state{generation = Generation#generation{roles = maps:remove(Monitor, Roles)}}};
         {_, #generation{roles = #{Monitor := {Role, Pid}}}} ->
             ok = notify({role_failed, Role, Pid}, State),
@@ -440,7 +429,7 @@ lead(Term, State = #state{monitor = Old}) ->
         known = {Term, self()},
         monitor = undefined,
         down = false,
-        db_info = #{term => Term, epoch => undefined, sequencer => undefined, proxies => []}
+        db_info = #{term => Term, epoch => undefined, proxies => []}
     },
     ok = notify({leader, Term}, State1),
     State1.
@@ -458,7 +447,7 @@ maybe_recruit(State = #state{role = leader, generation = undefined, waiting = fa
     case map_size(Workers) >= maps:get(min_workers, Options, 1) of
         true ->
             Attempt = Attempt0 + 1,
-            Plan = plan(Workers, Logs, Attempt, maps:get(stateless, Options, spread)),
+            Plan = plan(Workers, Logs, Attempt),
             ok = notify({recruiting, Attempt, Plan}, State),
             Recruiter = spawn_monitor(?MODULE, recruit, [self(), Attempt, Plan, Options]),
             State#state{attempt = Attempt, generation = #generation{attempt = Attempt, recruiter = Recruiter}};
@@ -470,7 +459,7 @@ maybe_recruit(State) ->
 
 %% The workers of the roles of one attempt. The workers are in the order
 %% of their nodes, and the attempt selects the first worker.
-plan(Workers, Logs, Attempt, Stateless0) ->
+plan(Workers, Logs, Attempt) ->
     Sorted = lists:sort([{Node, Class, Worker} || {Worker, {Node, Class, _Monitor}} <- maps:to_list(Workers)]),
     Count = length(Sorted),
     %% The workers of one rank in the order of their nodes, with a first
@@ -492,26 +481,17 @@ plan(Workers, Logs, Attempt, Stateless0) ->
     ForLogs = Order(#{log => 0, unset => 1, stateless => 2}),
     Stateless = Order(#{stateless => 0, unset => 1, log => 2}),
     Nth = fun(N, List) -> lists:nth(N rem Count + 1, List) end,
-    %% With `together', the three roles are on the first worker of the
-    %% order.
-    Step =
-        case Stateless0 of
-            spread -> 1;
-            together -> 0
-        end,
     #{
         logs => [Nth(N, ForLogs) || N <- lists:seq(0, Logs - 1)],
-        sequencer => Nth(0, Stateless),
-        resolver => Nth(Step, Stateless),
-        proxy => Nth(2 * Step, Stateless)
+        proxy => Nth(0, Stateless)
     }.
 
 %% @private
-%% The process of one attempt. It starts the Sequencer, waits for the end
-%% of the recovery, and starts the Proxy. The Sequencer calls `Recruit' and
-%% `RecruitResolver' in its own process.
+%% The process of one attempt. It starts the process of the epoch and waits
+%% for the end of its recovery. The process of the epoch calls `Recruit'
+%% in its own process.
 recruit(Controller, Attempt, Plan, Options = #{coordinators := Coordinators}) ->
-    #{logs := LogWorkers, sequencer := SequencerWorker, resolver := ResolverWorker, proxy := ProxyWorker} = Plan,
+    #{logs := LogWorkers, proxy := ProxyWorker} = Plan,
     Report = fun
         (Role, Reply = {ok, Pid}) when is_pid(Pid) ->
             Controller ! {recruited, Attempt, Role, Pid},
@@ -522,35 +502,25 @@ recruit(Controller, Attempt, Plan, Options = #{coordinators := Coordinators}) ->
     Recruit = fun(LogOptions = #{id := {_Epoch, Index}}) ->
         Report(log, deadlift_worker:start_role(lists:nth(Index, LogWorkers), log, LogOptions))
     end,
-    RecruitResolver = fun(ResolverOptions) ->
-        Report(resolver, deadlift_worker:start_role(ResolverWorker, resolver, ResolverOptions))
-    end,
-    SequencerOptions = (maps:get(sequencer, Options, #{}))#{
+    ProxyOptions = (maps:get(proxy, Options, #{}))#{
         coordinators => Coordinators,
         logs => maps:get(logs, Options, 3),
         replication => maps:get(replication, Options, 2),
-        recruit => Recruit,
-        recruit_resolver => RecruitResolver
+        recruit => Recruit
     },
-    case Report(sequencer, deadlift_worker:start_role(SequencerWorker, sequencer, SequencerOptions)) of
-        {ok, Sequencer} ->
-            try deadlift_sequencer:recovered(Sequencer, maps:get(recovery_timeout_ms, Options, 10000)) of
+    case Report(proxy, deadlift_worker:start_role(ProxyWorker, proxy, ProxyOptions)) of
+        {ok, Proxy} ->
+            try deadlift_epoch:recovered(Proxy, maps:get(recovery_timeout_ms, Options, 10000)) of
                 {ok, Result} ->
-                    ProxyOptions = (maps:get(proxy, Options, #{}))#{sequencer => Sequencer},
-                    case deadlift_worker:start_role(ProxyWorker, proxy, ProxyOptions) of
-                        {ok, Proxy} ->
-                            Controller ! {recovered, Attempt, Result, Proxy};
-                        {error, Reason} ->
-                            Controller ! {recruit_failed, Attempt, {proxy, Reason}}
-                    end
+                    Controller ! {recovered, Attempt, Result, Proxy}
             catch
                 exit:{{shutdown, {recovery, Reason}}, _Call} ->
                     Controller ! {recruit_failed, Attempt, Reason};
                 exit:{Reason, _Call} ->
-                    Controller ! {recruit_failed, Attempt, {sequencer, Reason}}
+                    Controller ! {recruit_failed, Attempt, {proxy, Reason}}
             end;
         {error, Reason} ->
-            Controller ! {recruit_failed, Attempt, {sequencer, Reason}}
+            Controller ! {recruit_failed, Attempt, {proxy, Reason}}
     end.
 
 %% Ends the attempt. The leader stops the Sequencer of an attempt whose
@@ -562,17 +532,17 @@ recruit(Controller, Attempt, Plan, Options = #{coordinators := Coordinators}) ->
 abandon(State = #state{generation = undefined}) ->
     State;
 abandon(State = #state{generation = Generation, db_info = Info}) ->
-    #generation{recruiter = Recruiter, sequencer = Sequencer, roles = Roles, recovered = Recovered} = Generation,
+    #generation{recruiter = Recruiter, proxy = Proxy, roles = Roles, recovered = Recovered} = Generation,
     case Recruiter of
         {_Pid, Monitor} -> true = erlang:demonitor(Monitor, [flush]);
         undefined -> true
     end,
-    _ = is_pid(Sequencer) andalso not Recovered andalso exit(Sequencer, kill),
+    _ = is_pid(Proxy) andalso not Recovered andalso exit(Proxy, kill),
     lists:foreach(fun(Monitor) -> erlang:demonitor(Monitor, [flush]) end, maps:keys(Roles)),
     State1 = State#state{generation = undefined},
     case Info of
         #{epoch := Epoch} when Epoch =/= undefined ->
-            broadcast(State1#state{db_info = Info#{epoch := undefined, sequencer := undefined, proxies := []}});
+            broadcast(State1#state{db_info = Info#{epoch := undefined, proxies := []}});
         _ ->
             State1
     end.

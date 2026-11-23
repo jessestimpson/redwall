@@ -509,7 +509,7 @@ commit(?IS_TX = Tx) ->
                 read_ranges => ets:select(Table, [{{{rr, '_'}, '$1', '$2'}, [], [{{'$1', '$2'}}]}]),
                 mutations => Mutations
             },
-            case deadlift_proxy:commit_with_index(server(Table, proxy), Transaction, ?TIMEOUT_MS) of
+            case deadlift_epoch:commit_with_index(server(Table, proxy), Transaction, ?TIMEOUT_MS) of
                 {ok, LSN, Index} ->
                     true = ets:insert(Table, [{state, committed}, {committed, LSN, Index}]),
                     ok;
@@ -633,7 +633,7 @@ read_version(Table) ->
         [{_, Version}] ->
             Version;
         [] ->
-            case deadlift_proxy:read_version(server(Table, proxy), ?TIMEOUT_MS) of
+            case deadlift_epoch:read_version(server(Table, proxy), ?TIMEOUT_MS) of
                 {ok, Version} ->
                     true = ets:insert(Table, {read_version, Version}),
                     Version;

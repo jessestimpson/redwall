@@ -32,8 +32,8 @@
 %%
 %% == Roles ==
 %%
-%% `start_role/3' starts a LogServer, a Resolver, a Proxy or a Sequencer
-%% on the node of the worker. The worker does not link to the role and
+%% `start_role/3' starts a LogServer or the process of an epoch
+%% ({@link deadlift_epoch}) on the node of the worker. The worker does not link to the role and
 %% does not monitor it. The ClusterController monitors the roles of an
 %% epoch.
 %%
@@ -47,8 +47,8 @@
 %% <ul>
 %% <li>`term': the term of the ClusterController that sent it.</li>
 %% <li>`epoch': the epoch that accepts commits, or `undefined'.</li>
-%% <li>`sequencer': the Sequencer of the epoch, or `undefined'.</li>
-%% <li>`proxies': the Proxies of the epoch.</li>
+%% <li>`proxies': the process of the epoch, in a list. A client sends its
+%%   commits and its requests for a read version to it.</li>
 %% </ul>
 %%
 %% In FoundationDB this information is `ServerDBInfo', and the part for
@@ -78,10 +78,11 @@
 
 -export_type([options/0, role/0, class/0, db_info/0]).
 
--type role() :: log | resolver | proxy | sequencer.
+-type role() :: log | proxy.
 
 %% The ClusterController prefers a worker of the class `log' for a
-%% LogServer, and a worker of the class `stateless' for the other roles.
+%% LogServer, and a worker of the class `stateless' for the process of an
+%% epoch.
 %% The default is `unset'. FoundationDB has these and further process
 %% classes.
 -type class() :: log | stateless | unset.
@@ -100,7 +101,6 @@
 -type db_info() :: #{
     term := non_neg_integer(),
     epoch := deadlift_cstate:epoch() | undefined,
-    sequencer := pid() | undefined,
     proxies := [pid()]
 }.
 
@@ -266,6 +266,4 @@ register(State = #state{controller = {Term, Pid}, monitor = Monitor0, options = 
     State#state{monitor = Monitor}.
 
 start_default(log, Options) -> deadlift_log:start(Options);
-start_default(resolver, Options) -> deadlift_resolver:start(Options);
-start_default(proxy, Options) -> deadlift_proxy:start(Options);
-start_default(sequencer, Options) -> deadlift_sequencer:start(Options).
+start_default(proxy, Options) -> deadlift_epoch:start(Options).

@@ -28,8 +28,7 @@ setup() ->
     {ok, Ids, []} = peace:start_cluster(Ids, deadlift_cstate:machine(), Opts),
     {ok, #{count := 0}} = await_read(Ids, 50),
     Options = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0},
-    {ok, Sequencer} = deadlift_sequencer:start(Options),
-    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer}),
+    {ok, Proxy} = deadlift_epoch:start(Options),
     {ok, Storage} = deadlift_storage:start(#{coordinators => Ids, poll_ms => 5, mvcc_window => 20}),
     deadlift:open(#{proxy => Proxy, storage => Storage}).
 

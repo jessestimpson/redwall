@@ -30,7 +30,7 @@
 %%
 %% The body of a record of a Proxy is `{batch, Entries}', with one entry
 %% for each transaction of the batch, in the order of the batch. The entry
-%% of a transaction is a list of mutations (`deadlift_proxy:mutation()'):
+%% of a transaction is a list of mutations (`deadlift_epoch:mutation()'):
 %% `{set, Key, Value}', `{clear, Key}' and `{clear_range, Begin, End}'.
 %% Another entry, and a record with another body, contain no mutation. The
 %% StorageServer applies the mutations of an entry in their order. A clear

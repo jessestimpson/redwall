@@ -12,9 +12,10 @@
 %% <ul>
 %% <li>3 nodes with a worker of the class `log'. Each receives one
 %%   LogServer of an epoch.</li>
-%% <li>3 nodes with a worker of the class `stateless'. They receive the
-%%   Sequencer, the Resolver and the Proxy. 2 of them have a candidate for
-%%   the ClusterController.</li>
+%% <li>3 nodes with a worker of the class `stateless'. One of them receives
+%%   the process of an epoch, which does the work of the Sequencer, of the
+%%   Resolver and of the Proxy. 2 of them have a candidate for the
+%%   ClusterController.</li>
 %% <li>1 node with a StorageServer.</li>
 %% </ul>
 %%
@@ -39,9 +40,9 @@
 %%   the commit version. The row has the time of the read, which ends
 %%   when the StorageServer has applied the record.</li>
 %% <li>The mean times of the steps of a batch in the Proxy, from
-%%   `deadlift_proxy:info/1'.</li>
+%%   `deadlift_epoch:info/1'.</li>
 %% <li>The time without an acknowledged commit after the kill of one
-%%   process: a LogServer, the Resolver, the Proxy, the Sequencer and the
+%%   process: a LogServer, the process of the epoch and the
 %%   ClusterController.</li>
 %% </ul>
 %%
@@ -105,19 +106,10 @@ main(Options) ->
         stop_cluster(Cluster)
     end,
     %% A second cluster, whose ClusterController recruits 35 ms after a
-    %% failure, and places the Sequencer, the Resolver and the Proxy on
-    %% one node. FoundationDB waits 35 ms (`ATTEMPT_RECRUITMENT_DELAY').
-    Fast = #{storage := Storage2} = start_cluster(#{retry_ms => 35, stateless => together}),
+    %% failure. FoundationDB waits 35 ms (`ATTEMPT_RECRUITMENT_DELAY').
+    Fast = start_cluster(#{retry_ms => 35}),
     try
-        #{proxies := [Proxy2]} = db_info(Fast),
-        Db2 = deadlift:open(#{proxy => Proxy2, storage => Storage2, direct => false}),
-        io:format("~nThe Sequencer, the Resolver and the Proxy on one node (`stateless` `together`):~n~n"),
-        header(),
-        Writes2 = [with_stats(Proxy2, N, fun() -> row(write, N, run(write, Db2, N, Ms)) end) || N <- Counts],
-        [row(read_write, N, run(read_write, Db2, N, Ms)) || N <- Counts],
-        Versions2 = [with_stats(Proxy2, N, fun() -> row(read_version, N, run(read_version, Db2, N, Ms)) end) || N <- Counts],
-        breakdown(Writes2, Versions2),
-        io:format("~n`retry_ms` 35 and `stateless` `together`:~n~n"),
+        io:format("~n`retry_ms` 35:~n~n"),
         failures(Fast)
     after
         stop_cluster(Fast)
@@ -129,12 +121,12 @@ main(Options) ->
 depth(Options) ->
     Ms = round(1000 * maps:get(seconds, Options, 3)),
     lists:foreach(
-        fun({Stateless, Depth}) ->
-            Cluster = #{storage := Storage} = start_cluster(#{stateless => Stateless, proxy => #{batch_depth => Depth}}),
+        fun(Depth) ->
+            Cluster = #{storage := Storage} = start_cluster(#{proxy => #{batch_depth => Depth}}),
             try
                 #{proxies := [Proxy]} = db_info(Cluster),
                 Db = deadlift:open(#{proxy => Proxy, storage => Storage, direct => false}),
-                io:format("~n`stateless` `~s`, `batch_depth` ~b:~n~n", [Stateless, Depth]),
+                io:format("~n`batch_depth` ~b:~n~n", [Depth]),
                 header(),
                 Writes = [with_stats(Proxy, N, fun() -> row(write, N, run(write, Db, N, Ms)) end) || N <- [1, 16, 64, 256]],
                 breakdown(Writes, [])
@@ -142,7 +134,7 @@ depth(Options) ->
                 stop_cluster(Cluster)
             end
         end,
-        [{Stateless, Depth} || Stateless <- maps:get(stateless, Options, [together, spread]), Depth <- maps:get(depths, Options, [1, 2, 4, 8])]
+        maps:get(depths, Options, [1, 2, 4, 8])
     ).
 
 %% @doc Measures `conflict' for several values of the option
@@ -265,7 +257,7 @@ op(read_write, Db) ->
 op(conflict, Db) ->
     read_write(Db, 100);
 op(read_version, {deadlift_database, #{proxy := Proxy}}) ->
-    {ok, _Version} = deadlift_proxy:read_version(Proxy),
+    {ok, _Version} = deadlift_epoch:read_version(Proxy),
     1;
 op(read_after_write, Db) ->
     %% The loop measures this whole operation. The row of the table has
@@ -360,36 +352,32 @@ row(Label, Clients, #{count := Count, us := Us, latencies := Latencies, attempts
     ]).
 
 %% Runs `Fun', and returns the number of clients with the sums that the
-%% Proxy added in that time (`deadlift_proxy:info/1').
+%% Proxy added in that time (`deadlift_epoch:info/1').
 with_stats(Proxy, Clients, Fun) ->
-    ok = deadlift_proxy:reset_stats(Proxy),
+    ok = deadlift_epoch:reset_stats(Proxy),
     _ = Fun(),
-    #{stats := Stats} = deadlift_proxy:info(Proxy),
+    #{stats := Stats} = deadlift_epoch:info(Proxy),
     {Clients, Stats}.
 
 %% Prints the times of the steps of a batch in the Proxy, and the
 %% confirmations for read versions.
 breakdown(Writes, Versions) ->
     io:format("~nThe steps of a `write` batch in the Proxy, as the mean time of a batch:~n~n"),
-    io:format("| Clients | Transactions per batch | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |~n"),
-    io:format("|---|---|---|---|---|---|---|~n"),
+    io:format("| Clients | Transactions per batch | Wait for the close (us) | Conflict check (us) | LogServers (us) |~n"),
+    io:format("|---|---|---|---|---|~n"),
     lists:foreach(
         fun({Clients, Stats = #{batches := Batches, transactions := Transactions}}) ->
             Mean = fun(Key) -> round(maps:get(Key, Stats, 0) / max(1, Batches)) end,
-            io:format("| ~b | ~.1f | ~b | ~b | ~b | ~b | ~b |~n", [
-                Clients, Transactions / max(1, Batches), Mean(wait_us), Mean(version_us), Mean(resolve_us), Mean(push_us), Mean(report_us)
-            ])
+            io:format("| ~b | ~.1f | ~b | ~b | ~b |~n", [Clients, Transactions / max(1, Batches), Mean(wait_us), Mean(resolve_us), Mean(push_us)])
         end,
         Writes
     ),
     io:format("~nThe longest single time of each step:~n~n"),
-    io:format("| Clients | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |~n"),
-    io:format("|---|---|---|---|---|---|~n"),
+    io:format("| Clients | Wait for the close (us) | Conflict check (us) | LogServers (us) |~n"),
+    io:format("|---|---|---|---|~n"),
     lists:foreach(
         fun({Clients, Stats}) ->
-            io:format("| ~b | ~b | ~b | ~b | ~b | ~b |~n", [
-                Clients | [maps:get(Key, Stats, 0) || Key <- [wait_max_us, version_max_us, resolve_max_us, push_max_us, report_max_us]]
-            ])
+            io:format("| ~b | ~b | ~b | ~b |~n", [Clients | [maps:get(Key, Stats, 0) || Key <- [wait_max_us, resolve_max_us, push_max_us]]])
         end,
         Writes
     ),
@@ -518,7 +506,7 @@ failures(Cluster = #{storage := Storage, coordinators := Ids}) ->
                 end,
             io:format("| ~s | ~p | ~p | ~p |~n", [Kind, ms(Gap), Epoch, After])
         end,
-        [log, resolver, proxy, sequencer, cluster_controller]
+        [log, proxy, cluster_controller]
     ),
     [unlink(Pid) || Pid <- [Refresher | Writers]],
     [exit(Pid, kill) || Pid <- [Refresher | Writers]],
@@ -529,12 +517,8 @@ ms(Us) -> round(Us / 1000).
 
 victim(log, #{epoch := Epoch}, #{log_nodes := [Node | _]}, _Ids) ->
     erpc:call(Node, deadlift_log, ref, [{Epoch, 1}]);
-victim(resolver, #{epoch := Epoch}, #{stateless_nodes := [Node | _]}, _Ids) ->
-    erpc:call(Node, deadlift_resolver, ref, [Epoch]);
 victim(proxy, #{proxies := [Proxy]}, _Cluster, _Ids) ->
     Proxy;
-victim(sequencer, #{sequencer := Sequencer}, _Cluster, _Ids) ->
-    Sequencer;
 victim(cluster_controller, _Info, _Cluster, Ids) ->
     {ok, #{controller := {_Term, Controller}}} = deadlift_cstate:read(Ids),
     Controller.

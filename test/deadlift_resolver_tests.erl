@@ -167,28 +167,37 @@ batch_test() ->
         H1
     ).
 
-%% The process handles the versions in their order.
-order_test_() ->
-    {setup,
-        fun() ->
-            {ok, _} = application:ensure_all_started(deadlift),
-            ok
-        end,
-        fun(_) -> ok = application:stop(deadlift) end,
-        fun() ->
-            {ok, Resolver} = deadlift_resolver:start_link(#{epoch => 7, version => 100}),
-            ?assertEqual(Resolver, deadlift_resolver:ref(7)),
-            ?assertEqual({error, {epoch, 7}}, gen_server:call(Resolver, {resolve, 6, 100, 101, [txn(0, [], [])]})),
-            %% The request for version 102 arrives before the request for
-            %% version 101, and waits.
-            R2 = gen_server:send_request(Resolver, {resolve, 7, 101, 102, [txn(100, [a], [])]}),
-            ?assertEqual(timeout, gen_server:wait_response(R2, 50)),
-            ?assertEqual([committed], gen_server:call(Resolver, {resolve, 7, 100, 101, [txn(100, [], [a])]})),
-            %% The read of `a' at version 100 is below the write at 101.
-            ?assertEqual({reply, [conflict]}, gen_server:receive_response(R2, 1000)),
-            ?assertEqual({error, {handled, 101}}, gen_server:call(Resolver, {resolve, 7, 100, 101, [txn(100, [], [a])]})),
-            ok = deadlift_resolver:stop(Resolver)
-        end}.
+%% `resolve/4' checks a batch as `check_batch/3' does. Each flag plants one
+%% defect.
+resolve_test() ->
+    New = fun() ->
+        {committed, History} = deadlift_resolver:check(txn(0, [], [], [a], [{m, p}]), 10, deadlift_resolver:new(infinity)),
+        History
+    end,
+    Batch = [
+        %% A read of `a' below the write at 10.
+        txn(5, [a], [b]),
+        %% A read of a range with `n' below the clear of the range at 10.
+        txn(5, [], [{n, o}], [c], []),
+        %% A read of `d', which the next transaction of the batch reads
+        %% after this one wrote it.
+        txn(10, [d], [d]),
+        txn(10, [d], [e]),
+        %% A clear of a range, and a read of a key of the range in a later
+        %% batch.
+        txn(10, [], [], [], [{x, z}])
+    ],
+    Later = [txn(10, [y], [])],
+    Run = fun(Flags) ->
+        {First, H1} = deadlift_resolver:resolve(Batch, 11, New(), Flags),
+        {Second, _} = deadlift_resolver:resolve(Later, 12, H1, Flags),
+        {First, Second}
+    end,
+    ?assertEqual({[conflict, conflict, committed, conflict, committed], [conflict]}, Run(#{})),
+    ?assertEqual({[committed, committed, committed, committed, committed], [committed]}, Run(#{check => false})),
+    ?assertEqual({[conflict, committed, committed, conflict, committed], [conflict]}, Run(#{check_ranges => false})),
+    ?assertEqual({[conflict, conflict, committed, committed, committed], [conflict]}, Run(#{check_batch => false})),
+    ?assertEqual({[conflict, conflict, committed, conflict, committed], [committed]}, Run(#{check_write_ranges => false})).
 
 %% The Resolver removes the versions below the oldest version. A removed
 %% version becomes 0, and a bound with the version 0 after a bound with

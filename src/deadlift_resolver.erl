@@ -107,10 +107,23 @@
 %%
 %% == Order ==
 %%
-%% The Resolver handles the commit versions in their order. A request has
-%% the previous commit version. A request that arrives before the request
-%% with the previous version waits. The source has the same rule
+%% The Resolver handles the commit versions in their order. In deadlift,
+%% the process of an epoch ({@link deadlift_epoch}) assigns the commit
+%% version of a batch and calls `resolve/4' for the batch in one step, so
+%% the calls are in the order of the versions. In the source, a request
+%% to the Resolver process has the previous commit version, and a request
+%% that arrives before the request with the previous version waits
 %% (`prevVersion').
+%%
+%% == Process ==
+%%
+%% The Resolver is not a process in deadlift. This module has functions on
+%% a history, and the process of an epoch owns the history. FoundationDB
+%% has a process for each role, because a process of FoundationDB runs on
+%% one thread. The process of an epoch does the work of the Sequencer, of
+%% the Resolver and of the Proxy of the paper. The three have the same
+%% lifetime, and the failure of each of them starts a recovery. This part
+%% is not in the paper.
 %%
 %% A Resolver records the writes of a transaction that it admits. If the
 %% Proxy then fails before the LogServers store the transaction, a later
@@ -127,32 +140,16 @@
 %% </ul>
 -module(deadlift_resolver).
 
--behaviour(gen_server).
-
 -include("deadlift_eta.hrl").
 
--export([start/1, start_link/1, stop/1, ref/1]).
--export([new/1, check/3, check_batch/3]).
--export([init/1, handle_call/3, handle_cast/2]).
+-export([new/1, check/3, check_batch/3, resolve/4]).
 
--export_type([options/0, transaction/0, key_range/0, result/0, history/0]).
+-export_type([flags/0, transaction/0, key_range/0, result/0, history/0]).
 
--type epoch() :: deadlift_cstate:epoch().
 -type version() :: deadlift_cstate:version().
 
-%% `version' is the last version of the previous epoch: the previous
-%% version of the first request. `mvcc_window' is a number of versions, or
-%% `infinity'. Two options plant a defect for the simulation. With
-%% `check => false' the Resolver admits every transaction. With
-%% `check_ranges => false' the Resolver does not check the read ranges of a
-%% transaction. With `check_batch => false' the Resolver does not check a
-%% transaction against the earlier transactions of its batch. With
-%% `check_write_ranges => false' the Resolver does not record the write
-%% ranges of a transaction.
--type options() :: #{
-    epoch := epoch(),
-    version := version(),
-    mvcc_window => pos_integer() | infinity,
+%% Planted defects for the simulation. See `resolve/4'.
+-type flags() :: #{
     check => boolean(),
     check_ranges => boolean(),
     check_batch => boolean(),
@@ -186,46 +183,6 @@
     oldest := integer(),
     window := pos_integer() | infinity
 }.
-
--record(state, {
-    epoch :: epoch(),
-    %% The last commit version that the Resolver has handled.
-    version :: version(),
-    history :: history(),
-    check :: boolean(),
-    check_ranges :: boolean(),
-    check_batch :: boolean(),
-    check_write_ranges :: boolean(),
-    %% PreviousVersion -> {Version, Transactions, Callers}: the requests that
-    %% wait for the request with the previous version.
-    waiting = #{} :: #{version() => {version(), [transaction()], [gen_server:from()]}}
-}).
-
-%% ---------------------------------------------------------------------------
-%% Client
-%% ---------------------------------------------------------------------------
-
-%% @doc Starts the Resolver of an epoch without a link to the caller. The
-%% Resolver registers with `deadlift_registry'.
--spec start(options()) -> {ok, pid()} | {error, term()}.
-start(Options) ->
-    gen_server:start(?MODULE, Options, []).
-
--spec start_link(options()) -> {ok, pid()} | {error, term()}.
-start_link(Options) ->
-    gen_server:start_link(?MODULE, Options, []).
-
--spec stop(gen_server:server_ref()) -> ok.
-stop(Resolver) ->
-    gen_server:call(Resolver, stop).
-
-%% @doc The process of the Resolver of `Epoch', or `undefined'. A Proxy
-%% sends the request `{resolve, Epoch, Prev, Version, Transactions}' to
-%% this process, with the transactions of one batch. The answer is a list
-%% with one `result()' for each transaction, or `{error, {epoch, Epoch}}'.
--spec ref(epoch()) -> pid() | undefined.
-ref(Epoch) ->
-    deadlift_registry:whereis({resolver, Epoch}).
 
 %% ---------------------------------------------------------------------------
 %% Algorithm 1
@@ -388,56 +345,27 @@ new_oldest(_Version, infinity, Oldest) -> Oldest;
 new_oldest(Version, Window, Oldest) -> max(Oldest, Version - Window).
 
 %% ---------------------------------------------------------------------------
-%% Server
+%% Batch of a Proxy
 %% ---------------------------------------------------------------------------
 
-%% @private
-init(Options = #{epoch := Epoch, version := Version}) ->
-    case deadlift_registry:register({resolver, Epoch}) of
-        yes ->
-            {ok, #state{
-                epoch = Epoch,
-                version = Version,
-                history = new(maps:get(mvcc_window, Options, infinity)),
-                check = maps:get(check, Options, true),
-                check_ranges = maps:get(check_ranges, Options, true),
-                check_batch = maps:get(check_batch, Options, true),
-                check_write_ranges = maps:get(check_write_ranges, Options, true)
-            }};
-        no ->
-            {stop, {already_registered, Epoch}}
-    end.
-
-%% @private
-handle_call({resolve, Epoch, _Prev, _Version, _Transactions}, _From, State = #state{epoch = Mine}) when Epoch =/= Mine ->
-    {reply, {error, {epoch, Mine}}, State};
-handle_call({resolve, _Epoch, Prev, Version, Transaction}, From, State = #state{version = Prev}) when Version > Prev ->
-    {Result, State1} = resolve(Version, Transaction, State),
-    gen_server:reply(From, Result),
-    {noreply, release(State1)};
-handle_call({resolve, _Epoch, Prev, Version, Transaction}, From, State = #state{version = Mine, waiting = Waiting}) when Prev > Mine, Version > Prev ->
-    %% The request with the previous version has not arrived.
-    case Waiting of
-        #{Prev := {Version, Transaction, Callers}} ->
-            {noreply, State#state{waiting = Waiting#{Prev := {Version, Transaction, [From | Callers]}}}};
-        #{Prev := _Other} ->
-            {reply, {error, {conflicting_request, Version}}, State};
-        _ ->
-            {noreply, State#state{waiting = Waiting#{Prev => {Version, Transaction, [From]}}}}
-    end;
-handle_call({resolve, _Epoch, _Prev, Version, _Transactions}, _From, State) ->
-    %% A version that the Resolver has handled. The Resolver does not keep
-    %% the result of a transaction.
-    {reply, {error, {handled, Version}}, State};
-handle_call(stop, _From, State) ->
-    {stop, normal, ok, State}.
-
-%% @private
-handle_cast(_Message, State) ->
-    {noreply, State}.
-
-resolve(Version, Transactions0, State = #state{history = History}) ->
-    #state{check = Check, check_ranges = CheckRanges, check_batch = CheckBatch} = State,
+%% @doc Checks the transactions of one batch with the commit version
+%% `Version', as `check_batch/3' does. `Flags' plants defects for the
+%% simulation:
+%%
+%% <ul>
+%% <li>`check => false': every transaction is admitted, and its writes
+%%   are recorded.</li>
+%% <li>`check_ranges => false': the read ranges are not checked.</li>
+%% <li>`check_batch => false': a transaction is not checked against the
+%%   earlier transactions of its batch.</li>
+%% <li>`check_write_ranges => false': the write ranges are not
+%%   recorded.</li>
+%% </ul>
+-spec resolve([transaction()], version(), history(), flags()) -> {[result()], history()}.
+resolve(Transactions0, Version, History, Flags) ->
+    Check = maps:get(check, Flags, true),
+    CheckRanges = maps:get(check_ranges, Flags, true),
+    CheckBatch = maps:get(check_batch, Flags, true),
     Transactions1 =
         case CheckRanges of
             true -> Transactions0;
@@ -445,42 +373,28 @@ resolve(Version, Transactions0, State = #state{history = History}) ->
             false -> [Transaction#{read_ranges => []} || Transaction <- Transactions0]
         end,
     Transactions =
-        case State#state.check_write_ranges of
+        case maps:get(check_write_ranges, Flags, true) of
             true -> Transactions1;
             %% The planted defect: the write ranges are not recorded.
             false -> [Transaction#{write_ranges => []} || Transaction <- Transactions1]
         end,
     WithoutReads = fun(Transaction) -> Transaction#{reads := [], read_ranges => []} end,
-    {Results, History1} =
-        case {Check, CheckBatch} of
-            {true, true} ->
-                check_batch(Transactions, Version, History);
-            {false, _} ->
-                %% The planted defect: every transaction is admitted, and
-                %% its writes are recorded.
-                check_batch([WithoutReads(Transaction) || Transaction <- Transactions], Version, History);
-            {true, false} ->
-                %% The planted defect: each transaction is checked against
-                %% the history before the batch. The writes of the admitted
-                %% transactions are recorded after the checks.
-                Checked = [{element(1, check(Transaction, Version, History, false)), Transaction} || Transaction <- Transactions],
-                Admitted = [WithoutReads(Transaction) || {committed, Transaction} <- Checked],
-                {_, History2} = check_batch(Admitted, Version, History),
-                %% The oldest version rises also when no transaction is
-                %% admitted.
-                {_, History3} = check(#{read_version => 0, reads => [], writes => []}, Version, History2),
-                {[Result || {Result, _Transaction} <- Checked], History3}
-        end,
-    {Results, State#state{version = Version, history = History1}}.
-
-%% Handles the waiting requests whose previous version is now the last
-%% version.
-release(State = #state{version = Version, waiting = Waiting}) ->
-    case maps:take(Version, Waiting) of
-        {{Next, Transaction, Callers}, Waiting1} ->
-            {Result, State1} = resolve(Next, Transaction, State#state{waiting = Waiting1}),
-            [gen_server:reply(Caller, Result) || Caller <- Callers],
-            release(State1);
-        error ->
-            State
+    case {Check, CheckBatch} of
+        {true, true} ->
+            check_batch(Transactions, Version, History);
+        {false, _} ->
+            %% The planted defect: every transaction is admitted, and
+            %% its writes are recorded.
+            check_batch([WithoutReads(Transaction) || Transaction <- Transactions], Version, History);
+        {true, false} ->
+            %% The planted defect: each transaction is checked against
+            %% the history before the batch. The writes of the admitted
+            %% transactions are recorded after the checks.
+            Checked = [{element(1, check(Transaction, Version, History, false)), Transaction} || Transaction <- Transactions],
+            Admitted = [WithoutReads(Transaction) || {committed, Transaction} <- Checked],
+            {_, History2} = check_batch(Admitted, Version, History),
+            %% The oldest version rises also when no transaction is
+            %% admitted.
+            {_, History3} = check(#{read_version => 0, reads => [], writes => []}, Version, History2),
+            {[Result || {Result, _Transaction} <- Checked], History3}
     end.

@@ -24,7 +24,7 @@ controller() ->
     try
         %% The first candidate wins the election of term 1 and recruits the
         %% epoch 1 on the worker.
-        #{term := 1, epoch := 1, sequencer := Sequencer1} = await_epoch(1),
+        #{term := 1, epoch := 1, proxies := [Proxy1]} = await_epoch(1),
         ?assertMatch(#{role := leader, term := 1, workers := [_]}, deadlift_cluster_controller:info(A)),
         ?assertMatch({ok, #{controller := {1, A}}}, deadlift_cstate:read(Coordinators)),
         ?assertMatch(#{controller := {1, A}, registered := true}, deadlift_worker:info()),
@@ -38,19 +38,19 @@ controller() ->
         ?assertEqual(1, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
         %% A LogServer stops. The leader recruits the epoch 2.
         exit(deadlift_log:ref({1, 2}), kill),
-        #{term := 1, epoch := 2, sequencer := Sequencer2} = await_epoch(2),
-        ?assertNotEqual(Sequencer1, Sequencer2),
+        #{term := 1, epoch := 2, proxies := [Proxy2]} = await_epoch(2),
+        ?assertNotEqual(Proxy1, Proxy2),
         ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 2) end),
         ?assertEqual(2, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
-        %% The Proxy stops. The leader recruits the epoch 3.
-        exit(hd(maps:get(proxies, deadlift_worker:db_info())), kill),
-        #{epoch := 3} = await_epoch(3),
-        %% The Sequencer stops. The leader recruits the epoch 4.
-        exit(maps:get(sequencer, deadlift_worker:db_info()), kill),
-        #{epoch := 4} = await_epoch(4),
-        %% The Resolver stops. The leader recruits the epoch 5.
-        exit(deadlift_resolver:ref(4), kill),
-        #{epoch := 5} = await_epoch(5),
+        %% The process of the epoch stops, three times. The leader recruits
+        %% the epochs 3, 4 and 5.
+        lists:foreach(
+            fun(Epoch) ->
+                exit(hd(maps:get(proxies, deadlift_worker:db_info())), kill),
+                #{epoch := Epoch} = await_epoch(Epoch)
+            end,
+            [3, 4, 5]
+        ),
         %% A request for a recovery. A candidate ignores the request.
         ok = deadlift_cluster_controller:force_recovery(B),
         ok = deadlift_cluster_controller:force_recovery(A),
@@ -79,7 +79,7 @@ controller() ->
         %% The worker ignores the information of a ClusterController of
         %% another term.
         Before = deadlift_worker:db_info(),
-        ok = gen_server:cast(Worker, {db_info, #{term => 2, epoch => 99, sequencer => undefined, proxies => []}}),
+        ok = gen_server:cast(Worker, {db_info, #{term => 2, epoch => 99, proxies => []}}),
         ?assertMatch(#{registered := false}, deadlift_worker:info()),
         ?assertEqual(Before, deadlift_worker:db_info()),
         ok = deadlift_cluster_controller:stop(B),
@@ -158,29 +158,26 @@ placement_test_() ->
             [L1, L2, L3, S1] = [fake(Controller, Node, Class) || {Node, Class} <- [{l1, log}, {l2, log}, {l3, log}, {s1, stateless}]],
             ok = await(fun() -> length(maps:get(workers, deadlift_cluster_controller:info(Controller))) =:= 4 end, 100),
             ?assertEqual(none, peek(recruiting)),
-            U1 = fake(Controller, u1, unset),
+            _U1 = fake(Controller, u1, unset),
             {recruiting, 1, Plan1} = next(recruiting),
             ?assertEqual([L1, L2, L3], lists:sort(maps:get(logs, Plan1))),
-            ?assertEqual({S1, U1}, {maps:get(sequencer, Plan1), maps:get(resolver, Plan1)}),
-            ?assert(lists:member(maps:get(proxy, Plan1), [L1, L2, L3])),
-            {recovered, #{epoch := 1, sequencer := Sequencer, proxy := Proxy}} = next(recovered),
-            ?assertEqual({S1, sequencer}, started(Sequencer)),
-            ?assertEqual(proxy, element(2, started(Proxy))),
+            ?assertEqual(S1, maps:get(proxy, Plan1)),
+            {recovered, #{epoch := 1, proxy := Proxy}} = next(recovered),
+            ?assertEqual({S1, proxy}, started(Proxy)),
             ?assertEqual(
                 lists:sort([{L1, log}, {L2, log}, {L3, log}]),
                 lists:sort([started(deadlift_log:ref({1, Index})) || Index <- [1, 2, 3]])
             ),
-            ?assertEqual({U1, resolver}, started(deadlift_resolver:ref(1))),
             %% Each fake worker has received the information about the
             %% epoch.
-            ok = await(fun() -> db_info(L1) =:= #{term => 1, epoch => 1, sequencer => Sequencer, proxies => [Proxy]} end, 100),
+            ok = await(fun() -> db_info(L1) =:= #{term => 1, epoch => 1, proxies => [Proxy]} end, 100),
             %% The second attempt starts at another worker. The classes
             %% decide in the same way.
             ok = deadlift_cluster_controller:force_recovery(Controller),
             {recruiting, 2, Plan2} = next(recruiting),
             ?assertEqual([L1, L2, L3], lists:sort(maps:get(logs, Plan2))),
             ?assertNotEqual(maps:get(logs, Plan1), maps:get(logs, Plan2)),
-            ?assertEqual({S1, U1}, {maps:get(sequencer, Plan2), maps:get(resolver, Plan2)}),
+            ?assertEqual(S1, maps:get(proxy, Plan2)),
             {recovered, #{epoch := 2}} = next(recovered),
             %% A worker stops. The leader removes it. The test stops the
             %% LogServer that the worker started, as a node does when it
@@ -199,22 +196,20 @@ placement_test_() ->
         end)
     end}.
 
-%% With `stateless => together', the Sequencer, the Resolver and the Proxy
-%% are on one worker of the class `stateless'.
-together_test_() ->
+%% The process of an epoch is on a worker of the class `stateless'. Two
+%% attempts in sequence use two workers of the class.
+rotation_test_() ->
     {timeout, 60, fun() ->
-        with_controller(#{min_workers => 3, stateless => together}, fun(Controller, _CState) ->
+        with_controller(#{min_workers => 3}, fun(Controller, _CState) ->
             L1 = fake(Controller, l1, log),
             S1 = fake(Controller, s1, stateless),
             S2 = fake(Controller, s2, stateless),
-            {recruiting, 1, Plan1} = next(recruiting),
-            #{sequencer := First, resolver := First, proxy := First} = Plan1,
+            {recruiting, 1, Plan1 = #{proxy := First}} = next(recruiting),
             ?assert(lists:member(First, [S1, S2])),
             ?assertEqual(L1, hd(maps:get(logs, Plan1))),
             {recovered, #{epoch := 1}} = next(recovered),
-            %% The next attempt uses the other worker of the class.
             ok = deadlift_cluster_controller:force_recovery(Controller),
-            {recruiting, 2, #{sequencer := Second, resolver := Second, proxy := Second}} = next(recruiting),
+            {recruiting, 2, #{proxy := Second}} = next(recruiting),
             ?assertEqual([S1, S2], lists:sort([First, Second])),
             {recovered, #{epoch := 2}} = next(recovered)
         end)
@@ -226,29 +221,18 @@ start_failure_test_() ->
         with_controller(#{}, fun(Controller, _CState) ->
             W = fake(Controller, w1, unset),
             {recovered, #{epoch := 1}} = next(recovered),
-            %% The worker refuses the Sequencer once.
-            W ! {fail, sequencer},
+            %% The worker refuses the process of the epoch once.
+            W ! {fail, proxy},
             ok = deadlift_cluster_controller:force_recovery(Controller),
-            ?assertEqual({recovery_failed, {sequencer, refused}}, next(recovery_failed)),
+            ?assertEqual({recovery_failed, {proxy, refused}}, next(recovery_failed)),
             {recovered, #{epoch := 2}} = next(recovered),
-            %% The worker refuses a LogServer once. The recovery of the
-            %% Sequencer fails after it has raised the recovery count.
+            %% The worker refuses a LogServer once. The recovery fails
+            %% after it has raised the recovery count.
             W ! {fail, log},
             ok = deadlift_cluster_controller:force_recovery(Controller),
             ?assertEqual({recovery_failed, {recruit, refused}}, next(recovery_failed)),
             {recovered, #{epoch := 4}} = next(recovered),
-            %% The worker refuses the Resolver once.
-            W ! {fail, resolver},
-            ok = deadlift_cluster_controller:force_recovery(Controller),
-            ?assertEqual({recovery_failed, {recruit_resolver, refused}}, next(recovery_failed)),
-            {recovered, #{epoch := 6}} = next(recovered),
-            %% The worker refuses the Proxy once. The recovery has ended,
-            %% so the next attempt has the next epoch.
-            W ! {fail, proxy},
-            ok = deadlift_cluster_controller:force_recovery(Controller),
-            ?assertEqual({recovery_failed, {proxy, refused}}, next(recovery_failed)),
-            {recovered, #{epoch := 8}} = next(recovered),
-            ?assertMatch(#{db_info := #{epoch := 8}}, deadlift_cluster_controller:info(Controller))
+            ?assertMatch(#{db_info := #{epoch := 4}}, deadlift_cluster_controller:info(Controller))
         end)
     end}.
 
@@ -265,8 +249,8 @@ abandon_during_recovery_test_() ->
             W ! {delay, log, 300},
             ok = deadlift_cluster_controller:force_recovery(Controller),
             {recruiting, 2, _} = next(recruiting),
-            ok = await(fun() -> length([x || {_Pid, sequencer} <- roles(W)]) =:= 2 end, 100),
-            Second = lists:last([Pid || {Pid, sequencer} <- roles(W)]),
+            ok = await(fun() -> length([x || {_Pid, proxy} <- roles(W)]) =:= 2 end, 100),
+            Second = lists:last([Pid || {Pid, proxy} <- roles(W)]),
             ?assert(is_process_alive(Second)),
             ok = deadlift_cluster_controller:force_recovery(Controller),
             {recruiting, 3, _} = next(recruiting),
@@ -448,7 +432,7 @@ lost_answer_test_() ->
             ok = proposed({elect, 0, Controller}),
             ?assertMatch(#{role := candidate}, deadlift_cluster_controller:info(Controller)),
             Stub ! {set, #{read => {1, Controller}}},
-            ok = await(fun() -> deadlift_cluster_controller:info(Controller) =:= #{role => leader, term => 1, workers => [], db_info => #{term => 1, epoch => undefined, sequencer => undefined, proxies => []}} end, 100)
+            ok = await(fun() -> deadlift_cluster_controller:info(Controller) =:= #{role => leader, term => 1, workers => [], db_info => #{term => 1, epoch => undefined, proxies => []}} end, 100)
         after
             exit(Controller, kill),
             exit(Stub, kill),
@@ -544,7 +528,7 @@ options(Coordinators) ->
         coordinators => Coordinators,
         poll_ms => 20,
         retry_ms => 10,
-        sequencer => #{lock_timeout_ms => 100, versions_per_second => 0}
+        proxy => #{lock_timeout_ms => 100, versions_per_second => 0}
     }.
 
 %% Runs `Fun' with one candidate and a `deadlift_cstate_local' process.
@@ -642,7 +626,11 @@ fake_loop(Fakes, Faults) ->
                             {delay, Ms} -> timer:sleep(Ms);
                             none -> ok
                         end,
-                    Module = list_to_existing_atom("deadlift_" ++ atom_to_list(Role)),
+                    Module =
+                        case Role of
+                            log -> deadlift_log;
+                            proxy -> deadlift_epoch
+                        end,
                     {ok, Pid} = Module:start(Options),
                     true = ets:insert(Fakes, [{{role, Pid}, self(), Role}, {{started, self()}, Pid, Role}]),
                     gen_server:reply(From, {ok, Pid})

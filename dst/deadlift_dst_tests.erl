@@ -425,21 +425,23 @@ one_no_clear_is_found_test_() ->
     end}.
 
 %% A planted defect: a registry sends no name to the registry of another
-%% node. This defect violates no invariant. A Proxy does not find the
-%% LogServers and the Resolver of its epoch, and a second Sequencer does not
-%% find the LogServers of the first epoch. The test shows that the runs
-%% depend on the exchange of names: no transaction is acknowledged, and
-%% each run has at most one recovery.
-no_exchange_stops_commits_test_() ->
+%% node. This defect violates no invariant. The process of the first epoch
+%% recruits its LogServers itself, so it commits. A StorageServer does not
+%% find the LogServers, and the process of a second epoch does not find
+%% the LogServers of the first epoch. The test shows that the runs depend
+%% on the exchange of names: no transaction reads a value, and each run
+%% has one recovery.
+no_exchange_stops_reads_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         ok = deadlift_dst:reset_stats(),
         Seeds = lists:seq(1, 10),
         sweep(Seeds, fun(Seed) -> (calm(Seed))#{config => #{mode => no_exchange, faults => false}} end),
         Stats = deadlift_dst:stats(),
         ?debugFmt("no_exchange: ~p", [Stats]),
-        ?assertEqual(0, maps:get(acks, Stats, 0), Stats),
-        ?assert(maps:get(recoveries, Stats, 0) =< length(Seeds), Stats),
-        ?assert(maps:get(recoveries, Stats, 0) > 0, Stats)
+        ?assertEqual(0, maps:get(reads, Stats, 0), Stats),
+        ?assert(maps:get(no_read, Stats, 0) > 100, Stats),
+        ?assertEqual(length(Seeds), maps:get(recoveries, Stats, 0), Stats),
+        ?assert(maps:get({recovery_failed, too_few_replies}, Stats, 0) > 30, Stats)
     end}.
 
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the
