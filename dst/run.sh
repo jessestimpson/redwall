@@ -32,10 +32,14 @@ done
 
 if [ "$1" = "--one" ]; then
     name=$2
+    # The directory of the simulated disk of the test. The tests run at
+    # the same time, so each test has a directory of its own.
+    disk=$PWD/$logs/disk/$name
+    mkdir -p "$disk"
     start=$(date +%s)
     status=ok
     # shellcheck disable=SC2086
-    DEADLIFT_DST_STATS_DIR=$PWD/$logs erl +S 1 -noshell $paths -eval "
+    DEADLIFT_DST_DISK_DIR=$disk DEADLIFT_DST_STATS_DIR=$PWD/$logs erl +S 1 -noshell $paths -eval "
         case eunit:test({generator, deadlift_dst_tests, $name}, [verbose]) of
             ok -> halt(0);
             _ -> halt(1)

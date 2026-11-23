@@ -11,7 +11,7 @@
 -export([recover/4, transaction/5, join/2, start_log/3]).
 -export([worker/5, force_recovery/1, worker_node/1]).
 -export([sequencer_node/1, log_node/1, storage_node/1, keys/0]).
--export([coordinators/1, coordinator_ids/0, coordinator_node/1, coordinator/1, form_cluster/2]).
+-export([coordinators/1, coordinator_ids/0, coordinator_node/1, coordinator/3, form_cluster/2]).
 
 %% Starts the process of a new epoch and waits for the end of its
 %% recovery. This is the work of a ClusterController. The runs without the
@@ -438,18 +438,31 @@ coordinator_ids() -> [{list_to_atom("deadlift_coordinator_" ++ integer_to_list(I
 
 coordinator_node(I) -> list_to_atom("coordinator_" ++ integer_to_list(I)).
 
-%% Starts the server `Id' of the peace cluster on the node of the caller,
-%% and waits. The server is linked to this process, so a kill of this
-%% process stops the server. The server keeps its data in memory, so a
-%% killed server is not started again.
-coordinator(Id) ->
-    Config = #{
+%% Starts the coordinator `Id' on the node of the caller, and waits. The
+%% server is linked to this process, so a kill of this process stops the
+%% server. The configuration is the configuration of
+%% `deadlift_coordinator', with the machine of the simulation in the
+%% place of `deadlift_cstate'. The coordinator keeps its data in the
+%% directory `Dir', on the simulated disk of eta, so a killed coordinator
+%% starts again with its data. The snapshot interval of 8 values and the
+%% chunk of 64 bytes make a coordinator write a checkpoint in several
+%% steps in each run.
+coordinator(Id, Dir, Mode) ->
+    Wal =
+        case Mode of
+            %% The planted defect: the coordinator never syncs its files.
+            unsynced_coordinators -> #{checkpoint_chunk_bytes => 64, io => deadlift_dst_nosync_io};
+            _ -> #{checkpoint_chunk_bytes => 64}
+        end,
+    {ok, Config0} = deadlift_coordinator:config(#{
         id => Id,
-        machine => {module, deadlift_dst_machine, []},
-        storage => {peace_storage_mem, #{}},
+        dir => Dir,
+        wal => Wal,
         election_timeout_ms => 50,
-        heartbeat_ms => 10
-    },
+        heartbeat_ms => 10,
+        snapshot_interval => 8
+    }),
+    Config = Config0#{machine := {module, deadlift_dst_machine, []}},
     case peace_server:start_link(Config) of
         {ok, _Pid} ->
             receive

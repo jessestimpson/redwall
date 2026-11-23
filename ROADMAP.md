@@ -42,8 +42,14 @@ before the commit path is complete.
 - [x] Run the simulation with the network of eta: lost and delayed
       messages, and nodes that are cut off.
 - [x] Run the coordinated state on a peace cluster in the simulation.
-- [ ] Give the servers of the peace cluster a disk in the simulation,
-      start a killed server again, and replace a member.
+- [x] Require a disk for a coordinator (`deadlift_coordinator`), give the
+      coordinators a disk in the simulation, and start a killed
+      coordinator again.
+- [ ] Replace a coordinator whose data is lost, and change the
+      coordinators of a cluster.
+- [ ] Form the peace cluster of the coordinators without a call of the
+      operator, for example from a list of coordinators in the
+      application environment.
 - [ ] Add each new part to the simulation in the step that adds the
       part.
 

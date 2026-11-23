@@ -787,6 +787,7 @@ their options.
 |---|---|---|
 | `worker` | The options of `deadlift_worker:start_link/1`: `coordinators`, `class`, and `candidate` for a candidate for the ClusterController on the node | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
 | `storage` | The options of `deadlift_storage:start_link/1`: `coordinators` | The StorageServer of the node |
+| `coordinator` | The options of `deadlift_coordinator:start_link/1`: `id` and `dir`, both required | The coordinator of the node: one server of the peace cluster with the coordinated state. The supervisor starts it before the worker and the StorageServer |
 
 Example, in `sys.config`, for a node that runs every role:
 
@@ -800,8 +801,35 @@ Example, in `sys.config`, for a node that runs every role:
 ```
 
 `coordinators` are the servers of a peace cluster that runs
-`deadlift_cstate:machine/0`. The application does not start the peace
-cluster.
+`deadlift_cstate:machine/0`.
+
+### Coordinators
+
+A coordinator keeps the coordinated state on a disk, as a coordinator of
+FoundationDB does. [deadlift_coordinator](src/deadlift_coordinator.erl)
+starts a server of peace with the write-ahead log of peace
+(`peace_storage_wal`), and the option `dir` is required:
+
+```erlang
+{deadlift, [
+    {coordinator, #{id => {c1, 'a@host'}, dir => "/var/lib/deadlift/coordinator"}},
+    {worker, #{coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}], candidate => #{}}}
+]}
+```
+
+1. Start the application on each node with a coordinator.
+2. Call `deadlift_coordinator:form([{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}])`
+   once. peace stores the configuration of the cluster on the disk of
+   each coordinator.
+
+- A coordinator that starts again reads its data from `dir`, and is the
+  same member of the cluster as before. The second step is not repeated.
+- Without `dir`, the coordinator does not start, and the error is
+  `{missing_option, dir}`. The options `storage` and `machine` are not
+  allowed.
+- A peace cluster that a caller starts with `peace:start_cluster/3` can
+  still be named in `coordinators`. The tests of deadlift do this with
+  the storage in memory.
 
 ### Start time
 
@@ -941,6 +969,7 @@ The harness checks these invariants after every step:
 | `select_agrees` | A `deadlift:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
 | `mapped_range_agrees` | A `deadlift:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
 | `own_writes` | Before the commit, the reads of a transaction return its sets and its clears, and `get_mapped_range/4` raises 2039. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation |
+| `coordinators_agree` | In a run with a peace cluster, no two servers have two states of the coordinated state for one index of the log of peace |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -1014,8 +1043,16 @@ servers in its place, under the scheduler and the network of eta:
   profile (`overrides` in [rebar.config](rebar.config)).
 - Each server is on a simulated node of its own. The cluster has
   majority quorums.
-- The harness kills the node of one server at most once in a run. A
-  server keeps its data in memory and does not start again.
+- Each server is a coordinator with the configuration of
+  [deadlift_coordinator](src/deadlift_coordinator.erl): it keeps its data
+  in the write-ahead log of peace, on the simulated disk of eta.
+- The harness kills the node of a coordinator, and in 1 kill operation
+  of 4 the node of every coordinator. A kill is also a crash of the
+  disk of the node: the node loses the data that was not synced. The
+  next `recover` operation starts each killed coordinator again, with
+  its data.
+- The invariant `coordinators_agree` holds when no two servers have two
+  states of the coordinated state for one index of the log of peace.
 - A partition can cut a server off, and can leave the cluster without a
   majority until the next heal.
 - [dst/deadlift_dst_machine.erl](dst/deadlift_dst_machine.erl) is the
@@ -1025,19 +1062,21 @@ servers in its place, under the scheduler and the network of eta:
   of 0.015, because the heartbeats of peace add steps for each unit of
   the virtual clock.
 
-Results of `make dst` on 2026-11-23. The 41 tests pass in 200 s:
+Results of `make dst` on 2026-11-23. The 42 tests pass in 260 s:
 
 | Test | Runs | Result |
 |---|---|---|
-| peace cluster, no faults | 50 seeds in 1 test, 80 operations each | No violation. 1,991 acknowledged transactions, 335 recoveries, 16 failed recoveries |
-| peace cluster, kills, partitions, lost and delayed messages | 200 seeds in 2 tests | No violation. 919 acknowledged transactions, 1,270 recoveries, 734 failed recoveries, 53 kills of a server of the peace cluster, 123 partitions, 242 rollbacks of StorageServers |
-| peace cluster, ClusterControllers, kills of worker nodes, partitions | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 301 acknowledged transactions, 398 recoveries, 139 elections, 24 kills of a server of the peace cluster |
-| peace cluster, ClusterControllers, cuts between ClusterController nodes | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 288 acknowledged transactions, 182 elections, 28 runs with two leaders at the same time |
-| Planted defect `no_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 1, `durable` |
+| peace cluster, no faults | 50 seeds in 1 test, 80 operations each | No violation. 1,991 acknowledged transactions, 346 recoveries, 16 failed recoveries |
+| peace cluster, kills, partitions, lost and delayed messages | 200 seeds in 2 tests | No violation. 866 acknowledged transactions, 1,261 recoveries, 735 failed recoveries, 180 kills of a coordinator, of which 30 times every coordinator, 160 starts of a killed coordinator |
+| peace cluster, ClusterControllers, kills of worker nodes, partitions | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 270 acknowledged transactions, 375 recoveries, 134 elections, 96 kills of a coordinator, of which 20 times every coordinator |
+| peace cluster, ClusterControllers, cuts between ClusterController nodes | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 274 acknowledged transactions, 176 elections, 94 kills of a coordinator, of which 20 times every coordinator |
+| Planted defect `no_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 4, `replicas_agree`. The same seed passes without the defect |
 | Planted defect `no_elect_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 1, `one_leader` |
+| Planted defect: a coordinator never syncs its files | Seeds from 1, runs with ClusterControllers | Found at seed 20: the run ends without an epoch. The same seed passes without the defect. In 60 seeds, 10 runs ended without an epoch or without a leader. The coordinators synced 2 times, against 44,646 times without the defect |
 
 The failed recoveries of the runs with a peace cluster were examined on
-2026-11-23, in 100 seeds with faults:
+2026-11-23, in 100 seeds with faults, before the coordinators had a
+disk:
 
 | Reason of a failed recovery | Count | Cause |
 |---|---|---|
@@ -1060,10 +1099,14 @@ The failed recoveries of the runs with a peace cluster were examined on
 
 Limitations of the simulation:
 
-- A killed server of the peace cluster does not start again, and at
-  most 1 of the 3 servers is killed in a run. The cluster has no disk
-  and no change of its members.
-- A run with a peace cluster and faults acknowledges 4.6 transactions
+- The invariant `coordinators_agree` has not failed in a run, also not
+  with the planted defect of a coordinator that never syncs. peace does
+  not let a server that lost its data act as the member that it was, so
+  that defect costs the availability of the coordinated state, and
+  `check_final/2` finds it in the runs with ClusterControllers.
+- The simulation does not replace a coordinator whose data is lost, and
+  does not change the members of the peace cluster.
+- A run with a peace cluster and faults acknowledges 4.3 transactions
   on average, against 5.0 without the cluster.
 
 - The application start (`deadlift_sup`) and `deadlift:open/0` are not
@@ -1088,7 +1131,7 @@ seeds. `dst/run.sh` prints the sums of the statistics of these tests.
 | Command | Nodes at the same time | Time |
 |---|---|---|
 | `make dst-serial` | 1 | 10 min 38 s |
-| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total. 2 min 23 s in 1 run with one process for each epoch. 2 min 1 s in 1 run of 32 tests without the registry. 3 min 3 s in 1 run of 41 tests, with the 8 tests with a peace cluster |
+| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total. 2 min 23 s in 1 run with one process for each epoch. 2 min 1 s in 1 run of 32 tests without the registry. 3 min 3 s in 1 run of 41 tests, with the 8 tests with a peace cluster. 4 min 20 s in 1 run of 42 tests, with the coordinators on the simulated disk |
 | `dst/run.sh -j 5` | 5 | 4 min 6 s |
 
 The machine has 4 performance cores and 6 efficiency cores. The
@@ -1446,12 +1489,15 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/deadlift_tuple.erl](src/deadlift_tuple.erl), [src/deadlift_float.erl](src/deadlift_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |
 | [src/deadlift_cluster_controller.erl](src/deadlift_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |
 | [src/deadlift_worker.erl](src/deadlift_worker.erl) | The worker of one node, which starts roles for the ClusterController |
+| [src/deadlift_coordinator.erl](src/deadlift_coordinator.erl) | A coordinator: a server of the peace cluster with the coordinated state on a disk |
 | [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
 | [include/deadlift_eta.hrl](include/deadlift_eta.hrl) | The header that puts a module under the parse transform of eta in the `dst` profile |
 | [dst/deadlift_dst.erl](dst/deadlift_dst.erl) | The eta harness: the workload and the invariants |
 | [dst/deadlift_dst_client.erl](dst/deadlift_dst_client.erl) | The processes that perform the operations of the simulation |
 | [dst/deadlift_dst_tests.erl](dst/deadlift_dst_tests.erl) | The simulation suite |
 | [dst/deadlift_dst_machine.erl](dst/deadlift_dst_machine.erl) | The machine of the peace cluster of a simulation run |
+| [dst/deadlift_dst_nosync_io.erl](dst/deadlift_dst_nosync_io.erl) | A planted defect: file operations of a coordinator that never sync |
+| [test/deadlift_coordinator_tests.erl](test/deadlift_coordinator_tests.erl) | Tests for `deadlift_coordinator`: the options, and the coordinated state after the stop of one coordinator and of every coordinator |
 | [bench/deadlift_bench.erl](bench/deadlift_bench.erl), [bench/run.sh](bench/run.sh) | The benchmark of a cluster on one computer |
 | [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
 | [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which has no child |
@@ -1570,8 +1616,11 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   changes between candidate and leader.
 - A worker and a candidate read the coordinated state every `poll_ms`. A
   process of FoundationDB waits for a change with one request.
-- The application does not start the peace cluster of the
-  coordinators.
+- The application starts the coordinator of a node, and does not form
+  the peace cluster. A caller forms it once with
+  `deadlift_coordinator:form/1`.
+- deadlift has no function that replaces a coordinator whose directory
+  is lost, and none that changes the coordinators of a cluster.
 - The recovery waits up to `lock_timeout_ms` (default 1,000 ms) for an old
   LogServer that does not answer.
 - The tests of the recovery stop LogServers between steps. No test stops a
@@ -1595,6 +1644,4 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - deadlift does not send a message again. In the simulation, a lost
   message to a LogServer stops the commits of the epoch until the next
   recovery.
-- The simulation has one process for the coordinated state, and no peace
-  cluster. No test runs deadlift on a peace cluster with faults.
 - The repository has no licence file.

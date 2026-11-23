@@ -11,6 +11,8 @@
 %%   state with the highest index that a server has applied. The harness
 %%   reads this row for its invariants, without a message to a
 %%   server.</li>
+%% <li>It records the state of each index, and whether two servers have
+%%   two states for one index.</li>
 %% <li>It plants the two defects of {@link deadlift_cstate_local}:
 %%   `cas => false' and `elect_cas => false'.</li>
 %% </ul>
@@ -48,7 +50,16 @@ apply(Meta = #{index := Index}, Value, State0) ->
     [{args, Args = #{tab := Tab}}] = ets:lookup(?MODULE, args),
     {State, Reply} = deadlift_cstate:apply(Meta, Value, without_cas(Value, State0, Args)),
     %% Every server applies the same values in the same order, so the
-    %% state of an index is the same on every server.
+    %% state of an index is the same on every server. The row
+    %% `{cstate_at, Index}' has the state of the first server that applied
+    %% the index. A server that has another state for the index records
+    %% the row `{cstate_differs, Index}', for the invariant
+    %% `coordinators_agree'.
+    case ets:lookup(Tab, {cstate_at, Index}) of
+        [] -> true = ets:insert(Tab, {{cstate_at, Index}, State});
+        [{_, State}] -> ok;
+        [{_, Other}] -> true = ets:insert(Tab, {{cstate_differs, Index}, #{index => Index, first => Other, second => State, value => Value}})
+    end,
     case ets:lookup(Tab, cstate) of
         [{cstate, Applied, _State}] when Applied >= Index -> ok;
         _ -> true = ets:insert(Tab, {cstate, Index, State})

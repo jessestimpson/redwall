@@ -278,7 +278,7 @@ no_step_down_is_found_test_() ->
 %% an operation with a lower probability, so that the 80 operations have
 %% about as much time of the virtual clock as in the other runs.
 peace(Opts = #{config := Config}) ->
-    Opts#{config := Config#{cstate => peace}, op_p => 0.004, max_steps => 400000}.
+    Opts#{config := Config#{cstate => peace}, op_p => 0.004, max_steps => 400000, disk => true}.
 
 %% Runs without faults. 50 seeds.
 peace_calm_test_() ->
@@ -293,7 +293,7 @@ peace_calm_test_() ->
     end}.
 
 %% Runs with the kills and the partitions of the other runs with faults,
-%% and with the kill of one server of the peace cluster. 200 seeds in 2
+%% and with kills of the coordinators, which start again from their disk. 200 seeds in 2
 %% shards.
 peace_faults_1_test_() -> peace_faults_shard(1).
 peace_faults_2_test_() -> peace_faults_shard(2).
@@ -307,12 +307,16 @@ peace_faults_shard(Shard) ->
         ok = write_stats({peace_faults, Shard}, Stats),
         ?assert(maps:get(acks, Stats, 0) > 200, Stats),
         ?assert(maps:get(recoveries, Stats, 0) > 300, Stats),
-        ?assert(maps:get(kills_coordinator, Stats, 0) > 8, Stats),
+        %% The harness killed coordinators, also every coordinator at one
+        %% time, and started them again with their data.
+        ?assert(maps:get(kills_coordinator, Stats, 0) > 50, Stats),
+        ?assert(maps:get(restarts_coordinator, Stats, 0) > 40, Stats),
+        ?assert(maps:get(kills_of_every_coordinator, Stats, 0) > 5, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 25, Stats)
     end}.
 
-%% Runs with ClusterControllers, with kills of worker nodes and of one
-%% server of the peace cluster, and with partitions. 100 seeds.
+%% Runs with ClusterControllers, with kills of worker nodes and of
+%% coordinators, and with partitions. 100 seeds.
 peace_controller_faults_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         ok = deadlift_dst:reset_stats(),
@@ -322,7 +326,8 @@ peace_controller_faults_test_() ->
         ok = write_stats({peace_controller_faults, 1}, Stats),
         ?assert(maps:get(acks, Stats, 0) > 150, Stats),
         ?assert(maps:get(leaders, Stats, 0) > 100, Stats),
-        ?assert(maps:get(kills_coordinator, Stats, 0) > 10, Stats)
+        ?assert(maps:get(kills_coordinator, Stats, 0) > 50, Stats),
+        ?assert(maps:get(kills_of_every_coordinator, Stats, 0) > 8, Stats)
     end}.
 
 %% Runs with ClusterControllers and with cuts between the nodes of the
@@ -364,7 +369,11 @@ peace_no_cas_is_found_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> peace(opts(Seed, #{mode => no_cas})) end),
         ?debugFmt("peace no_cas: seed ~p, ~p", [Seed, Violation]),
-        ?assert(lists:member(maps:get(property, Violation), [durable, unique_versions, read_version_order, kcv_below_dv]), Violation)
+        %% Two Sequencers of one epoch each write records. Two
+        %% StorageServers that follow different records then differ, which
+        %% is one more consequence of the defect.
+        ?assert(lists:member(maps:get(property, Violation), [durable, unique_versions, read_version_order, kcv_below_dv, replicas_agree]), Violation),
+        ?assertEqual(ok, maps:get(outcome, run(peace(opts(Seed, #{})))), {seed, Seed})
     end}.
 
 %% The planted defect `no_elect_cas' in the machine of the peace cluster.
@@ -373,6 +382,21 @@ peace_no_elect_cas_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> peace(controller_partitions(Seed, no_elect_cas)) end),
         ?debugFmt("peace no_elect_cas: seed ~p, ~p", [Seed, Violation]),
         ?assertMatch(#{property := one_leader}, Violation)
+    end}.
+
+%% A planted defect: a coordinator never syncs its files, so a kill of
+%% its node loses data that the peace cluster has decided. peace does not
+%% let a server that lost its data act as the member that it was, so the
+%% defect costs the availability of the coordinated state: a run ends
+%% without an epoch or without a leader. The same seed passes without the
+%% defect.
+peace_unsynced_coordinators_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Opts = fun(Seed, Mode) -> peace((opts(Seed, #{controller => true, last_op => 80, mode => Mode}))#{settle_steps => 20000}) end,
+        {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> Opts(Seed, unsynced_coordinators) end),
+        ?debugFmt("peace unsynced_coordinators: seed ~p, ~p", [Seed, Violation]),
+        ?assert(lists:member(maps:get(property, Violation), [epoch, leader, coordinators_agree]), Violation),
+        ?assertEqual(ok, maps:get(outcome, run(Opts(Seed, correct))), {seed, Seed})
     end}.
 
 shard_seeds(Shard, Size) ->

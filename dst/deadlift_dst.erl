@@ -45,10 +45,18 @@
 %%   the values with `deadlift_cstate' and records the state of the
 %%   highest index that a server has applied. The harness reads that
 %%   state for the invariants.</li>
-%% <li>`{kill_coordinator, R}' kills the node of one server, at most once
-%%   in a run and after the cluster has formed. A server keeps its data
-%%   in memory (`peace_storage_mem'), so a killed server does not start
-%%   again. The cluster then has 2 servers, which is a majority.</li>
+%% <li>Each server has the configuration of `deadlift_coordinator': it
+%%   keeps its data in the write-ahead log of peace, on the simulated
+%%   disk of eta (`disk => true' of the run).</li>
+%% <li>`{kill_coordinator, R}' kills the node of one server that runs, or
+%%   of every server that runs in 1 operation of 4, after the cluster has
+%%   formed. The kill is a crash of the disk of the node. The next
+%%   `recover' operation starts each killed server again with its
+%%   data.</li>
+%% <li>The invariant `coordinators_agree': no two servers have two states
+%%   of the coordinated state for one index of the log of peace.</li>
+%% <li>The planted defect `unsynced_coordinators': a server never syncs
+%%   its files (`deadlift_dst_nosync_io').</li>
 %% <li>`{partition, R1, R2}' can cut a node of a server off. A cut can
 %%   leave the cluster without a majority until the next `heal'.</li>
 %% <li>A call to the cluster can end without an answer after peace has
@@ -275,9 +283,8 @@
 %% <ul>
 %% <li>Without the config `cstate => peace', the coordinated state is one
 %%   process that is never killed.</li>
-%% <li>A killed server of the peace cluster does not start again, and at
-%%   most 1 of the 3 servers is killed. The cluster has no disk and no
-%%   change of its members in a run.</li>
+%% <li>The peace cluster has no change of its members in a run, and no
+%%   server is replaced.</li>
 %% <li>A killed process does not start again. A LogServer has no disk.</li>
 %% <li>The application start and `deadlift:open/0' are not in the run. A
 %%   client names its Proxy and its StorageServers.</li>
@@ -336,6 +343,8 @@ init(Seed, Config) ->
                 %% because a process on a simulated node starts only in a
                 %% step of the scheduler.
                 {module, _} = code:ensure_loaded(deadlift_dst_machine),
+                {module, _} = code:ensure_loaded(deadlift_dst_nosync_io),
+                ok = clear_dir(disk_dir()),
                 ok = deadlift_dst_machine:configure(Cas#{tab => Tab}),
                 Ids = deadlift_dst_client:coordinator_ids(),
                 Nodes = [Node || {_Name, Node} <- Ids],
@@ -435,7 +444,7 @@ generate(#{faults := Faults, cstate := CState}, Rand0) ->
             Roll < 0.988 -> partition;
             %% Only a run with a peace cluster has this operation, so the
             %% operations of the other runs are the same as before.
-            Roll < 0.992, element(1, CState) =:= peace -> {kill_coordinator, R};
+            Roll < 0.996, element(1, CState) =:= peace -> {kill_coordinator, R};
             true -> heal
         end,
     case Op of
@@ -464,8 +473,9 @@ execute(Op, S0 = #{n := N0}) ->
 %% message again and a lost message costs the time limit of a call. The
 %% system then has the nodes for an epoch, and `check_final/2' checks that
 %% it has one.
-repair(N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window := Window}) ->
+repair(N, S00 = #{tab := Tab, cstate := CState, mode := Mode, window := Window}) ->
     ok = eta_net:heal_all(),
+    S0 = restart_coordinators(S00),
     ok = eta_net:set_policy((eta_net:policy())#{drop_p => 0.0}),
     S1 = lists:foldl(
         fun([Slot, Generation], Acc) ->
@@ -492,23 +502,42 @@ replace_workers(Base, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
 execute(recover, 1, S0 = #{cstate := {peace, Tab, Ids}, coordinators_started := false}) ->
     %% The servers of the peace cluster, and a process that forms the
     %% cluster.
-    S1 = lists:foldl(fun(Id = {_Name, Node}, Acc) -> spawn_op(Node, fun() -> deadlift_dst_client:coordinator(Id) end, Acc) end, S0, Ids),
+    S1 = lists:foldl(fun(Id, Acc) -> start_coordinator(Id, Acc) end, S0, Ids),
     S2 = spawn_op(clients, fun() -> deadlift_dst_client:form_cluster(Tab, Ids) end, S1),
     execute(recover, 1, S2#{coordinators_started := true});
 execute({kill_coordinator, R}, _N, S = #{tab := Tab, cstate := {peace, Tab, Ids}}) ->
-    %% At most 1 of the 3 servers is killed in a run, because a server
-    %% keeps its data in memory and does not start again.
-    case ets:member(Tab, coordinator_killed) orelse not ets:member(Tab, cluster_formed) of
+    %% A kill of the node of a coordinator that runs. The kill is also a
+    %% crash of the simulated disk of the node: the node loses the data
+    %% that the coordinator has not synced. Any number of coordinators can
+    %% be killed, because each one starts again with its data at the next
+    %% `recover' operation. The harness kills no coordinator before the
+    %% cluster has formed.
+    %% 1 operation in 4 kills every coordinator that runs, as a loss of
+    %% power of every computer does.
+    Running = [Id || Id <- Ids, not ets:member(Tab, {coordinator_down, Id})],
+    Targets =
+        case R rem 4 of
+            0 -> Running;
+            _ -> [Id || Id <- [pick(R div 4, Running)], Id =/= none]
+        end,
+    case ets:member(Tab, cluster_formed) of
         true ->
+            lists:foreach(
+                fun(Id = {_Name, Node}) ->
+                    ok = eta_net:kill_node(Node),
+                    true = ets:insert(Tab, {{coordinator_down, Id}, true}),
+                    bump(kills_coordinator)
+                end,
+                Targets
+            ),
+            _ = Targets =/= [] andalso Targets =:= Running andalso bump(kills_of_every_coordinator),
             S;
         false ->
-            {_Name, Node} = pick(R, Ids),
-            ok = eta_net:kill_node(Node),
-            true = ets:insert(Tab, {coordinator_killed, Node}),
-            bump(kills_coordinator),
             S
     end;
-execute(recover, N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window := Window, controller := Controller}) ->
+execute(recover, N, S00 = #{tab := Tab, cstate := CState, mode := Mode, window := Window, controller := Controller}) ->
+    %% The operation starts each killed coordinator again, on its node.
+    S0 = restart_coordinators(S00),
     %% The operation also starts a new StorageServer for each place whose
     %% StorageServer was killed without a new one.
     S = lists:foldl(
@@ -690,7 +719,8 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> one_leader(Tab) end,
         fun() -> select_agrees(Tab) end,
         fun() -> mapped_range_agrees(Tab) end,
-        fun() -> own_writes(Tab) end
+        fun() -> own_writes(Tab) end,
+        fun() -> coordinators_agree(Tab) end
     ]).
 
 %% A `select/4' of a client returned the result of the match spec on the
@@ -699,6 +729,14 @@ select_agrees(Tab) ->
     case ets:match(Tab, {{select_differs, '_'}, '$1'}) of
         [] -> ok;
         [[Detail] | _] -> violation(select_agrees, Detail)
+    end.
+
+%% No two servers of the peace cluster have two states of the coordinated
+%% state for one index of the log of peace. See `deadlift_dst_machine'.
+coordinators_agree(Tab) ->
+    case ets:match(Tab, {{cstate_differs, '_'}, '$1'}) of
+        [] -> ok;
+        [[Detail] | _] -> violation(coordinators_agree, Detail)
     end.
 
 %% The reads of a transaction returned its own sets and clears, and
@@ -833,6 +871,7 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
     ok = kill_all([Pid || {_Id, Pid} <- log_pids(Tab)]),
     ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})] ++ [Pid || {local, Pid} <- [CState]]),
     ok = deadlift_dst_machine:clear(),
+    _ = [clear_dir(disk_dir()) || {peace, _Tab, _Ids} <- [CState]],
     catch ets:delete(Tab),
     ok.
 
@@ -1337,6 +1376,64 @@ spawn_op(Node, Fun, S = #{ops := Ops}) ->
 %% Element `R' of the list, counted in a circle, or `none'.
 pick(_R, []) -> none;
 pick(R, List) -> lists:nth(R rem length(List) + 1, List).
+
+%% Starts the coordinator `Id' on its node.
+start_coordinator(Id = {_Name, Node}, S = #{mode := Mode}) ->
+    Dir = disk_dir(),
+    spawn_op(Node, fun() -> deadlift_dst_client:coordinator(Id, Dir, Mode) end, S).
+
+%% Starts each killed coordinator again.
+restart_coordinators(S = #{tab := Tab, cstate := {peace, Tab, Ids}}) ->
+    lists:foldl(
+        fun(Id, Acc) ->
+            case ets:take(Tab, {coordinator_down, Id}) of
+                [_Row] ->
+                    bump(restarts_coordinator),
+                    start_coordinator(Id, Acc);
+                [] ->
+                    Acc
+            end
+        end,
+        S,
+        Ids
+    );
+restart_coordinators(S) ->
+    S.
+
+%% The directory of the data of the coordinators. Every run uses this one
+%% directory, so that the name of the directory is the same in every run.
+%% The harness empties the directory before and after each run. The
+%% environment variable `DEADLIFT_DST_DISK_DIR' sets the directory.
+%% `dst/run.sh' gives each test a directory of its own, because the tests
+%% run at the same time.
+disk_dir() ->
+    case os:getenv("DEADLIFT_DST_DISK_DIR") of
+        false -> filename:join(filename:basedir(user_cache, "deadlift_dst"), "disk");
+        Dir -> Dir
+    end.
+
+%% Deletes the files and the directories of a directory. The function
+%% uses `prim_file', because the file server is a process that no schedule
+%% controls.
+clear_dir(Dir) ->
+    case prim_file:list_dir(Dir) of
+        {ok, Names} ->
+            lists:foreach(
+                fun(Name) ->
+                    Path = filename:join(Dir, Name),
+                    case prim_file:delete(Path) of
+                        ok ->
+                            ok;
+                        {error, _} ->
+                            ok = clear_dir(Path),
+                            ok = prim_file:del_dir(Path)
+                    end
+                end,
+                Names
+            );
+        {error, enoent} ->
+            ok
+    end.
 
 %% Reads the coordinated state that the process publishes. The read sends
 %% no message to the process.
