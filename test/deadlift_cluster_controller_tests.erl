@@ -482,7 +482,7 @@ worker_role_error_test() ->
         ?assertEqual({error, {error, broken}}, deadlift_worker:start_role(Worker, log, #{})),
         ?assertEqual({ok, Worker}, deadlift_worker:start_role(Worker, proxy, #{})),
         ?assertEqual(undefined, deadlift_worker:db_info()),
-        ?assertEqual(#{controller => {0, undefined}, registered => false}, deadlift_worker:info())
+        ?assertEqual(#{controller => {0, undefined}, registered => false, candidate => undefined}, deadlift_worker:info())
     after
         ok = deadlift_worker:stop(),
         exit(CState, kill)
@@ -517,6 +517,97 @@ responsive_test_() ->
             exit(Stub, kill),
             flush()
         end
+    end}.
+
+%% The worker starts a candidate for the ClusterController. The two
+%% processes stop together.
+worker_candidate_test_() ->
+    {timeout, 60, fun() ->
+        {ok, CState} = deadlift_cstate_local:start(#{}),
+        Coordinators = {local, CState},
+        Start = fun() ->
+            {ok, Worker} = deadlift_worker:start(#{
+                coordinators => Coordinators,
+                poll_ms => 20,
+                candidate => maps:remove(coordinators, options(Coordinators))
+            }),
+            #{candidate := Candidate} = deadlift_worker:info(),
+            {Worker, Candidate}
+        end,
+        Down = fun(Pid) ->
+            Monitor = erlang:monitor(process, Pid),
+            receive
+                {'DOWN', Monitor, process, Pid, _} -> ok
+            after 2000 -> error({alive, Pid})
+            end
+        end,
+        try
+            %% The candidate of the worker is the leader, and recruits on
+            %% its own worker.
+            {W1, C1} = Start(),
+            #{term := 1, epoch := 1} = await_epoch(1),
+            ?assertMatch({ok, #{controller := {1, C1}}}, deadlift_cstate:read(Coordinators)),
+            %% The stop of the worker stops the candidate.
+            ok = deadlift_worker:stop(),
+            ok = Down(W1),
+            ok = Down(C1),
+            %% A new worker with a new candidate. The candidate wins the
+            %% election of term 2 and recruits the epoch 2.
+            {W2, C2} = Start(),
+            #{term := 2, epoch := 2} = await_epoch(2),
+            %% The stop of the candidate stops the worker.
+            exit(C2, kill),
+            ok = Down(W2),
+            ?assertEqual(undefined, whereis(deadlift_worker))
+        after
+            catch exit(whereis(deadlift_worker), kill),
+            exit(CState, kill)
+        end
+    end}.
+
+%% The application starts the worker, with its candidate, and the
+%% StorageServer of the node from its environment. `deadlift:open/0' then
+%% returns a database without the name of a process.
+application_test_() ->
+    {timeout, 60, fun() ->
+        {ok, CState} = deadlift_cstate_local:start(#{}),
+        Coordinators = {local, CState},
+        _ = application:load(deadlift),
+        ok = application:set_env(deadlift, worker, #{
+            coordinators => Coordinators,
+            poll_ms => 20,
+            candidate => maps:remove(coordinators, options(Coordinators))
+        }),
+        ok = application:set_env(deadlift, storage, #{coordinators => Coordinators, poll_ms => 5}),
+        try
+            {ok, _} = application:ensure_all_started(deadlift),
+            #{epoch := 1} = await_epoch(1),
+            Db = deadlift:open(),
+            ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 1) end),
+            ?assertEqual(1, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
+            %% The process of the epoch stops. The database finds the
+            %% process of the next epoch.
+            exit(hd(maps:get(proxies, deadlift_worker:db_info())), kill),
+            #{epoch := 2} = await_epoch(2),
+            ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 2) end),
+            ?assertEqual(2, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
+            %% An option of `open/1' replaces a default.
+            ?assertMatch({deadlift_database, #{direct := false, retry_delay_ms := 1}}, deadlift:open(#{direct => false, profile => ets})),
+            #{candidate := Candidate} = deadlift_worker:info(),
+            ok = application:stop(deadlift),
+            ?assertEqual(undefined, whereis(deadlift_worker)),
+            ?assertNot(is_process_alive(Candidate))
+        after
+            _ = application:stop(deadlift),
+            ok = application:unset_env(deadlift, worker),
+            ok = application:unset_env(deadlift, storage),
+            exit(CState, kill)
+        end,
+        %% Without a StorageServer of the application, `open/0' raises an
+        %% error.
+        {ok, _} = application:ensure_all_started(deadlift),
+        ?assertError(no_storage_server, deadlift:open()),
+        ok = application:stop(deadlift)
     end}.
 
 %% ---------------------------------------------------------------------------

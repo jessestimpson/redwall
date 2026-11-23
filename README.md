@@ -642,6 +642,47 @@ answers its requests while a read waits.
 - The Proxy chooses the LogServers that receive the body of a record from
   the LSN. FoundationDB chooses them from the tags of the record.
 
+## Start
+
+A node runs deadlift from the environment of the application. The
+application starts a worker and a StorageServer if the environment has
+their options.
+
+| Key of the environment | Value | Process |
+|---|---|---|
+| `worker` | The options of `deadlift_worker:start_link/1`: `coordinators`, `class`, and `candidate` for a candidate for the ClusterController on the node | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
+| `storage` | The options of `deadlift_storage:start_link/1`: `coordinators` | The StorageServer of the node |
+
+Example, in `sys.config`, for a node that runs every role:
+
+```erlang
+[
+    {deadlift, [
+        {worker, #{coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}], candidate => #{}}},
+        {storage, #{coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}]}}
+    ]}
+].
+```
+
+`coordinators` are the servers of a peace cluster that runs
+`deadlift_cstate:machine/0`. The application does not start the peace
+cluster.
+
+On such a node, `deadlift:open/0` returns a database:
+
+```erlang
+Db = deadlift:open(),
+ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, key, value) end).
+```
+
+- The Proxy of the database is the process of the current epoch, from
+  the information that the worker of the node has.
+- The StorageServer of the database is the StorageServer of the node. A
+  read uses its ETS tables in the process of the caller.
+- `deadlift:open/1` takes the same options as before, and each option
+  replaces a default. For example, `deadlift:open(#{profile => ets})`
+  uses the profile for the ETS StorageServer.
+
 ## Verification
 
 | Level | What it checks | Command | Time |
@@ -1209,14 +1250,21 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - The roles do not read the information of the ClusterController about
   the database. They read the process of each LogServer from the
   coordinated state.
-- The client does not find the Proxy from the coordinators. A caller
-  reads the Proxy with `deadlift_worker:db_info/0` on a node with a
-  worker.
+- The client does not find the Proxy from the coordinators.
+  `deadlift:open/0` works on a node with a worker and a StorageServer of
+  the application. On another node, a caller names the Proxy and the
+  StorageServers.
+- `deadlift:open/0` reads the StorageServer of the node once. A database
+  from before a new start of the StorageServer has the process of the
+  earlier one.
+- The worker and the candidate for the ClusterController of a node are
+  two linked processes. They are not one process, because each of them
+  is simpler alone: a worker lives as long as its node, and a candidate
+  changes between candidate and leader.
 - A worker and a candidate read the coordinated state every `poll_ms`. A
   process of FoundationDB waits for a change with one request.
-- The application does not start the worker or the candidate. A caller
-  starts them with `deadlift_worker:start/1` and
-  `deadlift_cluster_controller:start/1`.
+- The application does not start the peace cluster of the
+  coordinators.
 - The recovery waits up to `lock_timeout_ms` (default 1,000 ms) for an old
   LogServer that does not answer.
 - The tests of the recovery stop LogServers between steps. No test stops a

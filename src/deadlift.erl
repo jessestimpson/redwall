@@ -176,7 +176,7 @@
 
 -include("deadlift_eta.hrl").
 
--export([open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
+-export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, set/3, clear/2, clear_range/3]).
 -export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
@@ -199,8 +199,8 @@
     | fun(() -> gen_server:server_ref() | [gen_server:server_ref()] | undefined).
 
 -type servers() :: #{
-    proxy := server(),
-    storage := storage(),
+    proxy => server(),
+    storage => storage(),
     direct => boolean(),
     retry_delay_ms => number(),
     max_retry_delay_ms => number(),
@@ -235,8 +235,15 @@
 %% Database and transaction
 %% ---------------------------------------------------------------------------
 
-%% @doc Returns a database for a Proxy and for one StorageServer or
-%% several. The Proxy is a process, or a function that returns the process
+%% @doc Returns a database. Without the options `proxy' and `storage', the
+%% database uses the worker and the StorageServer that the deadlift
+%% application started on this node (see README.md, "Start"): the Proxy is
+%% the process of the current epoch, and the StorageServer is the
+%% StorageServer of this node. The call raises `no_storage_server' if the
+%% application has no StorageServer.
+%%
+%% With the options, the function returns a database for a Proxy and for
+%% one StorageServer or several. The Proxy is a process, or a function that returns the process
 %% that runs now. `storage' is a process, a list of processes, or a
 %% function that returns one of the two. With `direct => false', no read
 %% uses the ETS table of a StorageServer.
@@ -251,9 +258,37 @@
 %% documentation. The default is `default'. Each option above replaces the
 %% option of the profile.
 -spec open(servers()) -> database().
+open(Servers) when not is_map_key(proxy, Servers); not is_map_key(storage, Servers) ->
+    open(maps:merge(local(), Servers));
 open(Servers = #{proxy := _, storage := _}) ->
     Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms], Servers),
     {deadlift_database, maps:merge(profile(maps:get(profile, Servers, default)), Options)}.
+
+%% @equiv open(#{})
+-spec open() -> database().
+open() ->
+    open(#{}).
+
+%% The Proxy and the StorageServer of a node that runs the deadlift
+%% application with a worker and a StorageServer. The Proxy is the process
+%% of the current epoch, from the information of the ClusterController
+%% that the worker of this node has. The StorageServer is the child of the
+%% supervisor at the time of this call.
+local() ->
+    Storage =
+        try [Pid || {deadlift_storage, Pid, _Type, _Modules} <- supervisor:which_children(deadlift_sup), is_pid(Pid)] of
+            [Pid] -> Pid;
+            [] -> error(no_storage_server)
+        catch
+            exit:_ -> error(no_storage_server)
+        end,
+    Proxy = fun() ->
+        case deadlift_worker:db_info() of
+            #{proxies := [Process | _]} -> Process;
+            _ -> undefined
+        end
+    end,
+    #{proxy => Proxy, storage => Storage}.
 
 %% @doc Returns the client options of a profile.
 -spec profile(profile()) -> #{direct := boolean(), retry_delay_ms := number(), max_retry_delay_ms := number()}.

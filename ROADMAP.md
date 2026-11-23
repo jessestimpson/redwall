@@ -140,8 +140,10 @@ has the basic functions. The remaining parts, in the planned order:
 - [ ] `get_last_error/0`. erlfdb keeps the last error in the process
       dictionary, and an error that causes a retry is hidden by a later
       timeout error of the transaction. The design is open.
-- [ ] Find the Proxy and the StorageServer from the coordinators in
-      `open`.
+- [x] `open/0`: find the Proxy and the StorageServer on a node that runs
+      the application with a worker and a StorageServer.
+- [ ] Find the Proxy and the StorageServers from the coordinators in
+      `open`, on a node without a worker.
 - [ ] Client options for the read version, not planned soon:
   - [ ] A cache of the read version in the client, as `USE_GRV_CACHE` of
         FoundationDB. A read can then miss a commit that was
@@ -161,8 +163,9 @@ has the basic functions. The remaining parts, in the planned order:
       the Proxy for the names of its epoch is removed.
 - [x] Record the process of each LogServer in the coordinated state, and
       remove the registry and its waits.
-- [ ] Make the worker and the candidate for the ClusterController one
-      process for each node.
+- [x] Let the worker start the candidate for the ClusterController of
+      its node, as two linked processes. One process for both was
+      considered and not done: the two state machines are simpler apart.
 - [x] Name the module of the process of an epoch `deadlift_epoch`. Its
       earlier name was `deadlift_proxy`.
 - [ ] Decide whether a candidate replaces the ClusterController only
@@ -177,8 +180,10 @@ has the basic functions. The remaining parts, in the planned order:
       of a call, and the simulation stops the loss of messages before its
       checks at the end of a run.
 - [ ] Stop the Sequencer, the Resolver and the Proxy of an ended epoch.
-- [ ] Start the worker and the candidate in the application, and start
-      StorageServers through the ClusterController.
+- [x] Start the worker, with its candidate, and the StorageServer of a
+      node in the application, from the environment.
+- [ ] Start StorageServers through the ClusterController, and start the
+      peace cluster of the coordinators in the application.
 - [ ] Model the election and the recruitment in TLA+, or state why the
       recovery count makes a model unnecessary.
 - [ ] Shard the key space over StorageServers, with tags on log records:

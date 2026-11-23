@@ -30,6 +30,15 @@
 %% limit of `cstate_timeout_ms' (default 1000 ms). The worker answers a
 %% request for a role in that time.
 %%
+%% == Candidate ==
+%%
+%% With the option `candidate', the worker starts a candidate for the
+%% ClusterController on its node ({@link deadlift_cluster_controller}),
+%% with the options of the map and the coordinators of the worker. The two
+%% processes are linked: when one of them stops, the other one stops too.
+%% A node then has one process to start and to supervise. In FoundationDB,
+%% the ClusterController also runs in a worker.
+%%
 %% == Roles ==
 %%
 %% `start_role/3' starts a LogServer or the process of an epoch
@@ -75,7 +84,7 @@
 
 -export([start/1, start_link/1, stop/0]).
 -export([start_role/3, db_info/0, info/0]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, role/0, class/0, db_info/0]).
 
@@ -94,6 +103,9 @@
 -type options() :: #{
     coordinators := deadlift_cstate:servers(),
     class => class(),
+    %% Further options of a candidate for the ClusterController on this
+    %% node. Without the option, the node has no candidate.
+    candidate => map(),
     roles => fun((role(), map()) -> {ok, pid()} | {error, term()}),
     poll_ms => pos_integer(),
     cstate_timeout_ms => pos_integer()
@@ -110,6 +122,8 @@
 
 -record(state, {
     options :: options(),
+    %% The candidate for the ClusterController that the worker started.
+    candidate :: pid() | undefined,
     %% The term and the process of the ClusterController that the worker
     %% read last.
     controller = {0, undefined} :: {non_neg_integer(), pid() | undefined},
@@ -162,9 +176,9 @@ db_info() ->
     end.
 
 %% @doc Returns the term and the process of the ClusterController that the
-%% worker of this node knows, and whether that ClusterController has
-%% answered the registration.
--spec info() -> #{controller := {non_neg_integer(), pid() | undefined}, registered := boolean()}.
+%% worker of this node knows, whether that ClusterController has answered
+%% the registration, and the candidate that the worker started.
+-spec info() -> #{controller := {non_neg_integer(), pid() | undefined}, registered := boolean(), candidate := pid() | undefined}.
 info() ->
     gen_server:call(?MODULE, info).
 
@@ -173,10 +187,26 @@ info() ->
 %% ---------------------------------------------------------------------------
 
 %% @private
-init(Options) ->
+init(Options = #{coordinators := Coordinators}) ->
     ?TABLE = ets:new(?TABLE, [named_table, protected, {read_concurrency, true}]),
+    %% The worker handles the stop of the candidate, and stops the
+    %% candidate in `terminate/2'.
+    process_flag(trap_exit, true),
+    Candidate =
+        case Options of
+            #{candidate := CandidateOptions} ->
+                {ok, Pid} = deadlift_cluster_controller:start_link(CandidateOptions#{coordinators => Coordinators}),
+                Pid;
+            _ ->
+                undefined
+        end,
     self() ! poll,
-    {ok, #state{options = Options}}.
+    {ok, #state{options = Options, candidate = Candidate}}.
+
+%% @private
+terminate(_Reason, #state{candidate = Candidate}) ->
+    _ = is_pid(Candidate) andalso exit(Candidate, shutdown),
+    ok.
 
 %% @private
 handle_call({start_role, Role, RoleOptions}, _From, State = #state{options = Options}) ->
@@ -188,8 +218,8 @@ handle_call({start_role, Role, RoleOptions}, _From, State = #state{options = Opt
             Class:Reason -> {error, {Class, Reason}}
         end,
     {reply, Reply, State};
-handle_call(info, _From, State = #state{controller = Controller, registered = Registered}) ->
-    {reply, #{controller => Controller, registered => Registered}, State}.
+handle_call(info, _From, State = #state{controller = Controller, registered = Registered, candidate = Candidate}) ->
+    {reply, #{controller => Controller, registered => Registered, candidate => Candidate}, State}.
 
 %% @private
 %% The information about the database, from the ClusterController of
@@ -201,6 +231,10 @@ handle_cast(_Message, State) ->
     {noreply, State}.
 
 %% @private
+handle_info({'EXIT', Candidate, Reason}, State = #state{candidate = Candidate}) ->
+    %% The candidate stopped. The worker stops too, so that a supervisor
+    %% starts both again.
+    {stop, {candidate, Reason}, State#state{candidate = undefined}};
 handle_info(poll, State = #state{options = Options}) ->
     _ = erlang:send_after(maps:get(poll_ms, Options, 1000), self(), poll),
     {noreply, find(State#state{again = true})};

@@ -66,31 +66,39 @@ recover(Tab, N, CState, Mode) ->
 worker(Tab, CState, Mode, Class, Candidate) ->
     ok = join(Tab, Mode),
     Node = node(),
-    Coordinators = {local, CState},
     Roles = fun(Role, Options) -> start_role(Tab, Node, Mode, Role, Options) end,
-    {ok, Worker} = deadlift_worker:start(#{coordinators => Coordinators, class => Class, roles => Roles, poll_ms => 200, cstate_timeout_ms => 500}),
+    Options0 = #{coordinators => {local, CState}, class => Class, roles => Roles, poll_ms => 200, cstate_timeout_ms => 500},
+    Options =
+        case Candidate of
+            true ->
+                %% The worker starts the candidate, and the two processes
+                %% are linked.
+                Options0#{
+                    candidate => #{
+                        logs => 3,
+                        replication => 2,
+                        %% Each LogServer of an epoch is on a node of its
+                        %% own.
+                        min_workers => 3,
+                        proxy => #{lock_timeout_ms => 200},
+                        poll_ms => 200,
+                        retry_ms => 50,
+                        recovery_timeout_ms => 2000,
+                        cstate_timeout_ms => 500,
+                        notify => fun(Event) -> event(Tab, Node, Event) end,
+                        %% The planted defects of the ClusterController.
+                        monitor_roles => Mode =/= no_monitor_roles,
+                        step_down => Mode =/= no_step_down
+                    }
+                };
+            false ->
+                Options0
+        end,
+    {ok, Worker} = deadlift_worker:start(Options),
     true = ets:insert(Tab, {{worker, Node}, Worker, Class}),
-    case Candidate of
-        true ->
-            {ok, Controller} = deadlift_cluster_controller:start(#{
-                coordinators => Coordinators,
-                logs => 3,
-                replication => 2,
-                %% Each LogServer of an epoch is on a node of its own.
-                min_workers => 3,
-                proxy => #{lock_timeout_ms => 200},
-                poll_ms => 200,
-                retry_ms => 50,
-                recovery_timeout_ms => 2000,
-                cstate_timeout_ms => 500,
-                notify => fun(Event) -> event(Tab, Node, Event) end,
-                %% The planted defects of the ClusterController.
-                monitor_roles => Mode =/= no_monitor_roles,
-                step_down => Mode =/= no_step_down
-            }),
-            true = ets:insert(Tab, {{controller, Node}, Controller});
-        false ->
-            true
+    case deadlift_worker:info() of
+        #{candidate := Controller} when is_pid(Controller) -> true = ets:insert(Tab, {{controller, Node}, Controller});
+        _ -> true
     end.
 
 %% Starts a role on the node `Node', for the worker of that node.
