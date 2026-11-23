@@ -22,8 +22,7 @@ setup() ->
     {ok, #{count := 0}} = await_read(Ids, 50),
     Ids.
 
-%% The stop of deadlift empties the registry, so that the next test can use
-%% the identifiers of the LogServers again.
+%% Stops the applications of the test.
 cleanup(_Ids) ->
     ok = application:stop(deadlift),
     ok = application:stop(peace).

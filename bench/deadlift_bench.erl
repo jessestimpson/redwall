@@ -515,8 +515,10 @@ failures(Cluster = #{storage := Storage, coordinators := Ids}) ->
 ms(infinity) -> infinity;
 ms(Us) -> round(Us / 1000).
 
-victim(log, #{epoch := Epoch}, #{log_nodes := [Node | _]}, _Ids) ->
-    erpc:call(Node, deadlift_log, ref, [{Epoch, 1}]);
+victim(log, _Info, _Cluster, Ids) ->
+    %% The coordinated state has the process of each LogServer.
+    {ok, #{current := #{logs := [{_Id, Pid} | _]}}} = deadlift_cstate:read(Ids),
+    Pid;
 victim(proxy, #{proxies := [Proxy]}, _Cluster, _Ids) ->
     Proxy;
 victim(cluster_controller, _Info, _Cluster, Ids) ->

@@ -61,7 +61,8 @@
 %%   FoundationDB waits for a change with a request that the coordinator
 %%   answers late.</li>
 %% <li>The roles of deadlift do not read the information about the
-%%   database. They find each other through {@link deadlift_registry}.</li>
+%%   database. They read the process of each LogServer from the
+%%   coordinated state.</li>
 %% <li>A worker has one of three classes and no locality. See
 %%   {@link deadlift_cluster_controller}.</li>
 %% </ul>

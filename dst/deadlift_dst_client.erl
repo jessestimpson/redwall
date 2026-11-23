@@ -187,20 +187,12 @@ proxy_options(Count, Mode) ->
         _ -> Options
     end.
 
-%% Starts the registry of the node of the caller, and connects the node to
-%% every node of the run that has a registry. The function does nothing if
-%% the node has a registry. With the planted defect `no_exchange', the
-%% registry sends no name to another registry.
-join(Tab, Mode) ->
-    Node = node(),
-    case deadlift_registry:start(#{exchange => Mode =/= no_exchange}) of
-        {ok, Registry} ->
-            Others = [Other || [Other] <- ets:match(Tab, {{registry, '$1'}, '_'}), Other =/= Node],
-            true = ets:insert(Tab, [{{node, Node}, true}, {{registry, Node}, Registry}]),
-            lists:foreach(fun(Other) -> net_kernel:connect_node(Other) end, lists:sort(Others));
-        {error, {already_started, _Registry}} ->
-            ok
-    end.
+%% Records the node of the caller in the table of the run. The workload
+%% cuts connections between the recorded nodes. Two nodes connect with the
+%% first message between them.
+join(Tab, _Mode) ->
+    true = ets:insert(Tab, {{node, node()}, true}),
+    ok.
 
 %% Starts a LogServer on the node of the caller. `erpc' calls this
 %% function on the node of the LogServer.

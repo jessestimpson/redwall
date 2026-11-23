@@ -494,8 +494,8 @@ several. This is the replication of the whole key space.
   version, each StorageServer returns the same result, or waits for the
   version, or answers that the read version is too old.
 - The client chooses the StorageServer of a read. See "The client".
-- A StorageServer on another Erlang node finds the LogServers through the
-  registry. See "LogServer identifiers".
+- A StorageServer on another Erlang node reads the process of each
+  LogServer from the coordinated state. See "LogServer processes".
 
 FoundationDB divides the key space into shards. Each shard has a team of
 StorageServers, and each mutation has the tags of the team of its key
@@ -503,35 +503,28 @@ StorageServers, and each mutation has the tags of the team of its key
 The team is the list of StorageServers that the caller of
 `deadlift:open/1` names.
 
-### LogServer identifiers
+### LogServer processes
 
-The coordinated state identifies a LogServer with `{Epoch, Index}`. A
-LogServer registers its identifier with
-[deadlift_registry](src/deadlift_registry.erl). The Sequencer, the Proxy
-and the StorageServer find a LogServer through the registry. They send a
-request only to a LogServer that runs.
+The entry of a LogServer in a log system of the coordinated state is
+`{{Epoch, Index}, Pid}`: an identifier, and the process that the recovery
+started.
 
-Each Erlang node has one registry process. A lookup reads an ETS table of
-the local node and sends no message. The registries exchange the names:
+- The process of an epoch has the processes of its own LogServers,
+  because its recovery started them.
+- A recovery reads the coordinated state at its start, and so has the
+  processes of the LogServers of the previous epoch.
+- A StorageServer reads the log systems of all epochs from the
+  coordinated state, and so has the process of each LogServer.
 
-- The registry of a node sends each name that a process registers to the
-  registries of the connected nodes, and sends the names of its node to a
-  node that connects.
-- When the connection to a node ends, a registry keeps the names of the
-  processes of that node, because the processes can be alive.
-- The registry of a node receives a name after the registration on the
-  other node has returned. Three parts of deadlift handle this time:
-  1. A Sequencer adds the name of each LogServer and of the Resolver that
-     it recruits to the registry of its own node.
-  2. A Proxy waits at its start, for at most 1 second, until the registry
-     has the names of the Resolver and of the LogServers of its epoch.
-  3. A recovery waits, for at most the time of the lock, until the
-     registry has the names of enough LogServers of the previous epoch.
-- A StorageServer sends its requests again at an interval, so it needs
-  no such wait.
+No part of deadlift looks up a LogServer by a name, and no part waits
+for a name. FoundationDB stores the interface of each LogServer in the
+coordinated state in the same way.
 
-The simulation found the need for the three parts: with one registry on
-each simulated node and without them, no transaction was acknowledged.
+Until 2026-11-23, a registry process on each Erlang node had the names
+of the LogServers, and the registries exchanged the names in messages. A
+recovery and a Proxy waited, with a limit of time, for names that had
+not arrived. The registry was removed when the Sequencer, the Resolver
+and the Proxy became one process.
 
 ### The ClusterController
 
@@ -634,9 +627,6 @@ answers its requests while a read waits.
   atomic operations and versionstamps.
 - One Resolver handles every key. FoundationDB divides the key space over
   several Resolvers.
-- A registry on each node finds the process of a LogServer. In
-  FoundationDB the ClusterController has this function. This part is not
-  in the paper.
 - The coordinated state stores the ClusterController, and a candidate
   detects the failure of the ClusterController with an Erlang monitor.
   FoundationDB elects the ClusterController with a register on each
@@ -674,11 +664,11 @@ The simulated system has one process for the coordinated state
 peace cluster, 3 LogServers for each epoch and a replication degree of 2.
 A run has 1, 2 or 3 StorageServers. The number depends on the seed. Each
 node with the process of an epoch, a LogServer or a StorageServer has
-its own registry process, and the registries exchange the names over the
-simulated network. The process of an epoch starts each LogServer on its
-node through `erpc`. The harness connects each new node to the other
-nodes, as an Erlang cluster does by default. The coordinated state, each
-StorageServer, each process of an epoch and each LogServer run on a
+the process of each LogServer from the coordinated state. The process of
+an epoch starts each LogServer on its node through `erpc`. Two simulated
+nodes connect with the first message between them. The coordinated
+state, each StorageServer, each process of an epoch and each LogServer
+run on a
 simulated node of their own. The network loses 0.1% of the messages
 between nodes and delays 20% of them.
 
@@ -752,30 +742,29 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 7,514 acknowledged transactions, of which 2,030 with a read range, 911 with a clear of keys and 485 in a batch with another acknowledged transaction, 2,963 rejected for a conflict, 382 too old, 10,870 transactions with reads, of which 4,286 with direct reads on the node of a StorageServer and 2,157 by message only, 13 reads below the MVCC window of the StorageServer, 1,200 recoveries, 275 failed recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 2,531 acknowledged transactions, of which 585 with a read range, 288 with a clear of keys and 226 in a batch with another acknowledged transaction, 2,458 rejected for a conflict, 1,085 too old, 9,260 transactions with reads, of which 1,484 after the start of a new StorageServer, 161 while one of several StorageServers was not alive, 3,706 with direct reads on the node of a StorageServer and 1,882 by message only, 91 reads below the MVCC window of the StorageServer, 596 rollbacks of StorageServers, 2,761 recoveries, 2,282 failed recoveries, 1,620 kills, of which 217 of a StorageServer, 276 partitions |
-| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,678 acknowledged transactions, 305 recoveries, 2 failed recoveries, 50 elections |
-| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 981 acknowledged transactions, 1,136 recoveries, 196 failed recoveries, 521 kills of a worker node, of which 297 with a ClusterController process, 297 elections, 219 recoveries after the failure of a role, 162 rollbacks of StorageServers, 102 partitions |
-| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 19 runs with two leaders at the same time, 191 elections, 1 epoch that the leader found superseded, 503 acknowledged transactions, 573 recoveries, 256 kills of a worker node, 36 cuts |
-| Planted defect: the coordinated state accepts the proposal of a candidate for the ClusterController with any term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 2, `one_leader`: two processes are the leader of term 1 |
-| Planted defect: a ClusterController does not recruit after the failure of a role | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 13, `epoch`: the run ends with an epoch whose Sequencer or Proxy does not run |
-| Planted defect: a ClusterController stays the leader when the coordinated state has another term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 12, `stale_leader` |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 120 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
-| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 2, `durable` |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 8,833 acknowledged transactions, of which 2,370 with a read range, 1,057 with a clear of keys and 492 in a batch with another acknowledged transaction, 3,474 rejected for a conflict, 391 too old, 12,625 transactions with reads, of which 5,011 with direct reads on the node of a StorageServer and 2,467 by message only, 16 reads below the MVCC window of the StorageServer, 1,407 recoveries, 91 failed recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 4,296 acknowledged transactions, of which 983 with a read range, 485 with a clear of keys and 388 in a batch with another acknowledged transaction, 4,185 rejected for a conflict, 1,766 too old, 14,602 transactions with reads, of which 2,640 after the start of a new StorageServer, 173 while one of several StorageServers was not alive, 5,986 with direct reads on the node of a StorageServer and 2,856 by message only, 237 reads below the MVCC window of the StorageServer, 811 rollbacks of StorageServers, 3,776 recoveries, 1,376 failed recoveries, 1,604 kills, of which 202 of a StorageServer, 305 partitions |
+| ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,686 acknowledged transactions, 320 recoveries, 3 failed recoveries, 50 elections |
+| ClusterControllers, kills of worker nodes, partitions, lost and delayed messages | 200 seeds in 2 tests, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,232 acknowledged transactions, 1,323 recoveries, 121 failed recoveries, 504 kills of a worker node, of which 274 with a ClusterController process, 311 elections, 243 recoveries after the failure of a role, 228 rollbacks of StorageServers, 112 partitions |
+| ClusterControllers, kills of worker nodes, cuts between nodes with a ClusterController process only, lost and delayed messages | 100 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 27 runs with two leaders at the same time, 211 elections, 2 epochs that the leader found superseded, 563 acknowledged transactions, 698 recoveries, 262 kills of a worker node, 34 cuts |
+| Planted defect: the coordinated state accepts the proposal of a candidate for the ClusterController with any term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 1, `one_leader`: two processes are the leader of term 1 |
+| Planted defect: a ClusterController does not recruit after the failure of a role | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 4, `epoch`: the run ends with an epoch whose Sequencer or Proxy does not run |
+| Planted defect: a ClusterController stays the leader when the coordinated state has another term | Seeds from 1, runs with cuts between ClusterController nodes | Found at seed 5, `stale_leader` |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 3, `kcv_below_dv`. In 120 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
+| Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 2, `copied` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
-| Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 4, `no_conflict` |
-| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 7, `no_conflict` between two transactions of one batch |
-| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 12, `no_conflict`: a transaction read a key that another transaction cleared in a range |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` |
+| Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 3, `no_conflict` |
+| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 3, `no_conflict` between two transactions of one batch |
+| Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 3, `no_conflict`: a transaction read a key that another transaction cleared in a range |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 1, `no_conflict` |
 | Planted defect: the process of an epoch does not raise its read version after a commit | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 14, `read_version_order` |
-| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 2, `storage_rollback` |
-| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 12, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
-| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 12, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 30, `read_version_order` |
+| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 1, `storage_rollback` |
+| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 20, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
+| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 3, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 | Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
-| Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 4, `read_value` |
-| Planted defect: a registry sends no name to the registry of another node | Seeds 1 to 10, runs without faults | No violation, as expected. No transaction reads a value, because no StorageServer finds a LogServer. Each run has 1 recovery, and 69 later recoveries fail, because the process of a second epoch does not find the LogServers of the first epoch. 32 transactions without a read are acknowledged in the first epochs |
+| Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value` |
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
@@ -785,7 +774,7 @@ seeds. `dst/run.sh` prints the sums of the statistics of these tests.
 | Command | Nodes at the same time | Time |
 |---|---|---|
 | `make dst-serial` | 1 | 10 min 38 s |
-| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total. 2 min 23 s in 1 run with one process for each epoch |
+| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total. 2 min 23 s in 1 run with one process for each epoch. 2 min 1 s in 1 run of 32 tests without the registry |
 | `dst/run.sh -j 5` | 5 | 4 min 6 s |
 
 The machine has 4 performance cores and 6 efficiency cores. The
@@ -835,82 +824,81 @@ more. The machine has 4 performance cores and 6 efficiency cores.
 
 | Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
 |---|---|---|---|---|---|---|
-| `write` | 1 | 11072 | 90 | 125 | 166 | 1.00 |
-| `write` | 4 | 25564 | 152 | 242 | 312 | 1.00 |
-| `write` | 16 | 56910 | 277 | 420 | 522 | 1.00 |
-| `write` | 64 | 101930 | 612 | 941 | 1069 | 1.00 |
-| `write` | 256 | 118271 | 2119 | 3313 | 3720 | 1.00 |
-| `read_write` | 1 | 3954 | 238 | 448 | 636 | 1.00 |
-| `read_write` | 4 | 10062 | 365 | 830 | 1149 | 1.00 |
-| `read_write` | 16 | 23036 | 691 | 960 | 1100 | 1.00 |
-| `read_write` | 64 | 38322 | 1648 | 2385 | 2661 | 1.00 |
-| `read_write` | 256 | 44485 | 5696 | 7596 | 8296 | 1.00 |
-| `conflict` | 64 | 24416 | 1111 | 23996 | 58596 | 1.20 |
-| `read_version` | 1 | 14856 | 68 | 92 | 105 | 1.00 |
-| `read_version` | 4 | 41804 | 94 | 144 | 172 | 1.00 |
-| `read_version` | 16 | 103107 | 152 | 236 | 307 | 1.00 |
-| `read_version` | 64 | 161251 | 400 | 598 | 749 | 1.00 |
-| `read_version` | 256 | 157230 | 1588 | 2258 | 2562 | 1.00 |
-| `read_after_write` | 1 | 7967 | 31 | 46 | 64 | 1.00 |
-| `read_after_write` | 16 | 37290 | 123 | 260 | 315 | 1.00 |
-| `read_by_message` | 1 | 37848 | 26 | 32 | 63 | 1.00 |
-| `read_by_message` | 16 | 166858 | 92 | 165 | 234 | 1.00 |
-| `read_by_message` | 64 | 182116 | 352 | 542 | 644 | 1.00 |
-| `read_direct` | 1 | 619176 | 2 | 2 | 3 | 1.00 |
-| `read_direct` | 2 | 1095101 | 2 | 2 | 15 | 1.00 |
-| `read_direct` | 16 | 1000130 | 2 | 785 | 1051 | 1.00 |
+| `write` | 1 | 11642 | 86 | 119 | 170 | 1.00 |
+| `write` | 4 | 25874 | 150 | 239 | 301 | 1.00 |
+| `write` | 16 | 57195 | 275 | 418 | 499 | 1.00 |
+| `write` | 64 | 101397 | 615 | 936 | 1069 | 1.00 |
+| `write` | 256 | 116232 | 2166 | 3340 | 3773 | 1.00 |
+| `read_write` | 1 | 4093 | 232 | 425 | 611 | 1.00 |
+| `read_write` | 4 | 10135 | 364 | 811 | 1119 | 1.00 |
+| `read_write` | 16 | 22415 | 711 | 972 | 1087 | 1.00 |
+| `read_write` | 64 | 37743 | 1675 | 2417 | 2721 | 1.00 |
+| `read_write` | 256 | 43973 | 5796 | 7596 | 8196 | 1.00 |
+| `conflict` | 64 | 23976 | 1123 | 24096 | 59096 | 1.20 |
+| `read_version` | 1 | 15855 | 63 | 89 | 105 | 1.00 |
+| `read_version` | 4 | 42004 | 93 | 143 | 171 | 1.00 |
+| `read_version` | 16 | 100107 | 157 | 240 | 301 | 1.00 |
+| `read_version` | 64 | 156276 | 416 | 608 | 742 | 1.00 |
+| `read_version` | 256 | 154504 | 1621 | 2220 | 2523 | 1.00 |
+| `read_after_write` | 1 | 8060 | 31 | 49 | 69 | 1.00 |
+| `read_after_write` | 16 | 37154 | 124 | 260 | 318 | 1.00 |
+| `read_by_message` | 1 | 37245 | 27 | 33 | 68 | 1.00 |
+| `read_by_message` | 16 | 164120 | 94 | 169 | 232 | 1.00 |
+| `read_by_message` | 64 | 181250 | 355 | 540 | 640 | 1.00 |
+| `read_direct` | 1 | 583776 | 2 | 2 | 3 | 1.00 |
+| `read_direct` | 2 | 1057812 | 2 | 3 | 15 | 1.00 |
+| `read_direct` | 16 | 980976 | 2 | 840 | 964 | 1.00 |
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
 | Clients | Transactions per batch | Wait for the close (us) | Conflict check (us) | LogServers (us) |
 |---|---|---|---|---|
-| 1 | 1.0 | 0 | 3 | 44 |
-| 4 | 1.8 | 23 | 6 | 61 |
-| 16 | 5.7 | 43 | 20 | 77 |
-| 64 | 21.2 | 62 | 77 | 129 |
-| 256 | 70.1 | 152 | 315 | 269 |
+| 1 | 1.0 | 0 | 3 | 40 |
+| 4 | 1.8 | 23 | 6 | 60 |
+| 16 | 5.7 | 43 | 19 | 76 |
+| 64 | 21.2 | 63 | 78 | 129 |
+| 256 | 63.4 | 136 | 288 | 251 |
 
 The longest single time of each step:
 
 | Clients | Wait for the close (us) | Conflict check (us) | LogServers (us) |
 |---|---|---|---|
-| 1 | 5 | 58 | 555 |
-| 4 | 145 | 189 | 178 |
-| 16 | 185 | 114 | 240 |
-| 64 | 252 | 245 | 394 |
-| 256 | 535 | 1176 | 1032 |
+| 1 | 7 | 24 | 202 |
+| 4 | 141 | 104 | 181 |
+| 16 | 164 | 93 | 229 |
+| 64 | 276 | 315 | 379 |
+| 256 | 560 | 1152 | 897 |
 
 The confirmations of the Proxy for `read_version`:
 
 | Clients | Requests per confirmation | Time of a confirmation (us) |
 |---|---|---|
-| 1 | 1.0 | 30 |
+| 1 | 1.0 | 28 |
 | 4 | 1.7 | 36 |
-| 16 | 5.3 | 47 |
-| 64 | 11.5 | 67 |
-| 256 | 12.9 | 74 |
+| 16 | 5.3 | 49 |
+| 64 | 11.2 | 68 |
+| 256 | 12.3 | 72 |
 
 Garbage collections and uninterrupted runs of a process of 2 ms or more, since the start of the cluster:
 
 | Kind | Process | Count | Longest (ms) | Sum (ms) |
 |---|---|---|---|---|
-| long_gc | `deadlift_storage` | 1 | 3 | 3 |
 
 The default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 621 | 1 | 2 |
-| proxy | 636 | 2 | 3 |
-| cluster_controller | 10 | 3 | 4 |
+| log | 833 | 1 | 2 |
+| proxy | 571 | 2 | 3 |
+| cluster_controller | 5 | 3 | 4 |
 
 `retry_ms` 35:
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 64 | 1 | 2 |
-| proxy | 82 | 2 | 3 |
-| cluster_controller | 31 | 3 | 4 |
+| log | 56 | 1 | 2 |
+| proxy | 69 | 2 | 3 |
+| cluster_controller | 6 | 3 | 4 |
 
 In the two tables of kills, 8 clients write, and the time is the longest
 time without an acknowledged commit after the kill of one process.
@@ -922,7 +910,7 @@ The first run of the benchmark, on the same day, had these results. Six
 changes followed. Before the last change, the Sequencer, the Resolver and
 the Proxy were three processes, on three nodes or on one node.
 
-| Measurement | First run | Three processes on three nodes | Three processes on one node | One process (this run) |
+| Measurement | First run | Three processes on three nodes | Three processes on one node | One process |
 |---|---|---|---|---|
 | `write`, 1 client, p50 | 2,002 us | 170 us | 91 us | 90 us |
 | `write`, 1 client, p99.9 | 4,334 us | 251 us | 308 us | 166 us |
@@ -964,9 +952,10 @@ Observations:
 - An earlier version of the benchmark kept each latency in a list, and
   the garbage collections of its own processes were in the results.
 - After the kill of a LogServer or of the process of the epoch, the time
-  without a commit is `retry_ms` plus 50 ms to 140 ms.
+  without a commit is `retry_ms` plus 50 ms to 330 ms in three runs.
 - After the kill of the ClusterController, the old epoch accepts commits
-  until the process of the new epoch stops its LogServers.
+  until the process of the new epoch stops its LogServers. The time
+  without a commit was 5 ms, 10 ms and 616 ms in three runs.
 
 ### The history of the Resolver
 
@@ -1111,7 +1100,6 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/deadlift.erl](src/deadlift.erl) | The client, with the function names of erlfdb |
 | [src/deadlift_cluster_controller.erl](src/deadlift_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |
 | [src/deadlift_worker.erl](src/deadlift_worker.erl) | The worker of one node, which starts roles for the ClusterController |
-| [src/deadlift_registry.erl](src/deadlift_registry.erl) | The registry of the processes of one node |
 | [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
 | [include/deadlift_eta.hrl](include/deadlift_eta.hrl) | The header that puts a module under the parse transform of eta in the `dst` profile |
 | [dst/deadlift_dst.erl](dst/deadlift_dst.erl) | The eta harness: the workload and the invariants |
@@ -1119,7 +1107,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [dst/deadlift_dst_tests.erl](dst/deadlift_dst_tests.erl) | The simulation suite |
 | [bench/deadlift_bench.erl](bench/deadlift_bench.erl), [bench/run.sh](bench/run.sh) | The benchmark of a cluster on one computer |
 | [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
-| [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which starts the registry |
+| [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which has no child |
 | [test/deadlift_cstate_tests.erl](test/deadlift_cstate_tests.erl) | Tests for `deadlift_cstate` |
 | [test/deadlift_cluster_controller_tests.erl](test/deadlift_cluster_controller_tests.erl) | Tests for `deadlift_cluster_controller` and `deadlift_worker` |
 | [test/deadlift_log_tests.erl](test/deadlift_log_tests.erl) | Tests for `deadlift_log` |
@@ -1150,13 +1138,9 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   StorageServer that is behind or cut off, before it continues with the
   next StorageServer. The client has no record of the StorageServers that
   did not answer an earlier read.
-- A registry receives names only from the nodes to which its node is
-  connected, and it does not connect nodes. The nodes of an Erlang
-  cluster connect to each other by default. In the simulation, the
-  harness connects each new node to the other nodes.
-- A process cannot tell a LogServer whose name has not arrived from a
-  LogServer that does not run.
-- The registry keeps the name of a process on a node that has stopped.
+- The coordinated state has the process of each LogServer. A LogServer
+  that starts again after a stop is another process, and no log system
+  names it.
 - Two unit tests, in
   [test/deadlift_nodes_tests.erl](test/deadlift_nodes_tests.erl), use two
   Erlang nodes on one computer. One of them has a worker and a candidate
@@ -1223,7 +1207,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   for a read version.
 - The ClusterController does not start StorageServers.
 - The roles do not read the information of the ClusterController about
-  the database. They find each other through the registry.
+  the database. They read the process of each LogServer from the
+  coordinated state.
 - The client does not find the Proxy from the coordinators. A caller
   reads the Proxy with `deadlift_worker:db_info/0` on a node with a
   worker.

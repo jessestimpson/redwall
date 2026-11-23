@@ -22,7 +22,7 @@ opts(Seed, Config) ->
         %% commit takes several steps and, with delayed messages, several
         %% advances of the clock. With a higher value, a new recovery ends
         %% an epoch before its commits are acknowledged. The start of a
-        %% node takes steps for the messages between the registries.
+        %% node takes steps.
         op_p => 0.015,
         %% When no process is runnable, the run lets time pass more often
         %% than not, so that delayed messages arrive and time-outs fire.
@@ -422,26 +422,6 @@ one_no_clear_is_found_test_() ->
         #{first := First, second := Second} = Violation,
         %% The second StorageServer lacks a clear that the first one has.
         ?assert(lists:any(fun({_Version, Change}) -> Change =:= clear end, First -- Second), Violation)
-    end}.
-
-%% A planted defect: a registry sends no name to the registry of another
-%% node. This defect violates no invariant. The process of the first epoch
-%% recruits its LogServers itself, so it commits. A StorageServer does not
-%% find the LogServers, and the process of a second epoch does not find
-%% the LogServers of the first epoch. The test shows that the runs depend
-%% on the exchange of names: no transaction reads a value, and each run
-%% has one recovery.
-no_exchange_stops_reads_test_() ->
-    {timeout, ?TIMEOUT, fun() ->
-        ok = deadlift_dst:reset_stats(),
-        Seeds = lists:seq(1, 10),
-        sweep(Seeds, fun(Seed) -> (calm(Seed))#{config => #{mode => no_exchange, faults => false}} end),
-        Stats = deadlift_dst:stats(),
-        ?debugFmt("no_exchange: ~p", [Stats]),
-        ?assertEqual(0, maps:get(reads, Stats, 0), Stats),
-        ?assert(maps:get(no_read, Stats, 0) > 100, Stats),
-        ?assertEqual(length(Seeds), maps:get(recoveries, Stats, 0), Stats),
-        ?assert(maps:get({recovery_failed, too_few_replies}, Stats, 0) > 30, Stats)
     end}.
 
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the

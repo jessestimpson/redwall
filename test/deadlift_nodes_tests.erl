@@ -31,7 +31,7 @@ two_nodes() ->
     try
         {ok, _} = peer:call(Peer, application, ensure_all_started, [deadlift]),
         %% The StorageServer of the second node finds the LogServers of
-        %% the first node in the registry of its own node.
+        %% the first node in the coordinated state.
         {ok, Second} = peer:call(Peer, deadlift_storage, start, [#{coordinators => Ids, poll_ms => 5}]),
         ?assertEqual(Node, node(Second)),
         Both = deadlift:open(#{proxy => Proxy, storage => [First, Second]}),
@@ -100,7 +100,7 @@ controller() ->
         ?assertMatch(#{role := leader, term := 1, workers := [_, _]}, deadlift_cluster_controller:info(A)),
         Info1 = #{proxies := [Proxy1]} = deadlift_worker:db_info(),
         ?assertEqual(node(), node(Proxy1)),
-        ?assertEqual(lists:sort([Node, Node, node()]), lists:sort([node(peer:call(Peer, deadlift_log, ref, [{1, Index}])) || Index <- [1, 2, 3]])),
+        ?assertEqual(lists:sort([Node, Node, node()]), lists:sort([node(Pid) || Pid <- log_pids(Ids)])),
         %% The worker of the second node has the same information.
         ok = await(fun() -> peer:call(Peer, deadlift_worker, db_info, []) =:= Info1 end, 100),
         {ok, Storage} = deadlift_storage:start(#{coordinators => Ids, poll_ms => 5}),
@@ -119,7 +119,7 @@ controller() ->
         ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, b, 2) end),
         ?assertEqual({1, 2}, deadlift:transactional(Db, fun(Tx) -> {deadlift:get(Tx, a), deadlift:get(Tx, b)} end)),
         %% A LogServer stops. The leader recruits the epoch 3.
-        exit(peer:call(Peer, deadlift_log, ref, [{2, 1}]), kill),
+        exit(hd(log_pids(Ids)), kill),
         ok = await(fun() -> epoch(deadlift_worker:db_info()) =:= 3 end, 300),
         ?assertEqual({1, 2}, deadlift:transactional(Db, fun(Tx) -> {deadlift:get(Tx, a), deadlift:get(Tx, b)} end)),
         %% The second node stops, with the leader and 2 LogServers. A
@@ -143,6 +143,12 @@ controller() ->
         ok = application:stop(peace),
         _ = net_kernel:stop()
     end.
+
+%% The processes of the LogServers of the current epoch, from the
+%% coordinated state.
+log_pids(Ids) ->
+    {ok, #{current := #{logs := Logs}}} = deadlift_cstate:read(Ids),
+    [Pid || {_Id, Pid} <- Logs].
 
 epoch(#{epoch := Epoch, proxies := [_]}) -> Epoch;
 epoch(_Info) -> undefined.

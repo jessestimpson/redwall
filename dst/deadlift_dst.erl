@@ -9,15 +9,9 @@
 %%   run has no peace cluster. The process applies one value at a time,
 %%   which is the register with atomic operations of
 %%   `formal/Recovery.tla'.</li>
-%% <li>Each simulated node with the process of an epoch, a LogServer or a
-%%   StorageServer has its own `deadlift_registry' process, with its own
-%%   table of names. The registries exchange the names in messages of
-%%   the simulated network.</li>
-%% <li>The first process of such a node connects the node to every other
-%%   such node of the run. The nodes of an Erlang cluster connect to each
-%%   other in this way by default (`connect_all' of the kernel
-%%   application). eta connects two nodes only on request or with a
-%%   message.</li>
+%% <li>The process of an epoch, a recovery and a StorageServer read the
+%%   process of each LogServer from the coordinated state. Two simulated
+%%   nodes connect with the first message between them.</li>
 %% <li>A `recover' operation starts the process of a new epoch
 %%   (`deadlift_epoch'), which does the work of the Sequencer, of the
 %%   Resolver and of the Proxy. This is the work of a ClusterController. In these runs the harness does
@@ -202,8 +196,6 @@
 %%   not applied.</li>
 %% <li>`one_no_clear' - the second StorageServer of a run does not apply a
 %%   clear.</li>
-%% <li>`no_exchange' - a registry sends no name to the registry of another
-%%   node. This defect violates no invariant. It stops the commits.</li>
 %% <li>`no_elect_cas' - the coordinated state accepts the proposal of a
 %%   candidate with any term. This defect violates `one_leader'.</li>
 %% <li>`no_monitor_roles' - a ClusterController does not recruit after
@@ -310,7 +302,7 @@ init(Seed, Config) ->
     }}.
 
 %% The coordinated state, and the operation processes in the order of
-%% their start. The scheduler adopts the registries, the Sequencers, the
+%% their start. The scheduler adopts the Sequencers, the
 %% Proxies, the LogServers and the StorageServers as children of the
 %% processes that start them.
 processes(#{cstate := CState, ops := Ops}) ->
@@ -504,7 +496,7 @@ execute({kill_log, R}, _N, S = #{tab := Tab, cstate := CState}) ->
                 true ->
                     S;
                 false ->
-                    Id = pick(R, Logs),
+                    {Id, _Pid} = pick(R, Logs),
                     case lists:keymember(Id, 1, log_pids(Tab)) of
                         false ->
                             S;
@@ -712,11 +704,10 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
             [Pid || [Pid] <- ets:match(Tab, {{resolver, '_'}, '$1'})] ++
             [Pid || [Pid, _] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'})],
     %% The Sequencers are killed first, so that no recovery recruits a
-    %% LogServer after the harness has read the registry.
+    %% LogServer after the harness has read the table of the run.
     ok = kill_all(Started ++ Ops),
     ok = kill_all([Pid || {_Id, Pid} <- log_pids(Tab)]),
     ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})] ++ [CState]),
-    ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{registry, '_'}, '$1'})]),
     catch ets:delete(Tab),
     ok.
 

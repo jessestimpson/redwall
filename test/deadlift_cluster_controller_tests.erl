@@ -37,7 +37,7 @@ controller() ->
         ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 1) end),
         ?assertEqual(1, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end)),
         %% A LogServer stops. The leader recruits the epoch 2.
-        exit(deadlift_log:ref({1, 2}), kill),
+        exit(lists:nth(2, log_pids(Coordinators)), kill),
         #{term := 1, epoch := 2, proxies := [Proxy2]} = await_epoch(2),
         ?assertNotEqual(Proxy1, Proxy2),
         ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, 2) end),
@@ -153,7 +153,7 @@ on_peace() ->
 %% the class `stateless' and then `unset'.
 placement_test_() ->
     {timeout, 60, fun() ->
-        with_controller(#{min_workers => 5}, fun(Controller, _CState) ->
+        with_controller(#{min_workers => 5}, fun(Controller, CState) ->
             ?assertEqual({leader, 1}, next(leader)),
             [L1, L2, L3, S1] = [fake(Controller, Node, Class) || {Node, Class} <- [{l1, log}, {l2, log}, {l3, log}, {s1, stateless}]],
             ok = await(fun() -> length(maps:get(workers, deadlift_cluster_controller:info(Controller))) =:= 4 end, 100),
@@ -166,7 +166,7 @@ placement_test_() ->
             ?assertEqual({S1, proxy}, started(Proxy)),
             ?assertEqual(
                 lists:sort([{L1, log}, {L2, log}, {L3, log}]),
-                lists:sort([started(deadlift_log:ref({1, Index})) || Index <- [1, 2, 3]])
+                lists:sort([started(Pid) || Pid <- log_pids({local, CState})])
             ),
             %% Each fake worker has received the information about the
             %% epoch.
@@ -660,6 +660,12 @@ stub_cstate(Config = #{test := Test}) ->
             end,
             stub_cstate(Config)
     end.
+
+%% The processes of the LogServers of the current epoch, from the
+%% coordinated state.
+log_pids(Coordinators) ->
+    {ok, #{current := #{logs := Logs}}} = deadlift_cstate:read(Coordinators),
+    [Pid || {_Id, Pid} <- Logs].
 
 %% Waits until the worker of this node has the information about the
 %% epoch `Epoch'.

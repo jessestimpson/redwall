@@ -1,7 +1,7 @@
 {application, deadlift, [
     {description, "The transaction system of FoundationDB, with peace in the role of the Coordinators"},
     {vsn, "0.1.0"},
-    {registered, [deadlift_sup, deadlift_registry]},
+    {registered, [deadlift_sup]},
     {mod, {deadlift_app, []}},
     {applications, [
         kernel,

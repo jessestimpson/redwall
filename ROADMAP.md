@@ -103,10 +103,8 @@ commits and recoveries, and no run violates an invariant.
 - [x] Run a registry on each simulated node, and start each LogServer on
       its own simulated node, so that the simulation covers the exchange
       of names between registries.
-- [ ] Record the node of each LogServer in the coordinated state, as
-      FoundationDB records the interface of each LogServer, so that a
-      process can tell a LogServer whose name has not arrived from a
-      LogServer that does not run.
+- [x] Record the process of each LogServer in the coordinated state, as
+      FoundationDB records the interface of each LogServer.
 - [x] Reduce the time of the simulation suite: run each test in a node of
       its own, with several nodes at the same time.
 - [ ] Find where a simulation run waits without the use of a processor,
@@ -161,10 +159,8 @@ has the basic functions. The remaining parts, in the planned order:
 - [x] Make the Sequencer, the Resolver and the Proxy of an epoch one
       process. The process recruits its LogServers itself, so the wait of
       the Proxy for the names of its epoch is removed.
-- [ ] Send the processes of the LogServers in the information of the
-      ClusterController about the database, and read them in the recovery
-      and in the StorageServer. This step replaces the registry and its
-      remaining wait, in the recovery.
+- [x] Record the process of each LogServer in the coordinated state, and
+      remove the registry and its waits.
 - [ ] Make the worker and the candidate for the ClusterController one
       process for each node.
 - [x] Name the module of the process of an epoch `deadlift_epoch`. Its

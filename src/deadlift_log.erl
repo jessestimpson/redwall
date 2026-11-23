@@ -120,8 +120,8 @@
 %% version. `records' are the records that the recovery copied from the
 %% previous epoch.
 %%
-%% A LogServer with `id' registers with `deadlift_registry'. The epoch of
-%% the identifier must be `epoch'.
+%% `id' is the identifier of the LogServer in its log system. The
+%% LogServer does not use it.
 -type options() :: #{
     epoch := epoch(),
     id => id(),
@@ -169,16 +169,28 @@
 start(Options) ->
     gen_server:start(?MODULE, Options, []).
 
-%% @doc The process of the LogServer `Id', for the functions of this
-%% module. The LogServer runs on this node or on a connected node (see
-%% {@link deadlift_registry}).
+%% @doc The process of a LogServer of a log system, for the functions of
+%% this module. The entry of a LogServer in a log system is
+%% `{Id, Pid}': the identifier, and the process that the recovery
+%% started. The coordinated state has the log systems, so a process that
+%% reads the coordinated state has the process of each LogServer.
 %%
-%% The result is the atom `undefined' if no LogServer with the identifier
-%% runs. A `gen_server' call to `undefined' fails in the same way as a call
-%% to a process that has stopped.
--spec ref(id()) -> pid() | undefined.
-ref(Id) ->
-    deadlift_registry:whereis({log, Id}).
+%% The result is the atom `undefined' if the process is on this node and
+%% has stopped. A `gen_server' call to `undefined' fails in the same way
+%% as a call to a process that has stopped. For a process on another
+%% node the result is the process, and a call to a process that has
+%% stopped fails.
+-spec ref({id(), pid()}) -> pid() | undefined.
+ref({_Id, Pid}) when is_pid(Pid) ->
+    %% `is_process_alive/1' raises an error for a process of another node.
+    try is_process_alive(Pid) of
+        true -> Pid;
+        false -> undefined
+    catch
+        error:badarg -> Pid
+    end;
+ref(_NoProcess) ->
+    undefined.
 
 %% @doc The LogServers that receive the body of the record `LSN', out of
 %% the LogServers `Logs', with the replication degree `K'. The choice
@@ -288,15 +300,7 @@ info(Log) ->
 %% ---------------------------------------------------------------------------
 
 %% @private
-init(Options = #{id := Id}) ->
-    case deadlift_registry:register({log, Id}) of
-        yes -> init1(Options);
-        no -> {stop, {already_registered, Id}}
-    end;
-init(Options) ->
-    init1(Options).
-
-init1(Options = #{epoch := Epoch}) ->
+init(Options = #{epoch := Epoch}) ->
     Start = maps:get(start, Options, 0),
     Copied = lists:keysort(1, maps:get(records, Options, [])),
     case [LSN || {LSN, _Body} <- Copied, LSN > Start] of

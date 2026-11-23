@@ -79,8 +79,10 @@
 %% A term that identifies one Sequencer, for example a reference.
 -type owner() :: term().
 
-%% The LogServers of one epoch. `logs' holds the identifiers of the
-%% LogServers (`deadlift_log:id()'). `logs' and `replication' are not
+%% The LogServers of one epoch. `logs' holds one entry `{Id, Pid}' for
+%% each LogServer: the identifier (`deadlift_log:id()') and the process
+%% that the recovery started. A process that reads the coordinated state
+%% has the process of each LogServer. `logs' and `replication' are not
 %% interpreted by this module.
 -type log_system() :: #{
     epoch := epoch(),
