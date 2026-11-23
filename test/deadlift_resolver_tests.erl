@@ -190,25 +190,72 @@ order_test_() ->
             ok = deadlift_resolver:stop(Resolver)
         end}.
 
-%% The Resolver removes old entries at an interval of an eighth of the
-%% window. An entry that waits for its removal gives no conflict, and a
-%% read version below the oldest version is too old.
-prune_interval_test() ->
-    Write = fun(Key) -> #{read_version => 0, reads => [], writes => [Key]} end,
-    Read = fun(Key, Version) -> #{read_version => Version, reads => [Key], writes => []} end,
+%% The Resolver removes the versions below the oldest version. A removed
+%% version becomes 0, and a bound with the version 0 after a bound with
+%% the version 0, or after no bound, is removed.
+expire_test() ->
+    Empty = #{read_version => 0, reads => [], writes => []},
+    Rows = fun(History, Table) -> ets:tab2list(maps:get(Table, History)) end,
     H0 = deadlift_resolver:new(80),
-    {committed, H1} = deadlift_resolver:check(Write(a), 3, H0),
-    %% The oldest version is 5, which is less than 10 above the last
-    %% removal at 0. The entry of `a' stays.
-    {committed, H2} = deadlift_resolver:check(Write(b), 85, H1),
-    ?assertEqual(4, gb_trees:size(maps:get(last_commit, H2))),
-    ?assertMatch({too_old, _}, deadlift_resolver:check(Read(a, 4), 86, H2)),
-    ?assertMatch({committed, _}, deadlift_resolver:check(Read(a, 6), 86, H2)),
-    ?assertMatch({conflict, _}, deadlift_resolver:check(Read(b, 84), 86, H2)),
-    %% The oldest version is 10. The Resolver removes the entry of `a'.
-    {committed, H3} = deadlift_resolver:check(Write(c), 90, H2),
-    ?assertEqual(4, gb_trees:size(maps:get(last_commit, H3))),
-    ?assertMatch({conflict, _}, deadlift_resolver:check(Read(b, 84), 91, H3)),
-    %% Every entry is below the oldest version 400.
-    {committed, H4} = deadlift_resolver:check(#{read_version => 0, reads => [], writes => []}, 480, H3),
-    ?assertEqual(0, gb_trees:size(maps:get(last_commit, H4))).
+    {committed, H1} = deadlift_resolver:check(txn(0, [], [], [], [{b, f}]), 10, H0),
+    {committed, H2} = deadlift_resolver:check(txn(0, [], [d]), 20, H1),
+    ?assertEqual([{{b, 0}, 10}, {{d, 0}, 20}, {{d, 1}, 10}, {{f, 0}, 0}], Rows(H2, last_commit)),
+    ?assertEqual([{{10, {b, 0}}}, {{10, {d, 1}}}, {{20, {d, 0}}}], Rows(H2, versions)),
+    %% The oldest version is 15. The bound of `b' has no bound before it
+    %% and is removed. The bound after `d' ends the version 20, so it
+    %% stays with the version 0, and the bound of `f' after it is removed.
+    {committed, H3} = deadlift_resolver:check(Empty, 95, H2),
+    ?assertEqual([{{d, 0}, 20}, {{d, 1}, 0}], Rows(H3, last_commit)),
+    ?assertEqual([{{20, {d, 0}}}], Rows(H3, versions)),
+    ?assertMatch({committed, _}, deadlift_resolver:check(txn(16, [b, c, e], []), 96, H3)),
+    ?assertMatch({conflict, _}, deadlift_resolver:check(txn(19, [d], []), 96, H3)),
+    ?assertMatch({committed, _}, deadlift_resolver:check(txn(20, [d], []), 96, H3)),
+    ?assertMatch({too_old, _}, deadlift_resolver:check(txn(15, [d], []), 96, H3)),
+    %% The oldest version is 21. Both tables are empty.
+    {committed, H4} = deadlift_resolver:check(Empty, 101, H3),
+    ?assertEqual([], Rows(H4, last_commit)),
+    ?assertEqual([], Rows(H4, versions)).
+
+%% `random_test/0' with an MVCC window of 8 versions. The model keeps the
+%% last version of each key and removes nothing. The tables of the
+%% Resolver stay small, and the table of the versions has one row for each
+%% bound with a version above 0.
+random_window_test() ->
+    Keys = [1, 2, 3, 4, 5, 6],
+    Window = 8,
+    Rand0 = rand:seed_s(exsss, {4, 5, 6}),
+    {_, _, _, Counts} = lists:foldl(
+        fun(Version, {Rand1, History, Model, Seen}) ->
+            {[RV, K1, K2, K3, K4, K5, K6], Rand2} = lists:mapfoldl(fun(N, R) -> rand:uniform_s(N, R) end, Rand1, [12, 7, 7, 7, 7, 6, 6]),
+            ReadVersion = max(0, Version - RV),
+            Txn = txn(ReadVersion, [K5], [{min(K1, K2), max(K1, K2)}], [K6], [{min(K3, K4), max(K3, K4)}]),
+            Read = [K5 | [K || K <- Keys, K >= min(K1, K2), K < max(K1, K2)]],
+            Written = [K6 | [K || K <- Keys, K >= min(K3, K4), K < max(K3, K4)]],
+            Expected =
+                case {ReadVersion < Version - Window, lists:any(fun(K) -> maps:get(K, Model, 0) > ReadVersion end, Read)} of
+                    {true, _} -> too_old;
+                    {false, true} -> conflict;
+                    {false, false} -> committed
+                end,
+            {Result, History1} = deadlift_resolver:check(Txn, Version, History),
+            ?assertEqual(Expected, Result, {Version, Txn, Model}),
+            Bounds = ets:tab2list(maps:get(last_commit, History1)),
+            ?assert(length(Bounds) =< 13, Bounds),
+            ?assertEqual(
+                lists:sort([{{V, Bound}} || {Bound, V} <- Bounds, V > 0]),
+                ets:tab2list(maps:get(versions, History1))
+            ),
+            %% No version is below the oldest version.
+            ?assertEqual([], [Bound || {Bound, V} <- Bounds, V > 0, V < Version - Window]),
+            Model1 =
+                case Result of
+                    committed -> lists:foldl(fun(K, M) -> M#{K => Version} end, Model, Written);
+                    _ -> Model
+                end,
+            {Rand2, History1, Model1, Seen#{Result => maps:get(Result, Seen, 0) + 1}}
+        end,
+        {Rand0, deadlift_resolver:new(Window), #{}, #{}},
+        lists:seq(1, 5000)
+    ),
+    %% The run has each result.
+    [?assert(maps:get(Result, Counts, 0) > 500, Counts) || Result <- [committed, conflict, too_old]].

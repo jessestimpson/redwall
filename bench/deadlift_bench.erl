@@ -64,7 +64,7 @@
 -module(deadlift_bench).
 
 -export([main/0, main/1, depth/1]).
--export([run/4, client/5]).
+-export([run/4, client/5, watch/0]).
 
 -define(KEYS, 1000000).
 -define(WARMUP_US, 500000).
@@ -97,6 +97,7 @@ main(Options) ->
         Direct = deadlift:open(#{proxy => Proxy, storage => Storage}),
         [row(read_direct, N, erpc:call(StorageNode, ?MODULE, run, [read, Direct, N, Ms], infinity)) || N <- [1, 2, 16]],
         breakdown(Writes, Versions),
+        pauses(Cluster),
         io:format("~nThe default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):~n~n"),
         failures(Cluster)
     after
@@ -284,10 +285,10 @@ row(Label, Clients, #{count := Count, us := Us, latencies := Latencies, attempts
 %% Runs `Fun', and returns the number of clients with the sums that the
 %% Proxy added in that time (`deadlift_proxy:info/1').
 with_stats(Proxy, Clients, Fun) ->
-    #{stats := Before} = deadlift_proxy:info(Proxy),
+    ok = deadlift_proxy:reset_stats(Proxy),
     _ = Fun(),
-    #{stats := After} = deadlift_proxy:info(Proxy),
-    {Clients, maps:map(fun(Key, Value) -> Value - maps:get(Key, Before, 0) end, After)}.
+    #{stats := Stats} = deadlift_proxy:info(Proxy),
+    {Clients, Stats}.
 
 %% Prints the times of the steps of a batch in the Proxy, and the
 %% confirmations for read versions.
@@ -300,6 +301,17 @@ breakdown(Writes, Versions) ->
             Mean = fun(Key) -> round(maps:get(Key, Stats, 0) / max(1, Batches)) end,
             io:format("| ~b | ~.1f | ~b | ~b | ~b | ~b | ~b |~n", [
                 Clients, Transactions / max(1, Batches), Mean(wait_us), Mean(version_us), Mean(resolve_us), Mean(push_us), Mean(report_us)
+            ])
+        end,
+        Writes
+    ),
+    io:format("~nThe longest single time of each step:~n~n"),
+    io:format("| Clients | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |~n"),
+    io:format("|---|---|---|---|---|---|~n"),
+    lists:foreach(
+        fun({Clients, Stats}) ->
+            io:format("| ~b | ~b | ~b | ~b | ~b | ~b |~n", [
+                Clients | [maps:get(Key, Stats, 0) || Key <- [wait_max_us, version_max_us, resolve_max_us, push_max_us, report_max_us]]
             ])
         end,
         Writes
@@ -319,6 +331,78 @@ percentile(_Latencies, 0, _P) ->
     0;
 percentile(Latencies, Count, P) ->
     lists:nth(max(1, min(Count, round(P * Count + 0.5))), Latencies).
+
+%% ---------------------------------------------------------------------------
+%% Pauses
+%% ---------------------------------------------------------------------------
+
+%% @private
+%% A process that receives a message of the VM for each garbage
+%% collection of 2 ms or more, and for each time of 2 ms or more for which
+%% a process ran without a pause (`erlang:system_monitor/2').
+watch() ->
+    _ = erlang:system_monitor(self(), [{long_gc, 2}, {long_schedule, 2}]),
+    watch(#{}).
+
+watch(Seen) ->
+    receive
+        {monitor, Pid, Kind, Info} when is_pid(Pid) ->
+            Ms = proplists:get_value(timeout, Info, 0),
+            Key = {Kind, label(Pid)},
+            {Count, Max, Sum} = maps:get(Key, Seen, {0, 0, 0}),
+            watch(Seen#{Key => {Count + 1, max(Max, Ms), Sum + Ms}});
+        {report, From} ->
+            From ! {pauses, self(), Seen},
+            watch(#{});
+        _ ->
+            watch(Seen)
+    end.
+
+%% The callback module of a `gen_server', or the first function of another
+%% process.
+label(Pid) ->
+    case erlang:process_info(Pid, [dictionary, initial_call]) of
+        [{dictionary, Dictionary}, {initial_call, Call}] ->
+            case proplists:get_value('$initial_call', Dictionary) of
+                {Module, _Function, _Arity} -> Module;
+                undefined -> element(1, Call)
+            end;
+        undefined ->
+            stopped
+    end.
+
+%% Prints the pauses that the watchers have seen since the start of the
+%% cluster.
+pauses(#{watchers := Watchers}) ->
+    Seen = lists:append([
+        begin
+            Watcher ! {report, self()},
+            receive
+                {pauses, Watcher, Map} -> [{node(Watcher) =:= node(), Key, Value} || {Key, Value} <- maps:to_list(Map)]
+            after 5000 -> []
+            end
+        end
+     || Watcher <- Watchers
+    ]),
+    io:format("~nGarbage collections and uninterrupted runs of a process of 2 ms or more, since the start of the cluster:~n~n"),
+    io:format("| Kind | Process | Count | Longest (ms) | Sum (ms) |~n|---|---|---|---|---|~n"),
+    Merged = lists:foldl(
+        fun({Local, {Kind, Label}, {Count, Max, Sum}}, Acc) ->
+            Name =
+                case Local of
+                    true -> {Kind, {client_node, Label}};
+                    false -> {Kind, Label}
+                end,
+            {C0, M0, S0} = maps:get(Name, Acc, {0, 0, 0}),
+            Acc#{Name => {C0 + Count, max(M0, Max), S0 + Sum}}
+        end,
+        #{},
+        Seen
+    ),
+    lists:foreach(
+        fun({{Kind, Label}, {Count, Max, Sum}}) -> io:format("| ~s | `~0p` | ~b | ~b | ~b |~n", [Kind, Label, Count, Max, Sum]) end,
+        lists:reverse(lists:keysort(2, [{K, V} || {K, V = {_, _, _}} <- maps:to_list(Merged)]))
+    ).
 
 %% ---------------------------------------------------------------------------
 %% Failures
@@ -444,7 +528,9 @@ start_cluster(Controller) ->
      || Node <- lists:sublist(StatelessNodes, 2)
     ],
     {ok, Storage} = erpc:call(StorageNode, deadlift_storage, start, [#{coordinators => Ids}]),
+    Watchers = [erpc:call(Node, erlang, spawn, [?MODULE, watch, []]) || Node <- [node() | Nodes]],
     Cluster = #{
+        watchers => Watchers,
         coordinators => Ids,
         peers => Peers,
         log_nodes => LogNodes,

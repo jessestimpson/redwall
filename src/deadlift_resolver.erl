@@ -62,11 +62,25 @@
 %%   `Cv - Window' is too old, and is not committed.</li>
 %% <li>A transaction without read keys is never too old.</li>
 %% <li>The Resolver removes the entries of `lastCommit' below
-%%   `Cv - Window'. The removal examines every entry. The Resolver
-%%   therefore removes when the oldest version has risen by an eighth of
-%%   the window since the last removal. An entry that waits for its
-%%   removal gives no conflict.</li>
+%%   `Cv - Window', for each transaction.</li>
 %% </ul>
+%%
+%% == Tables ==
+%%
+%% `lastCommit' is an ETS table of the kind `ordered_set', with a bound as
+%% the key. A second ETS table of the kind `ordered_set' has the bounds in
+%% the order of their versions. The Resolver finds the entries below the
+%% oldest version at the start of the second table, and reads no other
+%% entry for the removal. Both tables are outside the heap of the Resolver
+%% process, so a garbage collection of the process does not copy them.
+%%
+%% A benchmark on 2026-11-23 compared this structure with a `gb_trees'
+%% tree that was rebuilt at an interval. At 100,000 writes per second, the
+%% longest batch took 0.3 ms with the tables and 89 ms with the tree. The
+%% README has the results.
+%%
+%% The functions `check/3' and `check_batch/3' change the tables of the
+%% history. A caller uses the history that the last call returned.
 %%
 %% The Resolver of a new epoch has no history. The first commit version of
 %% a new epoch is more than `Window' above the last version of the previous
@@ -162,11 +176,14 @@
 
 -type result() :: committed | conflict | too_old.
 
+%% `last_commit' is an ETS table of the kind `ordered_set' with one row
+%% `{Bound, Version}' for each bound. `versions' is an ETS table of the
+%% kind `ordered_set' with one row `{{Version, Bound}}' for each bound
+%% with a version above 0.
 -opaque history() :: #{
-    last_commit := gb_trees:tree(bound(), version()),
+    last_commit := ets:table(),
+    versions := ets:table(),
     oldest := integer(),
-    %% The oldest version at the last removal of entries.
-    pruned := integer(),
     window := pos_integer() | infinity
 }.
 
@@ -214,30 +231,35 @@ ref(Epoch) ->
 %% Algorithm 1
 %% ---------------------------------------------------------------------------
 
-%% @doc A history without a transaction.
+%% @doc A history without a transaction. The history is two ETS tables
+%% that the calling process owns. `check/3' and `check_batch/3' change
+%% the tables. A caller uses the history that the last call returned.
 -spec new(pos_integer() | infinity) -> history().
 new(Window) ->
-    #{last_commit => gb_trees:empty(), oldest => 0, pruned => 0, window => Window}.
+    #{
+        last_commit => ets:new(deadlift_resolver_last_commit, [ordered_set, private]),
+        versions => ets:new(deadlift_resolver_versions, [ordered_set, private]),
+        oldest => 0,
+        window => Window
+    }.
 
 %% @doc Checks the transaction `Transaction' with the commit version
 %% `Version'. Returns the result and the history after the transaction.
 -spec check(transaction(), version(), history()) -> {result(), history()}.
-check(Transaction = #{read_version := ReadVersion}, Version, History) ->
-    #{last_commit := LastCommit0, oldest := Oldest0, window := Window} = History,
+check(Transaction, Version, History) ->
+    check(Transaction, Version, History, true).
+
+%% With `Record' false, the function does not record the writes of an
+%% admitted transaction.
+check(Transaction = #{read_version := ReadVersion}, Version, History, Record) ->
+    #{last_commit := LastCommit, versions := Versions, oldest := Oldest0, window := Window} = History,
     Reads = intervals(reads, read_ranges, Transaction),
     Writes = intervals(writes, write_ranges, Transaction),
     NewOldest = new_oldest(Version, Window, Oldest0),
-    %% The removal examines every entry, so the Resolver removes at an
-    %% interval of an eighth of the window, and not for every batch. An
-    %% entry below the oldest version gives no conflict before its
-    %% removal: a transaction with read keys and a read version below the
-    %% oldest version is too old, and the entry is at or below every other
-    %% read version.
-    Pruned0 = maps:get(pruned, History, 0),
-    {LastCommit, Pruned} =
-        case is_integer(Window) andalso NewOldest - Pruned0 >= max(1, Window div 8) of
-            true -> {prune(NewOldest, LastCommit0), NewOldest};
-            false -> {LastCommit0, Pruned0}
+    ok =
+        case NewOldest > Oldest0 of
+            true -> expire(NewOldest, LastCommit, Versions);
+            false -> ok
         end,
     Result =
         case ReadVersion < NewOldest andalso Reads =/= [] of
@@ -249,12 +271,14 @@ check(Transaction = #{read_version := ReadVersion}, Version, History) ->
                     false -> committed
                 end
         end,
-    LastCommit1 =
+    ok =
         case Result of
-            committed -> lists:foldl(fun({Begin, End}, Acc) -> set_version(Begin, End, Version, Acc) end, LastCommit, Writes);
-            _ -> LastCommit
+            committed when Record ->
+                lists:foreach(fun({Begin, End}) -> set_version(Begin, End, Version, LastCommit, Versions) end, Writes);
+            _ ->
+                ok
         end,
-    {Result, History#{last_commit := LastCommit1, oldest := NewOldest, pruned => Pruned}}.
+    {Result, History#{oldest := NewOldest}}.
 
 %% @doc Checks the transactions of one batch, in their order, with the
 %% commit version `Version'. Returns one result for each transaction, and
@@ -273,57 +297,91 @@ intervals(Keys, Ranges, Transaction) ->
 %% The commit version at the bound `Bound': the version of the last bound
 %% at or below `Bound', or 0.
 version_at(Bound, LastCommit) ->
-    case gb_trees:lookup(Bound, LastCommit) of
-        {value, Version} ->
+    case ets:lookup(LastCommit, Bound) of
+        [{Bound, Version}] ->
             Version;
-        none ->
-            case gb_trees:smaller(Bound, LastCommit) of
-                {_Below, Version} -> Version;
-                none -> 0
+        [] ->
+            case ets:prev(LastCommit, Bound) of
+                '$end_of_table' -> 0;
+                Below -> ets:lookup_element(LastCommit, Below, 2)
             end
     end.
 
-%% The highest commit version in the interval from `Begin' to `End'.
+%% The highest commit version in the interval from `Begin' to `End'. The
+%% function reads the bounds of the interval only.
 max_version(Begin, End, LastCommit) ->
-    max_until(gb_trees:next(gb_trees:iterator_from(Begin, LastCommit)), End, version_at(Begin, LastCommit)).
+    max_until(ets:next(LastCommit, Begin), End, LastCommit, version_at(Begin, LastCommit)).
 
-max_until({Bound, Version, Iterator}, End, Max) when Bound < End ->
-    max_until(gb_trees:next(Iterator), End, max(Max, Version));
-max_until(_NoBoundInTheInterval, _End, Max) ->
+max_until(Bound, End, LastCommit, Max) when Bound =/= '$end_of_table', Bound < End ->
+    max_until(ets:next(LastCommit, Bound), End, LastCommit, max(Max, ets:lookup_element(LastCommit, Bound, 2)));
+max_until(_NoBoundInTheInterval, _End, _LastCommit, Max) ->
     Max.
 
 %% Sets the commit version of the interval from `Begin' to `End'. The
 %% version from `End' on does not change.
-set_version(Begin, End, Version, LastCommit) ->
+set_version(Begin, End, Version, LastCommit, Versions) ->
     AtEnd = version_at(End, LastCommit),
-    Inside = bounds_in(gb_trees:next(gb_trees:iterator_from(Begin, LastCommit)), End),
-    LastCommit1 = lists:foldl(fun gb_trees:delete/2, LastCommit, Inside),
-    gb_trees:enter(End, AtEnd, gb_trees:enter(Begin, Version, LastCommit1)).
+    ok = delete_until(ets:next(LastCommit, Begin), End, LastCommit, Versions),
+    ok = put_bound(Begin, Version, LastCommit, Versions),
+    put_bound(End, AtEnd, LastCommit, Versions).
 
-bounds_in({Bound, _Version, Iterator}, End) when Bound < End ->
-    [Bound | bounds_in(gb_trees:next(Iterator), End)];
-bounds_in(_NoBoundInTheInterval, _End) ->
-    [].
+delete_until(Bound, End, LastCommit, Versions) when Bound =/= '$end_of_table', Bound < End ->
+    Next = ets:next(LastCommit, Bound),
+    ok = unindex(Bound, LastCommit, Versions),
+    true = ets:delete(LastCommit, Bound),
+    delete_until(Next, End, LastCommit, Versions);
+delete_until(_NoBoundInTheInterval, _End, _LastCommit, _Versions) ->
+    ok.
 
-%% Removes the commit versions below `Oldest'. A removed version becomes
-%% 0. A bound with the version of the bound before it is removed.
-prune(Oldest, LastCommit) ->
-    {Kept, _Last} = lists:foldl(
-        fun({Bound, Version0}, {Acc, Before}) ->
-            Version =
-                case Version0 < Oldest of
-                    true -> 0;
-                    false -> Version0
+%% Writes the version of a bound, in both tables. `Versions' has one row
+%% `{{Version, Bound}}' for each bound with a version above 0.
+put_bound(Bound, Version, LastCommit, Versions) ->
+    ok = unindex(Bound, LastCommit, Versions),
+    _ = Version > 0 andalso ets:insert(Versions, {{Version, Bound}}),
+    true = ets:insert(LastCommit, {Bound, Version}),
+    ok.
+
+unindex(Bound, LastCommit, Versions) ->
+    case ets:lookup(LastCommit, Bound) of
+        [{Bound, Old}] when Old > 0 ->
+            true = ets:delete(Versions, {Old, Bound}),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% Removes the commit versions below `Oldest'. `Versions' has the bounds in
+%% the order of their versions, so the function reads only the bounds that
+%% it changes. A removed version becomes 0. A bound with the version 0
+%% directly after a bound with the version 0, or after no bound, is
+%% removed.
+expire(Oldest, LastCommit, Versions) ->
+    case ets:first(Versions) of
+        {Version, Bound} when Version < Oldest ->
+            true = ets:delete(Versions, {Version, Bound}),
+            Before =
+                case ets:prev(LastCommit, Bound) of
+                    '$end_of_table' -> 0;
+                    Below -> ets:lookup_element(LastCommit, Below, 2)
                 end,
-            case Version =:= Before of
-                true -> {Acc, Before};
-                false -> {[{Bound, Version} | Acc], Version}
-            end
-        end,
-        {[], 0},
-        gb_trees:to_list(LastCommit)
-    ),
-    gb_trees:from_orddict(lists:reverse(Kept)).
+            true =
+                case Before of
+                    0 -> ets:delete(LastCommit, Bound);
+                    _ -> ets:insert(LastCommit, {Bound, 0})
+                end,
+            %% The next bound has the version 0 only if it ended an
+            %% interval with a version above 0, which this bound was.
+            _ =
+                case ets:next(LastCommit, Bound) of
+                    '$end_of_table' ->
+                        true;
+                    Next ->
+                        ets:lookup_element(LastCommit, Next, 2) =:= 0 andalso ets:delete(LastCommit, Next)
+                end,
+            expire(Oldest, LastCommit, Versions);
+        _ ->
+            ok
+    end.
 
 %% The oldest version only rises.
 new_oldest(_Version, infinity, Oldest) -> Oldest;
@@ -405,7 +463,7 @@ resolve(Version, Transactions0, State = #state{history = History}) ->
                 %% The planted defect: each transaction is checked against
                 %% the history before the batch. The writes of the admitted
                 %% transactions are recorded after the checks.
-                Checked = [{element(1, check(Transaction, Version, History)), Transaction} || Transaction <- Transactions],
+                Checked = [{element(1, check(Transaction, Version, History, false)), Transaction} || Transaction <- Transactions],
                 Admitted = [WithoutReads(Transaction) || {committed, Transaction} <- Checked],
                 {_, History2} = check_batch(Admitted, Version, History),
                 %% The oldest version rises also when no transaction is

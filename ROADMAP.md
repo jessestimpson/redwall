@@ -70,12 +70,12 @@ commits and recoveries, and no run violates an invariant.
       confirmation among the requests for a read version.
 - [ ] Change the time of a batch with the load, as FoundationDB does, and
       limit the bytes of a batch.
-- [ ] Remove the old entries of the Resolver without an examination of
-      every entry. Today the Resolver examines every entry at an interval
-      of an eighth of the MVCC window. The choice between implementations
-      needs a benchmark.
-- [ ] Find the cause of the p99.9 of a commit in the benchmark, which is
-      1 ms to 85 ms.
+- [x] Find the cause of the p99.9 of a commit in the benchmark: garbage
+      collections of the LogServer and of the Resolver, and the removal
+      of old entries in the Resolver. The LogServer keeps its records in
+      an ETS table now.
+- [x] Keep the history of the Resolver in two ETS tables, chosen from a
+      benchmark of three structures in the README.
 - [ ] Decide the defaults of `retry_ms` (500 ms today, 35 ms in
       FoundationDB) and of the placement of the Sequencer, the Resolver
       and the Proxy (`spread` today) from the benchmark.

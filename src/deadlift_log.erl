@@ -73,6 +73,11 @@
 %%
 %% == Departures from the paper ==
 %%
+%% The records are in an ETS table of the kind `ordered_set', with the LSN
+%% as the key. The heap of the LogServer process then does not grow with
+%% the records. With the records on the heap, a benchmark on 2026-11-23
+%% had garbage collections of the LogServer of up to 90 ms.
+%%
 %% A LogServer of deadlift keeps the records in memory. A LogServer that
 %% stops loses the records. FoundationDB writes the records to disk. This
 %% part is not in the paper.
@@ -138,7 +143,11 @@
     dv :: version(),
     kcv :: version(),
     %% LSN -> {PreviousLSN, Body}
-    records :: gb_trees:tree(version(), {version(), body()}),
+    %% An ETS table of the kind `ordered_set' with one row
+    %% `{LSN, Prev, Body}' for each record. The records are not on the
+    %% heap of the process, so a garbage collection of the process does
+    %% not copy them.
+    records :: ets:table(),
     %% PreviousLSN -> {LSN, KCV, Body, Callers}: the pushes that wait for
     %% the record with the previous LSN.
     waiting = #{} :: #{version() => {version(), version(), body(), [gen_server:from()]}},
@@ -305,12 +314,16 @@ init1(Options = #{epoch := Epoch}) ->
 %% The copied records, each with the LSN of the copied record before it as
 %% the previous LSN.
 chain(Copied) ->
-    {Tree, _Last} = lists:foldl(
-        fun({LSN, Body}, {Acc, Prev}) -> {gb_trees:insert(LSN, {Prev, Body}, Acc), LSN} end,
-        {gb_trees:empty(), 0},
+    Table = ets:new(deadlift_log_records, [ordered_set, protected]),
+    _Last = lists:foldl(
+        fun({LSN, Body}, Prev) ->
+            true = ets:insert(Table, {LSN, Prev, Body}),
+            LSN
+        end,
+        0,
         Copied
     ),
-    Tree.
+    Table.
 
 %% @private
 handle_call({push, Epoch, _Prev, _LSN, _KCV, _Body}, _From, State = #state{epoch = Mine}) when Epoch =/= Mine ->
@@ -333,8 +346,8 @@ handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV, 
     end;
 handle_call({push, _Epoch, Prev, LSN, _KCV, Body}, _From, State = #state{dv = DV, records = Records}) ->
     %% The LSN is at or below the DV, or the previous LSN is below the DV.
-    case gb_trees:lookup(LSN, Records) of
-        {value, {Prev, Body}} ->
+    case ets:lookup(Records, LSN) of
+        [{LSN, Prev, Body}] ->
             %% The same record, sent a second time.
             {reply, {ok, DV}, State};
         _ ->
@@ -361,13 +374,13 @@ handle_call({confirm, _Epoch}, _From, State) ->
 handle_call({tail, After}, From = {Caller, _Tag}, State = #state{dv = DV, kcv = KCV, stopped_by = By, records = Records, tails = Tails}) ->
     case After < DV orelse By =/= undefined of
         true ->
-            Reply = {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), By =/= undefined, KCV},
+            Reply = {ok, range(Records, After, infinity), By =/= undefined, KCV},
             {reply, Reply, State#state{tails = maps:remove(Caller, Tails)}};
         false ->
             {noreply, State#state{tails = Tails#{Caller => {From, After}}}}
     end;
 handle_call({peek, After, UpTo}, _From, State = #state{records = Records}) ->
-    {reply, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), UpTo)}, State};
+    {reply, {ok, range(Records, After, UpTo)}, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 handle_call(info, _From, State) ->
@@ -385,7 +398,7 @@ answer_tails(Stopped, State = #state{dv = DV, kcv = KCV, records = Records, tail
     Later = maps:filter(
         fun
             (_Caller, {From, After}) when Stopped; After < DV ->
-                gen_server:reply(From, {ok, range(gb_trees:next(gb_trees:iterator_from(After + 1, Records)), infinity), Stopped, KCV}),
+                gen_server:reply(From, {ok, range(Records, After, infinity), Stopped, KCV}),
                 false;
             (_Caller, _Tail) ->
                 true
@@ -395,11 +408,8 @@ answer_tails(Stopped, State = #state{dv = DV, kcv = KCV, records = Records, tail
     State#state{tails = Later}.
 
 store(Prev, LSN, KCV, Body, State = #state{kcv = Mine, records = Records}) ->
-    State#state{
-        dv = LSN,
-        kcv = max(Mine, KCV),
-        records = gb_trees:insert(LSN, {Prev, Body}, Records)
-    }.
+    true = ets:insert(Records, {LSN, Prev, Body}),
+    State#state{dv = LSN, kcv = max(Mine, KCV)}.
 
 %% Stores the waiting records whose previous LSN is now the DV.
 release(State = #state{dv = DV, waiting = Waiting}) ->
@@ -412,7 +422,13 @@ release(State = #state{dv = DV, waiting = Waiting}) ->
             State
     end.
 
-range({LSN, {Prev, Body}, Iterator}, UpTo) when UpTo =:= infinity; LSN =< UpTo ->
-    [{LSN, Prev, Body} | range(gb_trees:next(Iterator), UpTo)];
-range(_, _UpTo) ->
-    [].
+%% The records with `After < LSN =< UpTo', in the order of the LSNs. The
+%% function reads only these rows of the table.
+range(Records, After, UpTo) ->
+    case ets:next(Records, After) of
+        LSN when is_integer(LSN), UpTo =:= infinity orelse LSN =< UpTo ->
+            [Record] = ets:lookup(Records, LSN),
+            [Record | range(Records, LSN, UpTo)];
+        _EndOfTableOrAbove ->
+            []
+    end.

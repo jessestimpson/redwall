@@ -171,7 +171,7 @@
 -include("deadlift_eta.hrl").
 
 -export([start/1, start_link/1, stop/1]).
--export([commit/2, commit/3, commit_with_index/3, read_version/1, read_version/2, info/1]).
+-export([commit/2, commit/3, commit_with_index/3, read_version/1, read_version/2, info/1, reset_stats/1]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([transaction/0, mutation/0]).
@@ -385,11 +385,18 @@ read_version(Proxy, Timeout) ->
 %% of the first transaction of a batch to the close of the batch
 %% (`wait_us'), for the commit version (`version_us'), for the Resolver
 %% (`resolve_us'), for the LogServers (`push_us'), for the report to the
-%% Sequencer (`report_us'), and for the confirmations (`read_us').
+%% Sequencer (`report_us'), and for the confirmations (`read_us'). For each
+%% time, `stats' also has the longest single time, for example
+%% `resolve_max_us'.
 -spec info(gen_server:server_ref()) ->
     #{epoch := deadlift_cstate:epoch(), kcv := version(), waiting := non_neg_integer(), stats := #{atom() => non_neg_integer()}}.
 info(Proxy) ->
     gen_server:call(Proxy, info).
+
+%% @doc Sets the sums of `info/1' to 0.
+-spec reset_stats(gen_server:server_ref()) -> ok.
+reset_stats(Proxy) ->
+    gen_server:call(Proxy, reset_stats).
 
 %% ---------------------------------------------------------------------------
 %% Server
@@ -467,6 +474,8 @@ handle_call(read_version, From, State = #state{read_round = Round, read_queue = 
     {noreply, State#state{read_queue = [From | Queue]}};
 handle_call(read_version, From, State) ->
     confirm([From], State);
+handle_call(reset_stats, _From, State) ->
+    {reply, ok, State#state{stats = #{}}};
 handle_call(info, _From, State = #state{epoch = Epoch, kcv = KCV, commits = Commits}) ->
     {reply, #{epoch => Epoch, kcv => KCV, waiting => map_size(Commits), stats => State#state.stats}, State}.
 
@@ -770,9 +779,28 @@ close_if_idle(State) ->
 now_us() ->
     erlang:monotonic_time(microsecond).
 
-%% Adds to the sums of `info/1'.
+%% Adds to the sums of `info/1', and keeps the longest single time.
 add(Sums, State = #state{stats = Stats}) ->
-    State#state{stats = maps:merge_with(fun(_Key, A, B) -> A + B end, Stats, Sums)}.
+    Stats1 = maps:merge_with(fun(_Key, A, B) -> A + B end, Stats, Sums),
+    Stats2 = maps:fold(
+        fun(Key, Value, Acc) ->
+            case max_key(Key) of
+                none -> Acc;
+                MaxKey -> Acc#{MaxKey => max(Value, maps:get(MaxKey, Acc, 0))}
+            end
+        end,
+        Stats1,
+        Sums
+    ),
+    State#state{stats = Stats2}.
+
+max_key(wait_us) -> wait_max_us;
+max_key(version_us) -> version_max_us;
+max_key(resolve_us) -> resolve_max_us;
+max_key(push_us) -> push_max_us;
+max_key(report_us) -> report_max_us;
+max_key(read_us) -> read_max_us;
+max_key(_Count) -> none.
 
 fail(Reason, State) ->
     {stop, Reason, unknown(State)}.

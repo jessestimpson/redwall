@@ -196,6 +196,12 @@ the range.
   version.
 - The Resolver handles the commit versions in their order. A request that
   arrives before the request with the previous version waits.
+- The commit versions of the key ranges are in an ETS table of the kind
+  `ordered_set`, with the bound of a range as the key. A second ETS table
+  of the kind `ordered_set` has the bounds in the order of their
+  versions. The Resolver removes the versions below the MVCC window for
+  each transaction, and reads only the entries that it removes. See "The
+  history of the Resolver" under "Benchmark".
 
 #### The store of the StorageServer
 
@@ -785,90 +791,120 @@ Sequencer, the Resolver and the Proxy are on three nodes.
 
 | Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
 |---|---|---|---|---|---|---|
-| `write` | 1 | 5851 | 166 | 241 | 1422 | 1.00 |
-| `write` | 4 | 12536 | 291 | 2027 | 3868 | 1.00 |
-| `write` | 16 | 36161 | 375 | 1689 | 9747 | 1.00 |
-| `write` | 64 | 71590 | 718 | 4356 | 30651 | 1.00 |
-| `write` | 256 | 92732 | 2088 | 26377 | 84982 | 1.00 |
-| `read_write` | 1 | 2790 | 284 | 445 | 45902 | 1.00 |
-| `read_write` | 4 | 6550 | 515 | 779 | 40174 | 1.00 |
-| `read_write` | 16 | 17203 | 784 | 1157 | 49186 | 1.00 |
-| `read_write` | 64 | 32249 | 1797 | 5589 | 51752 | 1.00 |
-| `read_write` | 256 | 38904 | 5888 | 36036 | 64680 | 1.00 |
-| `conflict` | 64 | 16570 | 1483 | 47140 | 116676 | 1.23 |
-| `read_version` | 1 | 13194 | 76 | 99 | 122 | 1.00 |
-| `read_version` | 4 | 35656 | 110 | 169 | 242 | 1.00 |
-| `read_version` | 16 | 91096 | 173 | 262 | 375 | 1.00 |
-| `read_version` | 64 | 149042 | 424 | 654 | 796 | 1.00 |
-| `read_version` | 256 | 151082 | 1654 | 2317 | 2622 | 1.00 |
-| `read_after_write` | 1 | 4136 | 32 | 41 | 49 | 1.00 |
-| `read_after_write` | 16 | 25710 | 99 | 224 | 297 | 1.00 |
-| `read_by_message` | 1 | 40736 | 24 | 36 | 53 | 1.00 |
-| `read_by_message` | 16 | 166826 | 93 | 157 | 192 | 1.00 |
-| `read_by_message` | 64 | 166841 | 387 | 617 | 723 | 1.00 |
-| `read_direct` | 1 | 600630 | 2 | 2 | 6 | 1.00 |
-| `read_direct` | 2 | 1096022 | 2 | 2 | 18 | 1.00 |
-| `read_direct` | 16 | 1011904 | 2 | 830 | 1172 | 1.00 |
+| `write` | 1 | 5944 | 169 | 200 | 256 | 1.00 |
+| `write` | 4 | 13536 | 295 | 371 | 420 | 1.00 |
+| `write` | 16 | 41711 | 383 | 465 | 576 | 1.00 |
+| `write` | 64 | 86668 | 733 | 948 | 1149 | 1.00 |
+| `write` | 256 | 116426 | 2179 | 2843 | 3149 | 1.00 |
+| `read_write` | 1 | 2960 | 327 | 502 | 580 | 1.00 |
+| `read_write` | 4 | 7433 | 533 | 838 | 990 | 1.00 |
+| `read_write` | 16 | 19696 | 803 | 1111 | 1295 | 1.00 |
+| `read_write` | 64 | 35661 | 1776 | 2485 | 2746 | 1.00 |
+| `read_write` | 256 | 42443 | 5996 | 8087 | 8669 | 1.00 |
+| `conflict` | 64 | 18636 | 1555 | 28209 | 76861 | 1.23 |
+| `read_version` | 1 | 12717 | 78 | 101 | 119 | 1.00 |
+| `read_version` | 4 | 35219 | 112 | 166 | 193 | 1.00 |
+| `read_version` | 16 | 90704 | 173 | 266 | 364 | 1.00 |
+| `read_version` | 64 | 154484 | 410 | 602 | 717 | 1.00 |
+| `read_version` | 256 | 154613 | 1620 | 2214 | 2515 | 1.00 |
+| `read_after_write` | 1 | 4848 | 33 | 43 | 51 | 1.00 |
+| `read_after_write` | 16 | 30326 | 98 | 220 | 280 | 1.00 |
+| `read_by_message` | 1 | 37454 | 26 | 40 | 55 | 1.00 |
+| `read_by_message` | 16 | 168724 | 92 | 155 | 195 | 1.00 |
+| `read_by_message` | 64 | 183009 | 352 | 537 | 628 | 1.00 |
+| `read_direct` | 1 | 597165 | 2 | 2 | 7 | 1.00 |
+| `read_direct` | 2 | 1077850 | 2 | 2 | 17 | 1.00 |
+| `read_direct` | 16 | 983109 | 2 | 852 | 1215 | 1.00 |
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
 | Clients | Transactions per batch | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
 |---|---|---|---|---|---|---|
-| 1 | 1.0 | 0 | 23 | 32 | 51 | 34 |
-| 4 | 2.0 | 115 | 26 | 40 | 64 | 34 |
-| 16 | 8.0 | 140 | 32 | 79 | 95 | 35 |
-| 64 | 31.4 | 273 | 54 | 261 | 148 | 47 |
-| 256 | 121.6 | 776 | 197 | 946 | 369 | 83 |
+| 1 | 1.0 | 1 | 24 | 31 | 47 | 33 |
+| 4 | 2.0 | 109 | 27 | 38 | 49 | 34 |
+| 16 | 8.0 | 133 | 31 | 70 | 55 | 35 |
+| 64 | 31.8 | 270 | 52 | 187 | 80 | 45 |
+| 256 | 126.0 | 844 | 198 | 642 | 157 | 78 |
+
+The longest single time of each step:
+
+| Clients | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
+|---|---|---|---|---|---|
+| 1 | 8 | 153 | 176 | 328 | 164 |
+| 4 | 295 | 106 | 141 | 156 | 211 |
+| 16 | 292 | 120 | 180 | 185 | 85 |
+| 64 | 503 | 234 | 405 | 224 | 136 |
+| 256 | 1361 | 813 | 1347 | 429 | 327 |
 
 The confirmations of the Proxy for `read_version`:
 
 | Clients | Requests per confirmation | Time of a confirmation (us) |
 |---|---|---|
-| 1 | 1.0 | 37 |
-| 4 | 1.9 | 45 |
+| 1 | 1.0 | 38 |
+| 4 | 1.9 | 46 |
 | 16 | 5.7 | 57 |
-| 64 | 13.5 | 86 |
-| 256 | 15.6 | 96 |
+| 64 | 13.8 | 84 |
+| 256 | 15.2 | 91 |
+
+Garbage collections and uninterrupted runs of a process of 2 ms or more, since the start of the cluster:
+
+| Kind | Process | Count | Longest (ms) | Sum (ms) |
+|---|---|---|---|---|
+| long_gc | `erpc` | 38 | 19 | 310 |
+| long_schedule | `erpc` | 8 | 9 | 55 |
+| long_gc | `deadlift_bench` | 8 | 5 | 30 |
+| long_gc | `{client_node,erlang}` | 5 | 8 | 25 |
+| long_schedule | `stopped` | 3 | 7 | 17 |
 
 The default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 611 | 1 | 2 |
-| resolver | 530 | 2 | 3 |
-| proxy | 522 | 3 | 4 |
-| sequencer | 526 | 4 | 5 |
-| cluster_controller | 16 | 5 | 6 |
+| log | 625 | 1 | 2 |
+| resolver | 694 | 2 | 3 |
+| proxy | 582 | 3 | 4 |
+| sequencer | 517 | 4 | 5 |
+| cluster_controller | 11 | 5 | 6 |
 
 The Sequencer, the Resolver and the Proxy on one node (`stateless` `together`):
 
 | Operation | Clients | Operations per second | p50 (us) | p99 (us) | p99.9 (us) | Attempts per operation |
 |---|---|---|---|---|---|---|
-| `write` | 1 | 10296 | 90 | 141 | 1652 | 1.00 |
-| `write` | 4 | 21697 | 149 | 548 | 5210 | 1.00 |
-| `write` | 16 | 49857 | 250 | 455 | 12667 | 1.00 |
-| `write` | 64 | 80180 | 582 | 3763 | 39520 | 1.00 |
-| `write` | 256 | 95879 | 1916 | 33977 | 72241 | 1.00 |
-| `read_write` | 1 | 3719 | 202 | 328 | 33522 | 1.00 |
-| `read_write` | 4 | 8514 | 344 | 551 | 45796 | 1.00 |
-| `read_write` | 16 | 16680 | 716 | 1109 | 55344 | 1.00 |
-| `read_write` | 64 | 28153 | 1757 | 11783 | 75132 | 1.00 |
-| `read_write` | 256 | 37730 | 5897 | 55007 | 60946 | 1.00 |
-| `read_version` | 1 | 14958 | 69 | 93 | 111 | 1.00 |
-| `read_version` | 4 | 41470 | 93 | 158 | 217 | 1.00 |
-| `read_version` | 16 | 97262 | 159 | 279 | 438 | 1.00 |
-| `read_version` | 64 | 154501 | 417 | 639 | 761 | 1.00 |
-| `read_version` | 256 | 155342 | 1611 | 2204 | 2482 | 1.00 |
+| `write` | 1 | 10669 | 91 | 226 | 308 | 1.00 |
+| `write` | 4 | 26151 | 151 | 214 | 290 | 1.00 |
+| `write` | 16 | 62398 | 252 | 373 | 456 | 1.00 |
+| `write` | 64 | 108514 | 580 | 852 | 1017 | 1.00 |
+| `write` | 256 | 119415 | 2125 | 3005 | 3454 | 1.00 |
+| `read_write` | 1 | 4124 | 237 | 381 | 513 | 1.00 |
+| `read_write` | 4 | 9762 | 386 | 745 | 954 | 1.00 |
+| `read_write` | 16 | 21431 | 743 | 1015 | 1109 | 1.00 |
+| `read_write` | 64 | 36353 | 1744 | 2474 | 2768 | 1.00 |
+| `read_write` | 256 | 42849 | 5941 | 7928 | 8628 | 1.00 |
+| `read_version` | 1 | 14592 | 69 | 94 | 112 | 1.00 |
+| `read_version` | 4 | 41883 | 93 | 149 | 188 | 1.00 |
+| `read_version` | 16 | 99071 | 158 | 250 | 317 | 1.00 |
+| `read_version` | 64 | 157626 | 409 | 613 | 781 | 1.00 |
+| `read_version` | 256 | 156508 | 1600 | 2194 | 2533 | 1.00 |
 
 The steps of a `write` batch in the Proxy, as the mean time of a batch:
 
 | Clients | Transactions per batch | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
 |---|---|---|---|---|---|---|
-| 1 | 1.0 | 0 | 2 | 5 | 46 | 5 |
-| 4 | 2.0 | 43 | 5 | 11 | 77 | 4 |
-| 16 | 6.8 | 56 | 12 | 35 | 105 | 6 |
-| 64 | 24.1 | 110 | 36 | 153 | 167 | 13 |
-| 256 | 65.6 | 349 | 47 | 484 | 292 | 34 |
+| 1 | 1.0 | 0 | 2 | 5 | 43 | 5 |
+| 4 | 2.0 | 37 | 5 | 8 | 57 | 4 |
+| 16 | 7.2 | 51 | 13 | 25 | 71 | 6 |
+| 64 | 27.8 | 71 | 43 | 100 | 99 | 12 |
+| 256 | 66.4 | 233 | 88 | 291 | 148 | 25 |
+
+The longest single time of each step:
+
+| Clients | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |
+|---|---|---|---|---|---|
+| 1 | 6 | 23 | 47 | 1914 | 93 |
+| 4 | 193 | 53 | 52 | 544 | 196 |
+| 16 | 171 | 102 | 140 | 188 | 63 |
+| 64 | 748 | 215 | 630 | 269 | 129 |
+| 256 | 2143 | 492 | 2283 | 597 | 290 |
 
 The confirmations of the Proxy for `read_version`:
 
@@ -876,19 +912,19 @@ The confirmations of the Proxy for `read_version`:
 |---|---|---|
 | 1 | 1.0 | 31 |
 | 4 | 1.7 | 36 |
-| 16 | 5.4 | 50 |
-| 64 | 11.4 | 69 |
-| 256 | 12.7 | 74 |
+| 16 | 5.3 | 49 |
+| 64 | 11.8 | 70 |
+| 256 | 13.1 | 76 |
 
 `retry_ms` 35 and `stateless` `together`:
 
 | Killed process | Time without an acknowledged commit (ms) | Epoch before | Epoch after |
 |---|---|---|---|
-| log | 59 | 1 | 2 |
-| resolver | 48 | 2 | 3 |
-| proxy | 58 | 3 | 4 |
-| sequencer | 43 | 4 | 5 |
-| cluster_controller | 15 | 5 | 6 |
+| log | 108 | 1 | 2 |
+| resolver | 94 | 2 | 3 |
+| proxy | 40 | 3 | 4 |
+| sequencer | 47 | 4 | 5 |
+| cluster_controller | 11 | 5 | 6 |
 
 In the two tables of kills, 8 clients write, and the time is the longest
 time without an acknowledged commit after the kill of one process.
@@ -896,22 +932,26 @@ time without an acknowledged commit after the kill of one process.
 
 ### Changes that the benchmark led to
 
-The first run of the benchmark, on the same day, had these results. Three
+The first run of the benchmark, on the same day, had these results. Five
 changes followed.
 
 | Measurement | First run | This run, three nodes | This run, one node |
 |---|---|---|---|
-| `write`, 1 client, p50 | 2,002 us | 166 us | 90 us |
-| `write`, 256 clients, operations per second | 10,193 | 92,732 | 95,879 |
-| `read_write`, 1 client, p50 | 5,138 us | 284 us | 202 us |
-| `read_version`, 1 client, p50 | 78 us | 76 us | 69 us |
-| `read_version`, 256 clients, operations per second | 50,408 | 151,082 | 155,342 |
+| `write`, 1 client, p50 | 2,002 us | 169 us | 91 us |
+| `write`, 1 client, p99.9 | 4,334 us | 256 us | 308 us |
+| `write`, 64 clients, p99.9 | 9,924 us | 1,149 us | 1,017 us |
+| `write`, 256 clients, p99.9 | 30,591 us | 3,149 us | 3,454 us |
+| `write`, 256 clients, operations per second | 10,193 | 116,426 | 119,415 |
+| `read_write`, 1 client, p50 | 5,138 us | 327 us | 237 us |
+| `read_version`, 1 client, p50 | 78 us | 78 us | 69 us |
+| `read_version`, 256 clients, operations per second | 50,408 | 154,613 | 156,508 |
 
 | Change | Reason |
 |---|---|
 | The Proxy closes a batch at once when no batch is in progress, and collects the next batch while one is in progress | A commit at an idle Proxy waited 1 ms to 2 ms for the batch timer |
-| The Resolver removes old entries at an interval of an eighth of the MVCC window | The Resolver examined every entry of its history for each batch. With 16 clients, a batch waited 2.5 ms for the Resolver, and with 256 clients 24 ms |
+| The history of the Resolver is two ETS tables. The second table has the entries in the order of their versions, so the Resolver reads only the entries that it removes | The Resolver examined every entry of its history for each batch, to remove the old entries. With 16 clients, a batch waited 2.5 ms for the Resolver, and with 256 clients 24 ms. The history was also on the heap of the Resolver process, which had garbage collections of up to 29 ms |
 | The requests for a read version that arrive during a confirmation share the next confirmation | Each request had its own 4 messages from the Proxy |
+| The LogServer keeps its records in an ETS table | The records were on the heap of the LogServer process. The LogServers had 163 garbage collections of 2 ms or more in one run, the longest 90 ms, and the longest wait of a batch for the LogServers was 38 ms. After the change it is 0.4 ms |
 
 `bench/deadlift_bench.erl` also has `depth/1`, which measures `write`
 for several values of `batch_depth`, the number of batches in progress
@@ -922,19 +962,42 @@ roles on one node. The default is 1.
 
 Observations:
 
-- A `write` of one client takes 166 us with the three roles on three
-  nodes: 23 us for the commit version, 32 us for the Resolver, 51 us for
-  the LogServers, 34 us for the report, and the round trip of the client.
+- A `write` of one client takes 171 us with the three roles on three
+  nodes: about 24 us for the commit version, 33 us for the Resolver,
+  53 us for the LogServers, 34 us for the report, and the round trip of
+  the client.
 - With the three roles on one node (`stateless => together` of the
-  ClusterController), a `write` of one client takes 90 us. The LogServers
-  take 46 us of it.
-- The p99.9 of `write` and `read_write` is 1 ms to 85 ms. The cause is
-  not measured. The removal of old entries in the Resolver examines
-  every entry and is one candidate.
+  ClusterController), a `write` of one client takes 92 us. The LogServers
+  take about 48 us of it.
+- The p99.9 of `write` is 0.3 ms to 3.1 ms, and no process of the
+  cluster had a garbage collection of 2 ms or more. Before the changes
+  of the LogServer and of the Resolver, the p99.9 was up to 85 ms.
+- The p99.9 of `conflict` is 77 ms. A client waits before it runs a
+  transaction again after a conflict.
 - After the kill of a role, the time without a commit is `retry_ms` plus
   about 50 ms.
 - After the kill of the ClusterController, the old epoch accepts commits
   until the Sequencer of the new ClusterController stops its LogServers.
+
+### The history of the Resolver
+
+A benchmark on 2026-11-23 compared three structures for the history of
+the Resolver. The benchmark is not part of this repository. Each run has
+batches of 32 transactions with one read and one write of 1,000,000
+keys, 12 seconds of versions, and an MVCC window of 5 seconds. The three
+structures gave the same result for every transaction.
+
+| Structure | Writes per second | Mean of a batch (us) | p99.9 (us) | Longest batch (us) | Garbage collections of 2 ms or more | Longest collection (ms) |
+|---|---|---|---|---|---|---|
+| A `gb_trees` tree, rebuilt at an interval | 100,000 | 168 | 6,491 | 88,578 | 131 | 31 |
+| A `gb_trees` tree and a `gb_sets` set of the versions, with a removal for each batch | 100,000 | 287 | 5,855 | 51,044 | 170 | 50 |
+| Two ETS tables of the kind `ordered_set`, with a removal for each batch | 100,000 | 117 | 174 | 316 | 0 | 0 |
+| A `gb_trees` tree, rebuilt at an interval | 20,000 | 137 | 12,890 | 15,020 | 21 | 7 |
+| A `gb_trees` tree and a `gb_sets` set of the versions, with a removal for each batch | 20,000 | 212 | 3,814 | 10,324 | 8 | 9 |
+| Two ETS tables of the kind `ordered_set`, with a removal for each batch | 20,000 | 94 | 141 | 165 | 0 | 0 |
+
+The Resolver of deadlift has the third structure. Before this benchmark
+it had the first one.
 
 Limitations of the benchmark:
 

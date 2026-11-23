@@ -1229,7 +1229,17 @@ log_pids(Tab) ->
 %% The published state of each LogServer that runs and has handled at least
 %% one event.
 logs(Tab) ->
-    [{Id, State} || {Id, Pid} <- log_pids(Tab), State <- [eta_observe:read(Pid)], is_map(State), is_map_key(records, State)].
+    [{Id, State#{records := Tree}} || {Id, Pid} <- log_pids(Tab), State <- [eta_observe:read(Pid)], is_map(State), is_map_key(records, State), Tree <- records(State)].
+
+%% The records of a LogServer as a tree from the LSN to the previous LSN
+%% and the body. The LogServer keeps the records in an ETS table. The
+%% result is the empty list if the table does not exist.
+records(#{records := Table}) ->
+    try ets:tab2list(Table) of
+        Rows -> [gb_trees:from_orddict([{LSN, {Prev, Body}} || {LSN, Prev, Body} <- Rows])]
+    catch
+        error:badarg -> []
+    end.
 
 %% Kills a worker node, if the kill leaves every epoch with at most one
 %% killed LogServer. An epoch keeps a record on 2 of its 3 LogServers, so
