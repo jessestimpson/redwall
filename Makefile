@@ -1,4 +1,4 @@
-.PHONY: all compile test dst tlc tlc-long
+.PHONY: all compile test dst dst-serial tlc tlc-long
 
 all: compile
 
@@ -9,10 +9,15 @@ compile:
 test:
 	rebar3 eunit
 
-# Deterministic simulation with eta. See dst/deadlift_dst.erl. The node has
+# Deterministic simulation with eta. See dst/deadlift_dst.erl. A node has
 # one scheduler thread, so that the scheduler of eta is the only source of
-# the order of the processes.
+# the order of the processes. `dst' runs each test in an Erlang node of its
+# own, and several nodes at the same time. See dst/run.sh. `dst-serial'
+# runs the tests one after another in one node.
 dst:
+	dst/run.sh
+
+dst-serial:
 	ERL_FLAGS="+S 1" rebar3 as dst eunit
 
 # Model checking with TLC. This target needs Java. formal/README.md states

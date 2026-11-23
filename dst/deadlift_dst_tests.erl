@@ -1,6 +1,7 @@
-%% This module is the simulation suite. `make dst' runs it. The node must
-%% have one scheduler thread (`ERL_FLAGS="+S 1"'), as the suite of peace
-%% does.
+%% This module is the simulation suite. `make dst' runs each test in a node
+%% of its own (`dst/run.sh'), and `make dst-serial' runs the tests in one
+%% node. A node must have one scheduler thread (`+S 1'), as the suite of
+%% peace does.
 -module(deadlift_dst_tests).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -61,56 +62,93 @@ determinism_test_() ->
         )
     end}.
 
-%% Runs without kills. Clients receive answers.
-calm_test_() ->
+%% The runs without faults and the runs with faults are divided into
+%% shards, so that `dst/run.sh' runs the shards in several nodes at the
+%% same time. A shard has its own seeds and its own statistics. Each limit
+%% of a shard is below the share of the shard in the sum over all shards.
+
+%% Runs without kills. Clients receive answers. 200 seeds in 4 shards.
+calm_1_test_() -> calm_shard(1).
+calm_2_test_() -> calm_shard(2).
+calm_3_test_() -> calm_shard(3).
+calm_4_test_() -> calm_shard(4).
+
+calm_shard(Shard) ->
     {timeout, ?TIMEOUT, fun() ->
         ok = deadlift_dst:reset_stats(),
-        sweep(lists:seq(1, 200), fun calm/1),
+        sweep(shard_seeds(Shard, 50), fun calm/1),
         Stats = deadlift_dst:stats(),
-        ?debugFmt("calm: ~p", [Stats]),
-        ?assert(maps:get(acks, Stats, 0) > 500, Stats),
-        ?assert(maps:get(recoveries, Stats, 0) > 100, Stats)
+        ?debugFmt("calm ~p: ~p", [Shard, Stats]),
+        ok = write_stats({calm, Shard}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 25, Stats),
+        ?assert(maps:get(batched, Stats, 0) > 100, Stats),
+        ?assert(maps:get(range_acks, Stats, 0) > 100, Stats)
     end}.
 
-%% Runs with kills of LogServers, Sequencers and Proxies.
-faults_test_() ->
+%% Runs with kills of LogServers, Sequencers, Proxies, Resolvers and the
+%% StorageServer. 500 seeds in 5 shards.
+faults_1_test_() -> faults_shard(1).
+faults_2_test_() -> faults_shard(2).
+faults_3_test_() -> faults_shard(3).
+faults_4_test_() -> faults_shard(4).
+faults_5_test_() -> faults_shard(5).
+
+faults_shard(Shard) ->
     {timeout, ?TIMEOUT, fun() ->
         ok = deadlift_dst:reset_stats(),
-        sweep(lists:seq(1, 500), fun(Seed) -> opts(Seed, #{}) end),
+        sweep(shard_seeds(Shard, 100), fun(Seed) -> opts(Seed, #{}) end),
         Stats = deadlift_dst:stats(),
-        ?debugFmt("faults: ~p", [Stats]),
+        ?debugFmt("faults ~p: ~p", [Shard, Stats]),
+        ok = write_stats({faults, Shard}, Stats),
         %% A transaction has 3 steps with messages: the read version, the
         %% reads and the commit. With faults, about 1 transaction in 8 is
         %% acknowledged.
-        ?assert(maps:get(acks, Stats, 0) > 2000, Stats),
-        ?assert(maps:get(kills_log, Stats, 0) > 100, Stats),
-        ?assert(maps:get(kills_sequencer, Stats, 0) > 100, Stats),
-        ?assert(maps:get(kills_proxy, Stats, 0) > 100, Stats),
-        ?assert(maps:get(kills_resolver, Stats, 0) > 100, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 300, Stats),
+        ?assert(maps:get(kills_log, Stats, 0) > 15, Stats),
+        ?assert(maps:get(kills_sequencer, Stats, 0) > 15, Stats),
+        ?assert(maps:get(kills_proxy, Stats, 0) > 15, Stats),
+        ?assert(maps:get(kills_resolver, Stats, 0) > 15, Stats),
         %% The harness killed StorageServers, and clients read from a
         %% StorageServer that started after a kill.
-        ?assert(maps:get(kills_storage, Stats, 0) > 100, Stats),
-        ?assert(maps:get(reads_after_restart, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(kills_storage, Stats, 0) > 15, Stats),
+        ?assert(maps:get(reads_after_restart, Stats, 0) > 150, Stats),
         %% Clients read values, and the StorageServer removed writes that a
         %% recovery discarded.
-        ?assert(maps:get(reads, Stats, 0) > 5000, Stats),
+        ?assert(maps:get(reads, Stats, 0) > 750, Stats),
         %% Clients read key ranges, and transactions with a read range were
         %% acknowledged.
-        ?assert(maps:get(range_reads, Stats, 0) > 2000, Stats),
-        ?assert(maps:get(range_acks, Stats, 0) > 300, Stats),
+        ?assert(maps:get(range_reads, Stats, 0) > 300, Stats),
+        ?assert(maps:get(range_acks, Stats, 0) > 45, Stats),
         %% Acknowledged transactions had their LSN together with another
         %% acknowledged transaction.
-        ?assert(maps:get(batched, Stats, 0) > 200, Stats),
-        ?assert(maps:get(rollbacks, Stats, 0) > 10, Stats),
-        ?assert(maps:get(partitions, Stats, 0) > 100, Stats),
+        ?assert(maps:get(batched, Stats, 0) > 30, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 2, Stats),
+        ?assert(maps:get(partitions, Stats, 0) > 15, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
         %% read version of an earlier epoch.
-        ?assert(maps:get(not_committed, Stats, 0) > 1000, Stats),
-        ?assert(maps:get(too_old, Stats, 0) > 10, Stats),
+        ?assert(maps:get(not_committed, Stats, 0) > 150, Stats),
+        ?assert(maps:get(too_old, Stats, 0) > 2, Stats),
         %% A Proxy of an ended epoch refused a read version.
-        ?assert(maps:get(no_read_version, Stats, 0) > 100, Stats),
-        ?assert(maps:get(runs_with_three_epochs, Stats, 0) > 100, Stats)
+        ?assert(maps:get(no_read_version, Stats, 0) > 15, Stats),
+        ?assert(maps:get(runs_with_three_epochs, Stats, 0) > 15, Stats)
     end}.
+
+%% The seeds of the shard `Shard', with `Size' seeds in each shard.
+shard_seeds(Shard, Size) ->
+    lists:seq((Shard - 1) * Size + 1, Shard * Size).
+
+%% Writes the statistics of a shard to the directory that the environment
+%% variable DEADLIFT_DST_STATS_DIR names. `dst/run.sh' sets the variable and
+%% prints the sums.
+write_stats({Kind, Shard}, Stats) ->
+    case os:getenv("DEADLIFT_DST_STATS_DIR") of
+        false ->
+            ok;
+        Dir ->
+            File = filename:join(Dir, lists:concat([Kind, "_", Shard, ".stats"])),
+            file:write_file(File, io_lib:format("~p.~n", [{Kind, Stats}]))
+    end.
 
 %% The planted defect of `RecoveryAckReplicasOnly': a Proxy answers after
 %% the 2 LogServers with the body.

@@ -77,8 +77,12 @@ commits and recoveries, and no run violates an invariant.
 - [x] Limit the versions in flight in the Sequencer, so that a discarded
       record has an LSN below every version of the next epoch.
 - [x] Kill the StorageServer in the simulation and start a new one.
-- [ ] Reduce the time of the simulation suite. It takes about 10 minutes
-      since the StorageServer is part of a run.
+- [x] Reduce the time of the simulation suite: run each test in a node of
+      its own, with several nodes at the same time.
+- [ ] Find where a simulation run waits without the use of a processor,
+      which is about 30% of the time of a run. The wait is not in the
+      harness of deadlift. A change of eta needs the agreement of the
+      owner of eta.
 - [ ] Keep only the versions of the MVCC window in the StorageServer.
 - [ ] Write a client: get a read version, read, commit, retry on conflict.
 - [ ] Check strict serializability of client histories with Elle.

@@ -370,7 +370,7 @@ through the registry. They send a request only to a LogServer that runs.
 | Level | What it checks | Command | Time |
 |---|---|---|---|
 | Unit tests | The coordinated state machine, alone and on a peace cluster of three servers on one node. One LogServer: the order of the LSNs, the KCV, repeated records and the lock. The recovery on a peace cluster: the first epoch, a second epoch with records to copy, 1 and 2 LogServers down, and two recoveries at the same time. The Proxy: commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down | `make test` | 3 seconds |
-| Simulation | The LogServer, the recovery, the Sequencer, the Resolver, the Proxy and the StorageServer under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 10 minutes |
+| Simulation | The LogServer, the recovery, the Sequencer, the Resolver, the Proxy and the StorageServer under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 4 minutes |
 | Model checking | The logging protocol, the recovery, the read versions, the StorageServer and the Resolver, with 2 epochs | `make tlc` | about 5 minutes |
 | Model checking | The logging protocol, the recovery and the StorageServer, with 3 epochs | `make tlc-long` | about 4 hours |
 
@@ -427,8 +427,8 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 9,558 acknowledged transactions, of which 2,223 with a read range and 2,169 in a batch with another acknowledged transaction, 9,265 rejected for a conflict, 1,887 too old, 22,132 transactions with reads from the StorageServer, 2,279 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 2,429 acknowledged transactions, of which 438 with a read range and 401 in a batch with another acknowledged transaction, 3,213 rejected for a conflict, 3,122 too old, 23,274 transactions with reads from the StorageServer, of which 7,130 from a StorageServer that started after a kill, 386 rollbacks of the StorageServer, 5,997 recoveries, 3,276 kills, of which 347 of the StorageServer, 566 partitions |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 9,558 acknowledged transactions, of which 2,223 with a read range and 2,169 in a batch with another acknowledged transaction, 9,265 rejected for a conflict, 1,887 too old, 22,132 transactions with reads from the StorageServer, 2,279 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 2,429 acknowledged transactions, of which 438 with a read range and 401 in a batch with another acknowledged transaction, 3,213 rejected for a conflict, 3,122 too old, 23,274 transactions with reads from the StorageServer, of which 7,130 from a StorageServer that started after a kill, 386 rollbacks of the StorageServer, 5,997 recoveries, 3,276 kills, of which 347 of the StorageServer, 566 partitions |
 | Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `no_loss` |
 | Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `read_version_order` |
@@ -440,16 +440,33 @@ Results of `make dst` on 2026-11-22:
 | Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 18, `read_version_order`: a Proxy of epoch 10 gave a read version below a commit of epoch 11 |
 | Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 3, `storage_rollback` |
 
-The suite takes about 10 minutes. A run has about 5,000 steps. Before the
-StorageServer, a run had about 2,750 steps and the suite took about 4.5
-minutes.
+`make dst` runs each test in an Erlang node of its own, with several
+nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
+are 4 tests of 50 seeds, and the runs with faults are 5 tests of 100
+seeds. `dst/run.sh` prints the sums of the statistics of these tests.
+
+| Command | Nodes at the same time | Time |
+|---|---|---|
+| `make dst-serial` | 1 | 10 min 38 s |
+| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs |
+| `dst/run.sh -j 5` | 5 | 4 min 6 s |
+
+The machine has 4 performance cores and 6 efficiency cores. The
+commands run the same seeds, and the sums of the statistics are equal.
+With 8 nodes, the tests use 2.2 times the processor time of the serial
+command, because one test takes longer while other nodes run.
+
+A run has about 5,000 steps and takes about 0.65 s in a node alone. About
+30% of that time, the node uses no processor. The invariant checks of the
+harness take less than 1% of the time.
 
 ## Commands
 
 ```
 make compile    # compile
 make test       # unit tests
-make dst        # deterministic simulation with eta
+make dst        # deterministic simulation with eta, in several nodes
+make dst-serial # the same tests in one node
 make tlc        # the quick TLC configs
 make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 ```
@@ -480,6 +497,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [dst/deadlift_dst.erl](dst/deadlift_dst.erl) | The eta harness: the workload and the invariants |
 | [dst/deadlift_dst_client.erl](dst/deadlift_dst_client.erl) | The processes that perform the operations of the simulation |
 | [dst/deadlift_dst_tests.erl](dst/deadlift_dst_tests.erl) | The simulation suite |
+| [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
 | [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which starts the registry |
 | [test/deadlift_cstate_tests.erl](test/deadlift_cstate_tests.erl) | Tests for `deadlift_cstate` |
 | [test/deadlift_log_tests.erl](test/deadlift_log_tests.erl) | Tests for `deadlift_log` |
