@@ -15,7 +15,9 @@ test:
 dst:
 	ERL_FLAGS="+S 1" rebar3 as dst eunit
 
-# Model checking with TLC. See formal/README.md. This target needs Java.
+# Model checking with TLC. This target needs Java. formal/README.md states
+# which configs a change needs: `formal/check_all.sh resolver' takes about
+# 15 seconds, `make tlc' about 5 minutes and `make tlc-long' about 4 hours.
 tlc:
 	formal/check_all.sh quick
 

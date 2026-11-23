@@ -81,8 +81,12 @@ model one request. The Proxy answers when the Sequencer has answered and
 | New epoch | A Resolver without history. The first version is the last version plus `Gap` |
 
 The model assumes that a recovery keeps every record. It does not contain
-LogServers, the StorageServer, key ranges or more than one Resolver in an
-epoch.
+LogServers, the StorageServer or more than one Resolver in an epoch.
+
+A read range and a write range of deadlift are sets of keys in the model.
+The model does not have the ordered set of bounds that
+`deadlift_resolver` keeps. A unit test compares that set of bounds with one
+version for each key, for 3,000 random transactions.
 
 ## Invariants
 
@@ -215,9 +219,30 @@ invariant now applies to the records of clients, and the comments in
 ```
 ./check.sh RecoverySafe            # one config that must pass
 ./check.sh RecoveryNoCas fail      # one config that must find a violation
-./check_all.sh quick               # every config except the long ones
-./check_all.sh long                # the Recovery configs with 3 epochs
+./check_all.sh resolver            # the Resolver configs, about 15 seconds
+./check_all.sh recovery            # the quick Recovery configs, about 5 minutes
+./check_all.sh quick               # resolver and recovery
+./check_all.sh long                # the Recovery configs with 3 epochs, about 4 hours
 ```
+
+## When to run TLC
+
+The configs with 3 epochs take about 4 hours, so a change does not run
+every config. The rule is:
+
+| Change | Configs to run | Time |
+|---|---|---|
+| Code, tests or documents, and no file in `formal/` | None | 0 |
+| A comment in a model | None | 0 |
+| `Resolver.tla` or `MCResolver.tla` | `./check_all.sh resolver` | about 15 seconds |
+| `Recovery.tla` or `MCRecovery.tla` | `./check_all.sh recovery` | about 5 minutes |
+| `Recovery.tla`, before the end of a milestone or before a release | `./check_all.sh long`, as a background job | about 4 hours |
+
+A change of the code that changes a rule of a model changes the model in
+the same step. The configs with 3 epochs last passed for the commit
+`1b56582`. A later change of `Recovery.tla` is recorded in the table of
+results as not checked with 3 epochs until the long configs have passed
+again.
 
 ## Limitations
 

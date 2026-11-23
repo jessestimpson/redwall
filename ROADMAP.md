@@ -12,8 +12,8 @@ deadlift follows the design of FoundationDB as the paper describes it. See
 | LogServer | Done in memory, with unit tests |
 | Sequencer and recovery | Done, with unit tests |
 | Proxy | Done, with unit tests |
-| Resolver | Done for keys, with unit tests |
-| StorageServer | Not started |
+| Resolver | Done for keys and key ranges, with unit tests |
+| StorageServer | Done in memory, with unit tests |
 | Simulation with eta | Done: kills, partitions, and lost and delayed messages |
 
 ## Milestones
@@ -59,7 +59,11 @@ commits and recoveries, and no run violates an invariant.
 - [x] Implement read versions in the Sequencer and the Proxy.
 - [x] Raise the commit version with the time, as FoundationDB does.
 - [x] Confirm that the epoch is live before a Proxy gives a read version.
-- [ ] Check key ranges in the Resolver.
+- [x] Check key ranges in the Resolver, and read a key range from the
+      StorageServer.
+- [ ] Add an operation that clears a key range: a mutation in the log
+      record, a write range for the Resolver, and the removal of the keys
+      in the StorageServer.
 - [ ] Collect the transactions of a short time into one batch with one
       commit version in the Proxy.
 - [x] Kill the Resolver in the simulation.
@@ -121,5 +125,8 @@ node of the cluster. See "Use cases" in [README.md](README.md).
       model has the value that a client reads.
 - [ ] Model the copy of records to a subset of the new LogServers. The
       model copies each record to every new LogServer.
+- [ ] Reduce the time of the Recovery configs with 3 epochs, which is
+      about 4 hours. Until then, run them as `formal/README.md` states
+      under "When to run TLC".
 - [ ] Validate traces of the implementation against the model, as peace
       does.

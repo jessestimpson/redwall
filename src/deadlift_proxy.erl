@@ -148,12 +148,15 @@
 }.
 
 %% A transaction. `reads' are the keys that the transaction read at
-%% `read_version'. `writes' are the keys and the values that the
-%% transaction writes. The default of `read_version' is 0, and the default
-%% of the lists is `[]'.
+%% `read_version'. `read_ranges' are the key ranges that the transaction
+%% read at `read_version': the range `{Begin, End}' has every key `K' with
+%% `Begin =< K' and `K < End'. `writes' are the keys and the values that
+%% the transaction writes. The default of `read_version' is 0, and the
+%% default of the lists is `[]'.
 -type transaction() :: #{
     read_version => version(),
     reads => [term()],
+    read_ranges => [deadlift_resolver:key_range()],
     writes => [{term(), term()}]
 }.
 
@@ -393,6 +396,7 @@ split(Transaction) when is_map(Transaction) ->
     Resolved = #{
         read_version => maps:get(read_version, Transaction, 0),
         reads => maps:get(reads, Transaction, []),
+        read_ranges => maps:get(read_ranges, Transaction, []),
         writes => [Key || {Key, _Value} <- Writes]
     },
     {Resolved, Writes};

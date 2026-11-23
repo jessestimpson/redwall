@@ -11,17 +11,44 @@
 %%
 %% == Algorithm 1 ==
 %%
-%% The Resolver keeps `lastCommit': for each key, the commit version of the
-%% last transaction that wrote the key. For a transaction with the read
-%% version `Rv', the read keys `R', the write keys `W' and the commit
-%% version `Cv':
+%% The Resolver keeps `lastCommit': for each key range, the commit version
+%% of the last transaction that wrote the range. For a transaction with the
+%% read version `Rv', the read ranges `R', the write ranges `W' and the
+%% commit version `Cv':
 %%
 %% <ol>
-%% <li>If `lastCommit[K] > Rv' for a key `K' in `R', the transaction has a
-%%   conflict and is not committed.</li>
+%% <li>If `lastCommit[K] > Rv' for a key `K' in a range of `R', the
+%%   transaction has a conflict and is not committed.</li>
 %% <li>Otherwise the transaction is committed, and `lastCommit[K]' becomes
-%%   `Cv' for each key `K' in `W'.</li>
+%%   `Cv' for each key `K' in a range of `W'.</li>
 %% </ol>
+%%
+%% == Key ranges ==
+%%
+%% A key is an Erlang term. The order of the keys is the order of Erlang
+%% terms. A transaction has two kinds of read entry and two kinds of write
+%% entry:
+%%
+%% <ul>
+%% <li>`reads' and `writes' are lists of keys.</li>
+%% <li>`read_ranges' and `write_ranges' are lists of `{Begin, End}'. A
+%%   range has every key `K' with `Begin =< K' and `K < End'. A range
+%%   with `Begin >= End' has no key.</li>
+%% </ul>
+%%
+%% A read range has the keys that are absent from the database. A
+%% transaction that reads a range and finds no value for a key therefore
+%% gets a conflict when another transaction writes that key.
+%%
+%% `lastCommit' is an ordered set of bounds. Each bound has the commit
+%% version that holds from the bound to the next bound. The version below
+%% the first bound is 0. A bound is `{Key, 0}' for the position of `Key',
+%% or `{Key, 1}' for the position directly after `Key'. The key `K' is the
+%% interval from `{K, 0}' to `{K, 1}'. The range `{Begin, End}' is the
+%% interval from `{Begin, 0}' to `{End, 0}'. FoundationDB keeps the same
+%% information in a skip list (`fdbserver/SkipList.cpp'). FoundationDB has
+%% byte strings as keys, and the key `K' is the range from `K' to `K'
+%% followed by a zero byte.
 %%
 %% == MVCC window ==
 %%
@@ -58,8 +85,10 @@
 %% == Departures from the paper ==
 %%
 %% <ul>
-%% <li>The Resolver checks keys. The Resolver of the paper checks key
-%%   ranges.</li>
+%% <li>A key is an Erlang term. A key of FoundationDB is a byte
+%%   string.</li>
+%% <li>The Proxy sends no write range. deadlift has no operation that
+%%   clears a range.</li>
 %% <li>A request has one transaction. A request of FoundationDB has a batch
 %%   of transactions with one commit version.</li>
 %% <li>One Resolver handles every key. FoundationDB divides the key space
@@ -75,32 +104,44 @@
 -export([new/1, check/3]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
--export_type([options/0, transaction/0, result/0, history/0]).
+-export_type([options/0, transaction/0, key_range/0, result/0, history/0]).
 
 -type epoch() :: deadlift_cstate:epoch().
 -type version() :: deadlift_cstate:version().
 
 %% `version' is the last version of the previous epoch: the previous
 %% version of the first request. `mvcc_window' is a number of versions, or
-%% `infinity'. `check => false' plants a defect for the simulation: the
-%% Resolver admits every transaction.
+%% `infinity'. Two options plant a defect for the simulation. With
+%% `check => false' the Resolver admits every transaction. With
+%% `check_ranges => false' the Resolver does not check the read ranges of a
+%% transaction.
 -type options() :: #{
     epoch := epoch(),
     version := version(),
     mvcc_window => pos_integer() | infinity,
-    check => boolean()
+    check => boolean(),
+    check_ranges => boolean()
 }.
 
+-type key_range() :: {Begin :: term(), End :: term()}.
+
+%% The default of `read_ranges' and of `write_ranges' is `[]'.
 -type transaction() :: #{
     read_version := version(),
     reads := [term()],
-    writes := [term()]
+    writes := [term()],
+    read_ranges => [key_range()],
+    write_ranges => [key_range()]
 }.
+
+%% A position in the order of the keys: `{Key, 0}' is the position of
+%% `Key', and `{Key, 1}' is the position directly after `Key'.
+-type bound() :: {term(), 0 | 1}.
 
 -type result() :: committed | conflict | too_old.
 
 -opaque history() :: #{
-    last_commit := #{term() => version()},
+    last_commit := gb_trees:tree(bound(), version()),
     oldest := integer(),
     window := pos_integer() | infinity
 }.
@@ -111,6 +152,7 @@
     version :: version(),
     history :: history(),
     check :: boolean(),
+    check_ranges :: boolean(),
     %% PreviousVersion -> {Version, Transaction, Callers}: the requests that
     %% wait for the request with the previous version.
     waiting = #{} :: #{version() => {version(), transaction(), [gen_server:from()]}}
@@ -148,17 +190,19 @@ ref(Epoch) ->
 %% @doc A history without a transaction.
 -spec new(pos_integer() | infinity) -> history().
 new(Window) ->
-    #{last_commit => #{}, oldest => 0, window => Window}.
+    #{last_commit => gb_trees:empty(), oldest => 0, window => Window}.
 
 %% @doc Checks the transaction `Transaction' with the commit version
 %% `Version'. Returns the result and the history after the transaction.
 -spec check(transaction(), version(), history()) -> {result(), history()}.
-check(#{read_version := ReadVersion, reads := Reads, writes := Writes}, Version, History) ->
+check(Transaction = #{read_version := ReadVersion}, Version, History) ->
     #{last_commit := LastCommit0, oldest := Oldest0, window := Window} = History,
+    Reads = intervals(reads, read_ranges, Transaction),
+    Writes = intervals(writes, write_ranges, Transaction),
     NewOldest = new_oldest(Version, Window, Oldest0),
     LastCommit =
         case NewOldest > Oldest0 of
-            true -> maps:filter(fun(_Key, V) -> V >= NewOldest end, LastCommit0);
+            true -> prune(NewOldest, LastCommit0);
             false -> LastCommit0
         end,
     Result =
@@ -166,17 +210,79 @@ check(#{read_version := ReadVersion, reads := Reads, writes := Writes}, Version,
             true ->
                 too_old;
             false ->
-                case lists:any(fun(Key) -> maps:get(Key, LastCommit, 0) > ReadVersion end, Reads) of
+                case lists:any(fun({Begin, End}) -> max_version(Begin, End, LastCommit) > ReadVersion end, Reads) of
                     true -> conflict;
                     false -> committed
                 end
         end,
     LastCommit1 =
         case Result of
-            committed -> lists:foldl(fun(Key, Acc) -> Acc#{Key => Version} end, LastCommit, Writes);
+            committed -> lists:foldl(fun({Begin, End}, Acc) -> set_version(Begin, End, Version, Acc) end, LastCommit, Writes);
             _ -> LastCommit
         end,
     {Result, History#{last_commit := LastCommit1, oldest := NewOldest}}.
+
+%% The keys and the ranges of a transaction as intervals of bounds. A range
+%% without a key gives no interval.
+-spec intervals(reads | writes, read_ranges | write_ranges, transaction()) -> [{bound(), bound()}].
+intervals(Keys, Ranges, Transaction) ->
+    [{{Key, 0}, {Key, 1}} || Key <- maps:get(Keys, Transaction)] ++
+        [{{Begin, 0}, {End, 0}} || {Begin, End} <- maps:get(Ranges, Transaction, []), Begin < End].
+
+%% The commit version at the bound `Bound': the version of the last bound
+%% at or below `Bound', or 0.
+version_at(Bound, LastCommit) ->
+    case gb_trees:lookup(Bound, LastCommit) of
+        {value, Version} ->
+            Version;
+        none ->
+            case gb_trees:smaller(Bound, LastCommit) of
+                {_Below, Version} -> Version;
+                none -> 0
+            end
+    end.
+
+%% The highest commit version in the interval from `Begin' to `End'.
+max_version(Begin, End, LastCommit) ->
+    max_until(gb_trees:next(gb_trees:iterator_from(Begin, LastCommit)), End, version_at(Begin, LastCommit)).
+
+max_until({Bound, Version, Iterator}, End, Max) when Bound < End ->
+    max_until(gb_trees:next(Iterator), End, max(Max, Version));
+max_until(_NoBoundInTheInterval, _End, Max) ->
+    Max.
+
+%% Sets the commit version of the interval from `Begin' to `End'. The
+%% version from `End' on does not change.
+set_version(Begin, End, Version, LastCommit) ->
+    AtEnd = version_at(End, LastCommit),
+    Inside = bounds_in(gb_trees:next(gb_trees:iterator_from(Begin, LastCommit)), End),
+    LastCommit1 = lists:foldl(fun gb_trees:delete/2, LastCommit, Inside),
+    gb_trees:enter(End, AtEnd, gb_trees:enter(Begin, Version, LastCommit1)).
+
+bounds_in({Bound, _Version, Iterator}, End) when Bound < End ->
+    [Bound | bounds_in(gb_trees:next(Iterator), End)];
+bounds_in(_NoBoundInTheInterval, _End) ->
+    [].
+
+%% Removes the commit versions below `Oldest'. A removed version becomes
+%% 0. A bound with the version of the bound before it is removed.
+prune(Oldest, LastCommit) ->
+    {Kept, _Last} = lists:foldl(
+        fun({Bound, Version0}, {Acc, Before}) ->
+            Version =
+                case Version0 < Oldest of
+                    true -> 0;
+                    false -> Version0
+                end,
+            case Version =:= Before of
+                true -> {Acc, Before};
+                false -> {[{Bound, Version} | Acc], Version}
+            end
+        end,
+        {[], 0},
+        gb_trees:to_list(LastCommit)
+    ),
+    gb_trees:from_orddict(lists:reverse(Kept)).
 
 %% The oldest version only rises.
 new_oldest(_Version, infinity, Oldest) -> Oldest;
@@ -194,7 +300,8 @@ init(Options = #{epoch := Epoch, version := Version}) ->
                 epoch = Epoch,
                 version = Version,
                 history = new(maps:get(mvcc_window, Options, infinity)),
-                check = maps:get(check, Options, true)
+                check = maps:get(check, Options, true),
+                check_ranges = maps:get(check_ranges, Options, true)
             }};
         no ->
             {stop, {already_registered, Epoch}}
@@ -228,7 +335,13 @@ handle_call(stop, _From, State) ->
 handle_cast(_Message, State) ->
     {noreply, State}.
 
-resolve(Version, Transaction, State = #state{history = History, check = Check}) ->
+resolve(Version, Transaction0, State = #state{history = History, check = Check, check_ranges = CheckRanges}) ->
+    Transaction =
+        case CheckRanges of
+            true -> Transaction0;
+            %% The planted defect: the read ranges are not checked.
+            false -> Transaction0#{read_ranges => []}
+        end,
     {Result0, History1} = check(Transaction, Version, History),
     case Check of
         true ->
@@ -236,7 +349,7 @@ resolve(Version, Transaction, State = #state{history = History, check = Check}) 
         false ->
             %% The planted defect: every transaction is admitted, and its
             %% writes are recorded.
-            {_, History2} = check(Transaction#{reads := []}, Version, History),
+            {_, History2} = check(Transaction#{reads := [], read_ranges => []}, Version, History),
             {committed, State#state{version = Version, history = History2}}
     end.
 

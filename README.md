@@ -173,13 +173,21 @@ source.
 ### The Resolver
 
 The Resolver follows Algorithm 1 of the paper (section 2.4.2). It keeps,
-for each key, the commit version of the last transaction that wrote the
-key.
+for each key range, the commit version of the last transaction that wrote
+the range.
 
-- A transaction has a conflict if a key that it read has a commit version
-  above the read version of the transaction.
-- A transaction with read keys and a read version below the MVCC window
-  is too old.
+- A transaction has read keys and read ranges. The read range
+  `{Begin, End}` has every key `K` with `Begin =< K` and `K < End`, in the
+  order of Erlang terms.
+- A transaction has a conflict if a key that it read, alone or in a read
+  range, has a commit version above the read version of the transaction.
+- A read range has the keys without a value. A transaction that reads a
+  range gets a conflict when another transaction writes a new key in the
+  range.
+- A transaction with read keys or read ranges and a read version below
+  the MVCC window is too old.
+- `deadlift_storage:read_range/4` reads the keys of a range at a read
+  version.
 - The Resolver handles the commit versions in their order. A request that
   arrives before the request with the previous version waits.
 
@@ -189,8 +197,8 @@ A Proxy commits a transaction in five steps (paper, sections 2.4.1 and
 2.4.3):
 
 1. The Proxy asks the Sequencer for an LSN and the previous LSN.
-2. The Proxy sends the read version, the read keys and the write keys to
-   the Resolver. If the Resolver rejects the transaction, the Proxy
+2. The Proxy sends the read version, the read keys, the read ranges and
+   the write keys to the Resolver. If the Resolver rejects the transaction, the Proxy
    answers the client with an error.
 3. The Proxy sends the record to every LogServer of the epoch. The k
    LogServers that replicate the record receive the body.
@@ -309,7 +317,12 @@ through the registry. They send a request only to a LogServer that runs.
 - The StorageServer reads the log systems from the coordinated state. A
   StorageServer of FoundationDB receives them from the ClusterController.
   This part is not in the paper.
-- The Resolver checks keys. The Resolver of the paper checks key ranges.
+- A key is an Erlang term, and the order of the keys is the order of
+  Erlang terms. A key of FoundationDB is a byte string.
+- A transaction writes keys only. FoundationDB also has an operation that
+  clears a key range, and the Resolver of FoundationDB records the range
+  as a write range. The Resolver of deadlift accepts write ranges, and no
+  other part of deadlift sends one.
 - One Resolver handles every key. FoundationDB divides the key space over
   several Resolvers.
 - A registry on each node finds the process of a LogServer. In
@@ -381,16 +394,17 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 12,085 acknowledged transactions, 7,896 rejected for a conflict, 1,806 too old, 21,618 transactions with reads from the StorageServer, 2,227 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 3,265 acknowledged transactions, 3,193 rejected for a conflict, 3,343 too old, 21,539 transactions with reads from the StorageServer, 627 rollbacks of the StorageServer, 6,156 recoveries, 2,969 kills, 694 partitions |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
+| No kills, no partitions, no lost or delayed messages | 200 seeds, 150 operations each | No violation. 11,572 acknowledged transactions, of which 2,747 with a read range, 8,398 rejected for a conflict, 1,887 too old, 22,141 transactions with reads from the StorageServer, of which 6,532 with a read of a range, 2,209 recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds, 150 operations each | No violation. 2,940 acknowledged transactions, of which 541 with a read range, 3,382 rejected for a conflict, 3,441 too old, 22,101 transactions with reads from the StorageServer, of which 6,538 with a read of a range, 657 rollbacks of the StorageServer, 6,182 recoveries, 2,944 kills, 725 partitions |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 4, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
-| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 2, `durable` |
+| Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 1, `no_conflict` between a transaction of epoch 8 and a write of epoch 7 |
+| Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 2, `no_conflict` |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` between a transaction of epoch 12 and a write of epoch 11 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 26, `read_version_order`: a Proxy of epoch 1 gave a read version below a commit of epoch 2 |
-| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 1, `storage_rollback` |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 7, `read_version_order`: a Proxy of epoch 13 gave a read version below a commit of epoch 14 |
+| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 2, `storage_rollback` |
 
 The suite takes about 10 minutes. A run has about 5,000 steps. Before the
 StorageServer, a run had about 2,750 steps and the suite took about 4.5
@@ -457,6 +471,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   a write that a recovery discards.
 - After a LogServer is stopped, the StorageServer reads the coordinated
   state every 500 ms until the coordinated state has a later epoch.
+- A read of a key range examines every key of the StorageServer.
+- deadlift has no operation that clears a key range.
 - A read does not check the range of the MVCC window. The StorageServer
   answers a read at any version at or below its version.
 - The simulation has one StorageServer and does not kill it.
@@ -488,7 +504,11 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - The model of the recovery and the model of the Resolver are separate.
   No model has both.
 - The models have no keys and values in the StorageServer, no tags, no
-  clock and no election of a ClusterController.
+  clock and no election of a ClusterController. The model of the Resolver
+  has a key range as a set of keys, without the bounds.
+- The Recovery configs with 3 epochs take about 4 hours. They are not run
+  for every change. See "When to run TLC" in
+  [formal/README.md](formal/README.md).
 - The models are checked with 3 LogServers, a replication degree of 2, at
   most 3 epochs and 7 versions, and for the Resolver 2 keys and 3
   transactions.

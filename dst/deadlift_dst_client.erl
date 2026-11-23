@@ -39,7 +39,7 @@ recover(Tab, N, CState, Mode) ->
     end,
     %% The Resolver of the epoch runs on a node of its own.
     RecruitResolver = fun(Resolver) ->
-        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check}) of
+        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check}) of
             {ok, Pid} ->
                 ok = eta_net:place(resolver_node(N), [Pid]),
                 true = ets:insert(Tab, {{node, resolver_node(N)}, true}),
@@ -94,6 +94,12 @@ recover(Tab, N, CState, Mode) ->
 %% writes. The transaction writes at least one key, and the value of each
 %% key is `{client, C}'.
 %%
+%% 2 transactions in 7 also read one key range. The range starts at one of
+%% the 4 keys and ends at a later key, or after the last key. The client
+%% reads the range from the StorageServer, and sends the range to the Proxy
+%% as a read range. The client records the keys of the range as read keys,
+%% with `not_found' for a key that the StorageServer did not return.
+%%
 %% The client records every read version that it receives, also when the
 %% commit fails. With the read version, the client reads its read keys from
 %% the StorageServer, and records the values.
@@ -116,15 +122,20 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             [] -> [lists:nth(R rem length(Keys) + 1, Keys)];
             _ -> Writes0
         end,
+    Ranges =
+        case R rem 7 < 2 of
+            true -> [range(R div 7)];
+            false -> []
+        end,
     Start = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
     case deadlift_proxy:read_version(Reader) of
         {ok, ReadVersion} ->
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
             true = ets:insert(Tab, {{read, C}, Read}),
-            case read_keys(Tab, Reads, ReadVersion) of
+            case read_keys(Tab, Reads, Ranges, ReadVersion) of
                 {ok, Values} ->
-                    true = ets:insert(Tab, {{read, C}, Read#{values => Values}}),
-                    commit(Tab, C, Read, Reads, Writes, Chosen, R);
+                    true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges}}),
+                    commit(Tab, C, Read, {Reads, Ranges}, Writes, Chosen, R);
                 {error, _Reason} ->
                     true = ets:insert(Tab, {{no_read, C}, ReaderEpoch})
             end;
@@ -134,20 +145,54 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
 
 %% Reads the keys from the StorageServer at the read version. The result
 %% has `{Key, not_found}' or `{Key, {Value, Written}}' for each key.
-read_keys(Tab, Keys, ReadVersion) ->
+read_keys(Tab, Keys, Ranges, ReadVersion) ->
     [{storage, Storage}] = ets:lookup(Tab, storage),
-    read_keys(Storage, Keys, ReadVersion, []).
+    case read_each(Storage, Keys, ReadVersion, []) of
+        {ok, Values} -> read_ranges(Storage, Ranges, ReadVersion, Values);
+        Error -> Error
+    end.
 
-read_keys(_Storage, [], _ReadVersion, Values) ->
+%% Reads the ranges from the StorageServer. Adds a result for each key of
+%% the workload in each range to `Values'.
+read_ranges(_Storage, [], _ReadVersion, Values) ->
+    {ok, Values};
+read_ranges(Storage, [Range = {Begin, End} | Ranges], ReadVersion, Values) ->
+    case deadlift_storage:read_range_with_version(Storage, Begin, End, ReadVersion, 2000) of
+        {ok, Found} ->
+            InRange = [
+                case lists:keyfind(Key, 1, Found) of
+                    {Key, Value, Written} -> {Key, {Value, Written}};
+                    false -> {Key, not_found}
+                end
+             || Key <- keys_in(Range)
+            ],
+            %% The StorageServer returns no key outside the range.
+            [] = [Key || {Key, _Value, _Written} <- Found, not lists:member(Key, keys_in(Range))],
+            read_ranges(Storage, Ranges, ReadVersion, Values ++ InRange);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% The keys of the workload in a range.
+keys_in({Begin, End}) ->
+    [Key || Key <- keys(), Key >= Begin, Key < End].
+
+%% One of the 10 ranges whose bounds are the 4 keys and `k5'.
+range(R) ->
+    Bounds = keys() ++ [k5],
+    Pairs = [{Begin, End} || Begin <- Bounds, End <- Bounds, Begin < End],
+    lists:nth(R rem length(Pairs) + 1, Pairs).
+
+read_each(_Storage, [], _ReadVersion, Values) ->
     {ok, lists:reverse(Values)};
-read_keys(Storage, [Key | Keys], ReadVersion, Values) ->
+read_each(Storage, [Key | Keys], ReadVersion, Values) ->
     case deadlift_storage:read_with_version(Storage, Key, ReadVersion, 2000) of
-        {ok, Value, Written} -> read_keys(Storage, Keys, ReadVersion, [{Key, {Value, Written}} | Values]);
-        not_found -> read_keys(Storage, Keys, ReadVersion, [{Key, not_found} | Values]);
+        {ok, Value, Written} -> read_each(Storage, Keys, ReadVersion, [{Key, {Value, Written}} | Values]);
+        not_found -> read_each(Storage, Keys, ReadVersion, [{Key, not_found} | Values]);
         {error, Reason} -> {error, Reason}
     end.
 
-commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, Reads, Writes, Chosen, R) ->
+commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, {Reads, Ranges}, Writes, Chosen, R) ->
     {Proxy, Epoch} =
         case R rem 3 of
             0 ->
@@ -160,6 +205,7 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
     Transaction = #{
         read_version => ReadVersion,
         reads => Reads,
+        read_ranges => Ranges,
         writes => [{Key, {client, C}} || Key <- Writes]
     },
     case deadlift_proxy:commit(Proxy, Transaction) of
@@ -168,8 +214,10 @@ commit(Tab, C, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start
             true = ets:insert(Tab, {{txn, C}, #{
                 read_version => ReadVersion,
                 reader_epoch => ReaderEpoch,
-                reads => Reads,
+                %% The read keys and the keys of the read ranges.
+                reads => lists:usort(Reads ++ lists:append([keys_in(Range) || Range <- Ranges])),
                 writes => Writes,
+                ranges => Ranges,
                 start => Start,
                 'end' => End
             }}),

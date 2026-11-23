@@ -82,6 +82,13 @@ reads(Ids) ->
     ?assertEqual({ok, 2, 3}, deadlift_storage:read_with_version(Storage, x, ReadVersion, 5000)),
     ?assertEqual({ok, 1}, deadlift_storage:read(Storage, y, ReadVersion)),
     ?assertEqual(not_found, deadlift_storage:read(Storage, z, ReadVersion)),
+    %% Reads of ranges. The range has its first key and does not have its
+    %% last key.
+    ?assertEqual({ok, [{x, 2}, {y, 1}]}, deadlift_storage:read_range(Storage, a, z, ReadVersion)),
+    ?assertEqual({ok, [{x, 2, 3}]}, deadlift_storage:read_range_with_version(Storage, x, y, ReadVersion, 5000)),
+    ?assertEqual({ok, [{x, 1}, {y, 1}]}, deadlift_storage:read_range(Storage, x, z, 2)),
+    ?assertEqual({ok, []}, deadlift_storage:read_range(Storage, a, x, ReadVersion)),
+    ?assertEqual({ok, []}, deadlift_storage:read_range(Storage, a, z, 1)),
     %% Reads at earlier versions.
     ?assertEqual({ok, 1}, deadlift_storage:read(Storage, x, 2)),
     ?assertEqual(not_found, deadlift_storage:read(Storage, x, 1)),

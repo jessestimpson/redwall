@@ -104,6 +104,7 @@
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1]).
+-export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([options/0]).
@@ -148,7 +149,7 @@
     %% stopped.
     stopped = [] :: [deadlift_log:id()],
     %% The reads that wait for a version.
-    waiting = [] :: [{gen_server:from(), term(), version()}],
+    waiting = [] :: [{gen_server:from(), {key, term()} | {range, term(), term()}, version()}],
     %% The number of rollbacks.
     rollbacks = 0 :: non_neg_integer(),
     %% The number of intervals of `poll_ms' since the start.
@@ -206,6 +207,35 @@ read_with_version(Storage, Key, Version, Timeout) ->
         exit:Reason -> {error, Reason}
     end.
 
+%% @equiv read_range(Storage, Begin, End, Version, 5000)
+-spec read_range(gen_server:server_ref(), term(), term(), version()) -> {ok, [{term(), term()}]} | {error, term()}.
+read_range(Storage, Begin, End, Version) ->
+    read_range(Storage, Begin, End, Version, ?TIMEOUT_MS).
+
+%% @doc Reads the keys of the range `{Begin, End}' at the read version
+%% `Version'. The range has every key `K' with `Begin =< K' and `K < End'.
+%% The result has each key that a record at or below `Version' wrote, with
+%% its value, in the order of the keys. The errors are the errors of
+%% `read/4'.
+-spec read_range(gen_server:server_ref(), term(), term(), version(), timeout()) ->
+    {ok, [{term(), term()}]} | {error, term()}.
+read_range(Storage, Begin, End, Version, Timeout) ->
+    case read_range_with_version(Storage, Begin, End, Version, Timeout) of
+        {ok, Found} -> {ok, [{Key, Value} || {Key, Value, _Written} <- Found]};
+        Other -> Other
+    end.
+
+%% @doc Reads as `read_range/5' does. The result also has, for each key,
+%% the LSN of the record that wrote the value.
+-spec read_range_with_version(gen_server:server_ref(), term(), term(), version(), timeout()) ->
+    {ok, [{term(), term(), version()}]} | {error, term()}.
+read_range_with_version(Storage, Begin, End, Version, Timeout) ->
+    try
+        gen_server:call(Storage, {read_range, Begin, End, Version}, Timeout)
+    catch
+        exit:Reason -> {error, Reason}
+    end.
+
 -spec info(gen_server:server_ref()) ->
     #{version := version(), epoch := deadlift_cstate:epoch() | undefined, rollbacks := non_neg_integer()}.
 info(Storage) ->
@@ -229,10 +259,10 @@ init(Options = #{coordinators := Coordinators}) ->
     {ok, State}.
 
 %% @private
-handle_call({read, Key, Version}, _From, State = #state{version = Mine}) when Version =< Mine ->
-    {reply, lookup(Key, Version, State), State};
-handle_call({read, Key, Version}, From, State = #state{waiting = Waiting}) ->
-    {noreply, State#state{waiting = [{From, Key, Version} | Waiting]}};
+handle_call({read, Key, Version}, From, State) ->
+    read_at({key, Key}, Version, From, State);
+handle_call({read_range, Begin, End, Version}, From, State) ->
+    read_at({range, Begin, End}, Version, From, State);
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
     Epoch =
         case System of
@@ -431,12 +461,27 @@ write(_NoTransaction, _LSN, Data) ->
 %% Reads
 %% ---------------------------------------------------------------------------
 
+%% Answers a read at `Version', or keeps the read until the StorageServer
+%% has the version.
+read_at(Query, Version, _From, State = #state{version = Mine}) when Version =< Mine ->
+    {reply, lookup(Query, Version, State), State};
+read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
+    {noreply, State#state{waiting = [{From, Query, Version} | Waiting]}}.
+
 answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
-    {Ready, Later} = lists:partition(fun({_From, _Key, V}) -> V =< Version end, Waiting),
-    lists:foreach(fun({From, Key, V}) -> gen_server:reply(From, lookup(Key, V, State)) end, Ready),
+    {Ready, Later} = lists:partition(fun({_From, _Query, V}) -> V =< Version end, Waiting),
+    lists:foreach(fun({From, Query, V}) -> gen_server:reply(From, lookup(Query, V, State)) end, Ready),
     State#state{waiting = Later}.
 
-lookup(Key, Version, #state{data = Data}) ->
+%% The StorageServer examines every key for a range. See "Limitations" in
+%% README.md.
+lookup({key, Key}, Version, State) ->
+    lookup_key(Key, Version, State);
+lookup({range, Begin, End}, Version, State = #state{data = Data}) ->
+    Keys = lists:sort([Key || Key <- maps:keys(Data), Key >= Begin, Key < End]),
+    {ok, [{Key, Value, Written} || Key <- Keys, {ok, Value, Written} <- [lookup_key(Key, Version, State)]]}.
+
+lookup_key(Key, Version, #state{data = Data}) ->
     case [W || W = {Written, _Value} <- maps:get(Key, Data, []), Written =< Version] of
         [{Written, Value} | _] -> {ok, Value, Written};
         [] -> not_found

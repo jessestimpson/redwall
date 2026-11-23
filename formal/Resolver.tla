@@ -25,7 +25,9 @@
 (* The model does not contain:                                             *)
 (*   - LogServers, the recovery and the StorageServer. Recovery.tla models *)
 (*     them. This model assumes that a recovery keeps every record.        *)
-(*   - key ranges. The Resolver of deadlift checks keys.                   *)
+(*   - the bounds of a key range. A read range and a write range of        *)
+(*     deadlift are sets of keys in this model. The model does not have    *)
+(*     the ordered set of bounds that the Resolver of deadlift keeps.      *)
 (*   - more than one Resolver in an epoch.                                 *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs a set of model configs. See README.md for each config.
-#   usage: check_all.sh [quick|long|all]
+#   usage: check_all.sh [resolver|recovery|quick|long|all]
+# README.md states which set a change needs.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,9 +21,19 @@ run() { # expectation configs...
   done
 }
 
+# The configs whose name starts with the model name.
+only() { # model configs...
+  local model="$1"; shift
+  for cfg in "$@"; do
+    case "$cfg" in "$model"*) echo "$cfg" ;; esac
+  done
+}
+
 case "${1:-quick}" in
   quick) run pass $QUICK_PASS; run fail $QUICK_FAIL $QUICK_REACH ;;
+  resolver) run pass $(only Resolver $QUICK_PASS); run fail $(only Resolver $QUICK_FAIL $QUICK_REACH) ;;
+  recovery) run pass $(only Recovery $QUICK_PASS); run fail $(only Recovery $QUICK_FAIL $QUICK_REACH) ;;
   long) run pass $LONG_PASS ;;
   all) run pass $QUICK_PASS $LONG_PASS; run fail $QUICK_FAIL $QUICK_REACH ;;
-  *) echo "usage: check_all.sh [quick|long|all]" >&2; exit 2 ;;
+  *) echo "usage: check_all.sh [resolver|recovery|quick|long|all]" >&2; exit 2 ;;
 esac

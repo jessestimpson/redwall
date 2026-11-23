@@ -159,9 +159,17 @@ transactions(Ids) ->
     ),
     %% The rejected transaction has the LSN 4. The next commit follows it.
     {ok, 5} = deadlift_proxy:commit(Proxy, #{read_version => 3, reads => [x, y], writes => [{y, 4}]}),
-    ?assertEqual(#{epoch => 1, kcv => 5, waiting => 0}, deadlift_proxy:info(Proxy)),
-    [?assertMatch(#{dv := 5}, info(L)) || L <- Logs],
-    %% The record 4 has no transaction. Each body is on 2 LogServers.
+    %% A read range. The write of `y' at the LSN 5 is above the read
+    %% version 4.
+    ?assertEqual(
+        {error, not_committed},
+        deadlift_proxy:commit(Proxy, #{read_version => 4, read_ranges => [{a, z}], writes => [{w, 5}]})
+    ),
+    {ok, 7} = deadlift_proxy:commit(Proxy, #{read_version => 5, read_ranges => [{a, z}], writes => [{w, 5}]}),
+    ?assertEqual(#{epoch => 1, kcv => 7, waiting => 0}, deadlift_proxy:info(Proxy)),
+    [?assertMatch(#{dv := 7}, info(L)) || L <- Logs],
+    %% The records 4 and 6 have no transaction. Each body is on 2
+    %% LogServers.
     All = lists:sort(lists:append([bodies(L) || L <- Logs])),
     ?assertEqual(
         [
@@ -174,7 +182,11 @@ transactions(Ids) ->
             {4, no_transaction},
             {4, no_transaction},
             {5, [{y, 4}]},
-            {5, [{y, 4}]}
+            {5, [{y, 4}]},
+            {6, no_transaction},
+            {6, no_transaction},
+            {7, [{w, 5}]},
+            {7, [{w, 5}]}
         ],
         All
     ).

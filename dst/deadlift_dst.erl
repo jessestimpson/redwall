@@ -37,7 +37,7 @@
 %%   runs. The client uses the Proxy of the highest epoch in 3 of 4
 %%   cases, and any Proxy that runs in the others. A Proxy can belong to an
 %%   epoch that has ended. The transaction reads and writes some of 4
-%%   keys.</li>
+%%   keys. 2 transactions in 7 also read a key range.</li>
 %% <li>`{kill_log, R}': kill one LogServer of the current epoch. The
 %%   harness kills at most 1 LogServer of each epoch, because the design
 %%   tolerates the loss of k - 1 LogServers of an epoch, and a LogServer of
@@ -75,7 +75,8 @@
 %% <li>`copied' - when a recovery ends an epoch, every LogServer of the new
 %%   epoch that runs has the body of every acknowledged record of the
 %%   ended epoch above the previous epoch's end version.</li>
-%% <li>`no_conflict' - no acknowledged transaction read a key that another
+%% <li>`no_conflict' - no acknowledged transaction read a key, alone or in
+%%   a key range, that another
 %%   acknowledged transaction wrote at a commit version above the read
 %%   version of the first transaction and below its commit version. This is
 %%   the guarantee of the Resolver.</li>
@@ -113,6 +114,8 @@
 %%   whose epoch is not the recovery count. See `RecoveryNoCas'.</li>
 %% <li>`no_copy' - a recovery copies no record to the new LogServers.</li>
 %% <li>`no_check' - the Resolver admits every transaction.</li>
+%% <li>`no_range_check' - the Resolver does not check the read ranges of a
+%%   transaction.</li>
 %% <li>`no_gap' - the first commit version of an epoch is the Recovery
 %%   Version plus 1. The Resolver of the new epoch then admits a
 %%   transaction with a read version of the previous epoch.</li>
@@ -376,6 +379,9 @@ record_stats(Tab) ->
     bump(no_read_version, length(ets:match(Tab, {{no_read_version, '_'}, '_'}))),
     bump(no_read, length(ets:match(Tab, {{no_read, '_'}, '_'}))),
     bump(reads, length([x || [#{values := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
+    bump(range_reads, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
+    %% The acknowledged transactions with a read range.
+    bump(range_acks, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{txn, '_'}, '$1'})])),
     bump(recoveries, length(Epochs)),
     bump(recoveries_failed, length(ets:match(Tab, {{recovery_failed, '_'}, '_'}))),
     %% The number of failed recoveries for each kind of reason.

@@ -90,6 +90,10 @@ faults_test_() ->
         %% Clients read values, and the StorageServer removed writes that a
         %% recovery discarded.
         ?assert(maps:get(reads, Stats, 0) > 5000, Stats),
+        %% Clients read key ranges, and transactions with a read range were
+        %% acknowledged.
+        ?assert(maps:get(range_reads, Stats, 0) > 2000, Stats),
+        ?assert(maps:get(range_acks, Stats, 0) > 300, Stats),
         ?assert(maps:get(rollbacks, Stats, 0) > 10, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 100, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
@@ -137,6 +141,15 @@ no_check_is_found_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_check}) end),
         ?debugFmt("no_check: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := no_conflict}, Violation)
+    end}.
+
+%% A planted defect: the Resolver does not check the read ranges of a
+%% transaction. The reader of the violation read the key in a range.
+no_range_check_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_range_check}) end),
+        ?debugFmt("no_range_check: seed ~p, ~p", [Seed, Violation]),
         ?assertMatch(#{property := no_conflict}, Violation)
     end}.
 
