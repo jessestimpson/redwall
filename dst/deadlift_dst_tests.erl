@@ -27,7 +27,7 @@ opts(Seed, Config) ->
         %% When no process is runnable, the run lets time pass more often
         %% than not, so that delayed messages arrive and time-outs fire.
         quiet_p => 0.8,
-        preload => [deadlift],
+        preload => [deadlift, peace],
         net => #{policy => #{drop_p => 0.001, delay_p => 0.2, max_delay => 5}}
     }.
 
@@ -268,6 +268,113 @@ no_step_down_is_found_test_() ->
     end}.
 
 %% The seeds of the shard `Shard', with `Size' seeds in each shard.
+%% ---------------------------------------------------------------------------
+%% Runs with a peace cluster as the coordinated state
+%% ---------------------------------------------------------------------------
+
+%% The options of a run with a peace cluster of 3 servers as the
+%% coordinated state. The servers of peace send heartbeats, so a run has
+%% more steps for each unit of the virtual clock. A step therefore injects
+%% an operation with a lower probability, so that the 80 operations have
+%% about as much time of the virtual clock as in the other runs.
+peace(Opts = #{config := Config}) ->
+    Opts#{config := Config#{cstate => peace}, op_p => 0.004, max_steps => 400000}.
+
+%% Runs without faults. 50 seeds.
+peace_calm_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(lists:seq(1, 50), fun(Seed) -> peace(calm(Seed)) end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("peace calm: ~p", [Stats]),
+        ok = write_stats({peace_calm, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 500, Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 100, Stats)
+    end}.
+
+%% Runs with the kills and the partitions of the other runs with faults,
+%% and with the kill of one server of the peace cluster. 200 seeds in 2
+%% shards.
+peace_faults_1_test_() -> peace_faults_shard(1).
+peace_faults_2_test_() -> peace_faults_shard(2).
+
+peace_faults_shard(Shard) ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(shard_seeds(Shard, 100), fun(Seed) -> peace(opts(Seed, #{})) end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("peace faults ~p: ~p", [Shard, Stats]),
+        ok = write_stats({peace_faults, Shard}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 200, Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 300, Stats),
+        ?assert(maps:get(kills_coordinator, Stats, 0) > 8, Stats),
+        ?assert(maps:get(partitions, Stats, 0) > 25, Stats)
+    end}.
+
+%% Runs with ClusterControllers, with kills of worker nodes and of one
+%% server of the peace cluster, and with partitions. 100 seeds.
+peace_controller_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(lists:seq(1, 100), fun(Seed) -> peace((opts(Seed, #{controller => true, last_op => 80}))#{settle_steps => 20000}) end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("peace controller faults: ~p", [Stats]),
+        ok = write_stats({peace_controller_faults, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 150, Stats),
+        ?assert(maps:get(leaders, Stats, 0) > 100, Stats),
+        ?assert(maps:get(kills_coordinator, Stats, 0) > 10, Stats)
+    end}.
+
+%% Runs with ClusterControllers and with cuts between the nodes of the
+%% ClusterControllers only. 100 seeds.
+peace_controller_partitions_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        sweep(lists:seq(1, 100), fun(Seed) -> peace(controller_partitions(Seed, correct)) end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("peace controller partitions: ~p", [Stats]),
+        ok = write_stats({peace_controller_partitions, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 150, Stats),
+        ?assert(maps:get(leaders, Stats, 0) > 100, Stats)
+    end}.
+
+%% The same seed gives the same trace, the audit of eta reports nothing,
+%% and the trace replays, for the runs with a peace cluster.
+peace_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Kinds = [
+            fun(Seed) -> peace(opts(Seed, #{})) end,
+            fun(Seed) -> peace((opts(Seed, #{controller => true, last_op => 80}))#{settle_steps => 20000}) end
+        ],
+        lists:foreach(
+            fun({Kind, Seed}) ->
+                Opts = Kind(Seed),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                Replayed = eta_run:replay(deadlift_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [{Kind, Seed} || Kind <- Kinds, Seed <- lists:seq(1, 6)]
+        )
+    end}.
+
+%% The planted defect `no_cas' in the machine of the peace cluster.
+peace_no_cas_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> peace(opts(Seed, #{mode => no_cas})) end),
+        ?debugFmt("peace no_cas: seed ~p, ~p", [Seed, Violation]),
+        ?assert(lists:member(maps:get(property, Violation), [durable, unique_versions, read_version_order, kcv_below_dv]), Violation)
+    end}.
+
+%% The planted defect `no_elect_cas' in the machine of the peace cluster.
+peace_no_elect_cas_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> peace(controller_partitions(Seed, no_elect_cas)) end),
+        ?debugFmt("peace no_elect_cas: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := one_leader}, Violation)
+    end}.
+
 shard_seeds(Shard, Size) ->
     lists:seq((Shard - 1) * Size + 1, Shard * Size).
 

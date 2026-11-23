@@ -41,7 +41,9 @@ before the commit path is complete.
       `NoLoss` and `UniqueVersions`.
 - [x] Run the simulation with the network of eta: lost and delayed
       messages, and nodes that are cut off.
-- [ ] Run the coordinated state on a peace cluster in the simulation.
+- [x] Run the coordinated state on a peace cluster in the simulation.
+- [ ] Give the servers of the peace cluster a disk in the simulation,
+      start a killed server again, and replace a member.
 - [ ] Add each new part to the simulation in the step that adds the
       part.
 

@@ -5,8 +5,8 @@
 %% == Simulated system ==
 %%
 %% <ul>
-%% <li>The coordinated state is one `deadlift_cstate_local' process. The
-%%   run has no peace cluster. The process applies one value at a time,
+%% <li>The coordinated state is one `deadlift_cstate_local' process, or a
+%%   peace cluster (see "Runs with a peace cluster"). The process applies one value at a time,
 %%   which is the register with atomic operations of
 %%   `formal/Recovery.tla'.</li>
 %% <li>The process of an epoch, a recovery and a StorageServer read the
@@ -27,6 +27,33 @@
 %%   run can lose or delay a message between two nodes.</li>
 %% <li>A LogServer starts on its own node, through `erpc' from the node
 %%   of the process of the epoch.</li>
+%% </ul>
+%%
+%% == Runs with a peace cluster ==
+%%
+%% With the config `cstate => peace', the coordinated state is a peace
+%% cluster in the place of the `deadlift_cstate_local' process:
+%%
+%% <ul>
+%% <li>The cluster has 3 servers, each on a simulated node of its own,
+%%   with majority quorums, an election time limit of 50 ms and a
+%%   heartbeat of 10 ms. peace is compiled with the parse transform of
+%%   eta in the `dst' profile.</li>
+%% <li>The first `recover' operation starts the servers, and a process
+%%   that forms the cluster (`peace:form_cluster/3').</li>
+%% <li>The machine of the servers is `deadlift_dst_machine', which applies
+%%   the values with `deadlift_cstate' and records the state of the
+%%   highest index that a server has applied. The harness reads that
+%%   state for the invariants.</li>
+%% <li>`{kill_coordinator, R}' kills the node of one server, at most once
+%%   in a run and after the cluster has formed. A server keeps its data
+%%   in memory (`peace_storage_mem'), so a killed server does not start
+%%   again. The cluster then has 2 servers, which is a majority.</li>
+%% <li>`{partition, R1, R2}' can cut a node of a server off. A cut can
+%%   leave the cluster without a majority until the next `heal'.</li>
+%% <li>A call to the cluster can end without an answer after peace has
+%%   decided its value. The `deadlift_cstate_local' process has this case
+%%   only for a lost answer.</li>
 %% </ul>
 %%
 %% == Runs with ClusterControllers ==
@@ -246,8 +273,11 @@
 %% == Limitations ==
 %%
 %% <ul>
-%% <li>The coordinated state is one process that is never killed. The run
-%%   has no peace cluster.</li>
+%% <li>Without the config `cstate => peace', the coordinated state is one
+%%   process that is never killed.</li>
+%% <li>A killed server of the peace cluster does not start again, and at
+%%   most 1 of the 3 servers is killed. The cluster has no disk and no
+%%   change of its members in a run.</li>
 %% <li>A killed process does not start again. A LogServer has no disk.</li>
 %% <li>The application start and `deadlift:open/0' are not in the run. A
 %%   client names its Proxy and its StorageServers.</li>
@@ -291,11 +321,31 @@ init(Seed, Config) ->
     %% `preload => [deadlift]' does not load them.
     {module, _} = code:ensure_loaded(deadlift_dst_client),
     Tab = ets:new(deadlift_dst, [public, ordered_set]),
-    {ok, CState} = deadlift_cstate_local:start(#{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas}),
+    Cas = #{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas},
     %% The topology is declared before any process creates a monitor.
-    ok = eta_net:place(coordinators, [CState]),
+    CState =
+        case maps:get(cstate, Config, local) of
+            local ->
+                {ok, Local} = deadlift_cstate_local:start(Cas),
+                ok = eta_net:place(coordinators, [Local]),
+                true = ets:insert(Tab, {{node, coordinators}, true}),
+                {local, Local};
+            peace ->
+                %% A peace cluster of 3 servers, each on a node of its
+                %% own. The first `recover' operation starts the servers,
+                %% because a process on a simulated node starts only in a
+                %% step of the scheduler.
+                {module, _} = code:ensure_loaded(deadlift_dst_machine),
+                ok = deadlift_dst_machine:configure(Cas#{tab => Tab}),
+                Ids = deadlift_dst_client:coordinator_ids(),
+                Nodes = [Node || {_Name, Node} <- Ids],
+                [ok = eta_net:place(Node, []) || Node <- Nodes],
+                [true = eta_net:with_node(A, fun() -> eta_net:connect_node(B) end) || A <- Nodes, B <- Nodes, A < B],
+                true = ets:insert(Tab, [{{node, Node}, true} || Node <- Nodes]),
+                {peace, Tab, Ids}
+        end,
     ok = eta_net:place(clients, []),
-    true = ets:insert(Tab, [{{node, coordinators}, true}, {{node, clients}, true}]),
+    true = ets:insert(Tab, {{node, clients}, true}),
     %% 1, 2 or 3 StorageServers, each on a node of its own. The first
     %% `recover' operation starts them, because a process on a simulated
     %% node starts only in a step of the scheduler.
@@ -316,6 +366,7 @@ init(Seed, Config) ->
         partitions => maps:get(partitions, Config, true),
         %% The number of the last operation of the run, or `undefined'.
         last_op => maps:get(last_op, Config, undefined),
+        coordinators_started => false,
         %% Every process that an operation started, oldest first.
         ops => [],
         %% The number of operations that the run has executed.
@@ -326,8 +377,10 @@ init(Seed, Config) ->
 %% their start. The scheduler adopts the Sequencers, the
 %% Proxies, the LogServers and the StorageServers as children of the
 %% processes that start them.
-processes(#{cstate := CState, ops := Ops}) ->
-    [CState | [Pid || Pid <- Ops, is_process_alive(Pid)]].
+processes(#{cstate := {local, CState}, ops := Ops}) ->
+    [CState | [Pid || Pid <- Ops, is_process_alive(Pid)]];
+processes(#{ops := Ops}) ->
+    [Pid || Pid <- Ops, is_process_alive(Pid)].
 
 %% Starts the StorageServer of the place `Slot'. `N' is the number of the
 %% operation, and `Generation' is the number of StorageServers of the
@@ -342,7 +395,7 @@ processes(#{cstate := CState, ops := Ops}) ->
 start_storage(Tab, CState, {Mode, Window}, {Slot, N}, Generation) ->
     ok = deadlift_dst_client:join(Tab, Mode),
     {ok, Storage} = deadlift_storage:start(#{
-        coordinators => {local, CState},
+        coordinators => deadlift_dst_client:coordinators(CState),
         poll_ms => 100,
         mvcc_window => Window,
         rollback => Mode =/= no_rollback,
@@ -362,7 +415,7 @@ storages(Tab) ->
 %% The first operation of a run is a recovery, which creates epoch 1.
 generate(#{n := 0}, Rand) ->
     {recover, Rand};
-generate(#{faults := Faults}, Rand0) ->
+generate(#{faults := Faults, cstate := CState}, Rand0) ->
     {Roll, Rand1} = rand:uniform_s(Rand0),
     {R, Rand2} = rand:uniform_s(1000, Rand1),
     Op =
@@ -380,6 +433,9 @@ generate(#{faults := Faults}, Rand0) ->
             Roll < 0.975 -> {kill_resolver, R};
             Roll < 0.98 -> {kill_storage, R};
             Roll < 0.988 -> partition;
+            %% Only a run with a peace cluster has this operation, so the
+            %% operations of the other runs are the same as before.
+            Roll < 0.992, element(1, CState) =:= peace -> {kill_coordinator, R};
             true -> heal
         end,
     case Op of
@@ -433,6 +489,25 @@ replace_workers(Base, S = #{tab := Tab, cstate := CState, mode := Mode}) ->
         lists:enumerate(lists:sort(ets:match(Tab, {{worker_down, '$1'}, '$2'})))
     ).
 
+execute(recover, 1, S0 = #{cstate := {peace, Tab, Ids}, coordinators_started := false}) ->
+    %% The servers of the peace cluster, and a process that forms the
+    %% cluster.
+    S1 = lists:foldl(fun(Id = {_Name, Node}, Acc) -> spawn_op(Node, fun() -> deadlift_dst_client:coordinator(Id) end, Acc) end, S0, Ids),
+    S2 = spawn_op(clients, fun() -> deadlift_dst_client:form_cluster(Tab, Ids) end, S1),
+    execute(recover, 1, S2#{coordinators_started := true});
+execute({kill_coordinator, R}, _N, S = #{tab := Tab, cstate := {peace, Tab, Ids}}) ->
+    %% At most 1 of the 3 servers is killed in a run, because a server
+    %% keeps its data in memory and does not start again.
+    case ets:member(Tab, coordinator_killed) orelse not ets:member(Tab, cluster_formed) of
+        true ->
+            S;
+        false ->
+            {_Name, Node} = pick(R, Ids),
+            ok = eta_net:kill_node(Node),
+            true = ets:insert(Tab, {coordinator_killed, Node}),
+            bump(kills_coordinator),
+            S
+    end;
 execute(recover, N, S0 = #{tab := Tab, cstate := CState, mode := Mode, window := Window, controller := Controller}) ->
     %% The operation also starts a new StorageServer for each place whose
     %% StorageServer was killed without a new one.
@@ -756,7 +831,8 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
     %% LogServer after the harness has read the table of the run.
     ok = kill_all(Started ++ Ops),
     ok = kill_all([Pid || {_Id, Pid} <- log_pids(Tab)]),
-    ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})] ++ [CState]),
+    ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})] ++ [Pid || {local, Pid} <- [CState]]),
+    ok = deadlift_dst_machine:clear(),
     catch ets:delete(Tab),
     ok.
 
@@ -1264,10 +1340,17 @@ pick(R, List) -> lists:nth(R rem length(List) + 1, List).
 
 %% Reads the coordinated state that the process publishes. The read sends
 %% no message to the process.
-cstate(CState) ->
+cstate({local, CState}) ->
     case eta_observe:read(CState) of
         {State, _Cas} when is_map(State) -> State;
         _ -> #{}
+    end;
+%% The state with the highest index that a server of the peace cluster has
+%% applied. See `deadlift_dst_machine'.
+cstate({peace, Tab, _Ids}) ->
+    case ets:lookup(Tab, cstate) of
+        [{cstate, _Index, State}] -> State;
+        [] -> #{}
     end.
 
 current(CState) ->

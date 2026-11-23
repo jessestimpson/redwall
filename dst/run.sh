@@ -100,7 +100,8 @@ erl -noshell -eval '
             Atoms = lists:sort([{K, V} || {K, V} <- maps:to_list(Sum), is_atom(K)]),
             Maps =:= [] orelse io:format("~s, ~b shards: ~0p~n", [Kind, length(Maps), Atoms])
         end,
-        [calm, faults, controller_calm, controller_faults, controller_partitions]),
+        [calm, faults, controller_calm, controller_faults, controller_partitions,
+         peace_calm, peace_faults, peace_controller_faults, peace_controller_partitions]),
     halt().' -- "$logs"
 
 if [ "$result" -eq 0 ]; then

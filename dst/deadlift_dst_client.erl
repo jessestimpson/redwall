@@ -11,6 +11,7 @@
 -export([recover/4, transaction/5, join/2, start_log/3]).
 -export([worker/5, force_recovery/1, worker_node/1]).
 -export([sequencer_node/1, log_node/1, storage_node/1, keys/0]).
+-export([coordinators/1, coordinator_ids/0, coordinator_node/1, coordinator/1, form_cluster/2]).
 
 %% Starts the process of a new epoch and waits for the end of its
 %% recovery. This is the work of a ClusterController. The runs without the
@@ -39,7 +40,7 @@ recover(Tab, N, CState, Mode) ->
         end
     end,
     Options = (proxy_options(N, Mode))#{
-        coordinators => {local, CState},
+        coordinators => coordinators(CState),
         logs => 3,
         replication => 2,
         lock_timeout_ms => 200,
@@ -67,7 +68,7 @@ worker(Tab, CState, Mode, Class, Candidate) ->
     ok = join(Tab, Mode),
     Node = node(),
     Roles = fun(Role, Options) -> start_role(Tab, Node, Mode, Role, Options) end,
-    Options0 = #{coordinators => {local, CState}, class => Class, roles => Roles, poll_ms => 200, cstate_timeout_ms => 500},
+    Options0 = #{coordinators => coordinators(CState), class => Class, roles => Roles, poll_ms => 200, cstate_timeout_ms => 500},
     Options =
         case Candidate of
             true ->
@@ -419,6 +420,55 @@ mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found) ->
         )
     after
         ets:delete(Table)
+    end.
+
+%% The coordinators for the options of a process. `CState' is the
+%% coordinated state of the run: `{local, Pid}' for a
+%% `deadlift_cstate_local' process, or `{peace, Tab, Ids}' for a peace
+%% cluster with the servers `Ids'.
+coordinators({local, Pid}) -> {local, Pid};
+coordinators({peace, _Tab, Ids}) -> Ids.
+
+%% The servers of the peace cluster of a run, each on a node of its own.
+coordinator_ids() -> [{list_to_atom("deadlift_coordinator_" ++ integer_to_list(I)), coordinator_node(I)} || I <- [1, 2, 3]].
+
+coordinator_node(I) -> list_to_atom("coordinator_" ++ integer_to_list(I)).
+
+%% Starts the server `Id' of the peace cluster on the node of the caller,
+%% and waits. The server is linked to this process, so a kill of this
+%% process stops the server. The server keeps its data in memory, so a
+%% killed server is not started again.
+coordinator(Id) ->
+    Config = #{
+        id => Id,
+        machine => {module, deadlift_dst_machine, []},
+        storage => {peace_storage_mem, #{}},
+        election_timeout_ms => 50,
+        heartbeat_ms => 10
+    },
+    case peace_server:start_link(Config) of
+        {ok, _Pid} ->
+            receive
+                stop -> ok
+            end;
+        {error, _Reason} ->
+            ok
+    end.
+
+%% Forms the peace cluster. The servers start in other processes at the
+%% same time, and a message can be lost, so the function tries again
+%% until every server has the configuration. It then records the row
+%% `cluster_formed' in the table of the run. The harness kills no server
+%% of the cluster before that, because `peace:form_cluster/3' needs an
+%% answer from every server.
+form_cluster(Tab, Ids) ->
+    case peace:form_cluster(Ids, majority, 500) of
+        {ok, _Formed, []} ->
+            true = ets:insert(Tab, {cluster_formed, true}),
+            ok;
+        _NotRunningOrNotFormed ->
+            ok = timer:sleep(20),
+            form_cluster(Tab, Ids)
     end.
 
 %% The StorageServers that the table of the run has.

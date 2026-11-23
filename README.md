@@ -864,8 +864,8 @@ The models have 10 planted bugs. TLC finds a counterexample for each. See
 of eta. The harness is [dst/deadlift_dst.erl](dst/deadlift_dst.erl).
 
 The simulated system has one process for the coordinated state
-([deadlift_cstate_local](src/deadlift_cstate_local.erl)) in the place of a
-peace cluster, 3 LogServers for each epoch and a replication degree of 2.
+([deadlift_cstate_local](src/deadlift_cstate_local.erl)), or a peace
+cluster of 3 servers in the tests with the name `peace_`. It has 3 LogServers for each epoch and a replication degree of 2.
 A run has 1, 2 or 3 StorageServers. The number depends on the seed. Each
 node with the process of an epoch, a LogServer or a StorageServer has
 the process of each LogServer from the coordinated state. The process of
@@ -950,6 +950,7 @@ Results of `make dst` on 2026-11-22:
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
 | The same for the runs with ClusterControllers: without faults, with faults, and with cuts between ClusterController nodes | 18 seeds, 3 runs each | Pass |
+| The same for the runs with a peace cluster: with faults, and with ClusterControllers and faults | 12 seeds, 3 runs each | Pass |
 | No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 8,883 acknowledged transactions, of which 2,289 with a read range, 1,100 with a clear of keys and 546 in a batch with another acknowledged transaction, 3,446 rejected for a conflict, 391 too old, 12,683 transactions with reads, of which 4,995 with direct reads on the node of a StorageServer and 2,517 by message only, 7,610 selects, 12 reads below the MVCC window of the StorageServer, 1,388 recoveries, 89 failed recoveries |
 | Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 3,934 acknowledged transactions, of which 839 with a read range, 497 with a clear of keys and 371 in a batch with another acknowledged transaction, 3,756 rejected for a conflict, 1,470 too old, 13,757 transactions with reads, of which 2,475 after the start of a new StorageServer, 237 while one of several StorageServers was not alive, 5,646 with direct reads on the node of a StorageServer and 2,781 by message only, 8,326 selects, 164 reads below the MVCC window of the StorageServer, 1,145 rollbacks of StorageServers, 3,666 recoveries, 1,397 failed recoveries, 1,641 kills, of which 210 of a StorageServer, 285 partitions |
 | ClusterControllers, no kills, no partitions, no lost or delayed messages | 50 seeds in 1 test, 80 operations each | No violation, and each run ends with a leader and an epoch. 1,708 acknowledged transactions, 328 recoveries, 2 failed recoveries, 50 elections |
@@ -1003,7 +1004,45 @@ of the repository. Each one was found at seed 1 of the runs with faults:
 | `select/5` returns a stored row of a key range that the transaction cleared | `own_writes` |
 | `select/5` sends the limit to the StorageServer when the transaction has written a key of the range | `own_writes` |
 
+#### Runs with a peace cluster
+
+In the runs above, the coordinated state is one `deadlift_cstate_local`
+process. The tests with the name `peace_` run a peace cluster of 3
+servers in its place, under the scheduler and the network of eta:
+
+- peace is compiled with the parse transform of eta in the `dst`
+  profile (`overrides` in [rebar.config](rebar.config)).
+- Each server is on a simulated node of its own. The cluster has
+  majority quorums.
+- The harness kills the node of one server at most once in a run. A
+  server keeps its data in memory and does not start again.
+- A partition can cut a server off, and can leave the cluster without a
+  majority until the next heal.
+- [dst/deadlift_dst_machine.erl](dst/deadlift_dst_machine.erl) is the
+  machine of the servers. It records the decided state for the
+  invariants, and plants the defects `no_cas` and `no_elect_cas`.
+- A step injects an operation with the probability 0.004 in the place
+  of 0.015, because the heartbeats of peace add steps for each unit of
+  the virtual clock.
+
+Results of `make dst` on 2026-11-23. The 41 tests pass in 183 s:
+
+| Test | Runs | Result |
+|---|---|---|
+| peace cluster, no faults | 50 seeds in 1 test, 80 operations each | No violation. 1,801 acknowledged transactions, 323 recoveries, 73 failed recoveries |
+| peace cluster, kills, partitions, lost and delayed messages | 200 seeds in 2 tests | No violation. 861 acknowledged transactions, 1,197 recoveries, 834 failed recoveries, 32 kills of a server of the peace cluster, 120 partitions, 199 rollbacks of StorageServers |
+| peace cluster, ClusterControllers, kills of worker nodes, partitions | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 301 acknowledged transactions, 398 recoveries, 139 elections, 24 kills of a server of the peace cluster |
+| peace cluster, ClusterControllers, cuts between ClusterController nodes | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 288 acknowledged transactions, 182 elections, 28 runs with two leaders at the same time |
+| Planted defect `no_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 1, `durable` |
+| Planted defect `no_elect_cas` in the machine of the peace cluster | Seeds from 1 | Found at seed 1, `one_leader` |
+
 Limitations of the simulation:
+
+- A killed server of the peace cluster does not start again, and at
+  most 1 of the 3 servers is killed in a run. The cluster has no disk
+  and no change of its members.
+- A run with a peace cluster acknowledges fewer transactions than a
+  run without one: 4.3 for each run with faults, against 5.0.
 
 - The application start (`deadlift_sup`) and `deadlift:open/0` are not
   in the simulation. Unit tests on two nodes cover them.
@@ -1027,7 +1066,7 @@ seeds. `dst/run.sh` prints the sums of the statistics of these tests.
 | Command | Nodes at the same time | Time |
 |---|---|---|
 | `make dst-serial` | 1 | 10 min 38 s |
-| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total. 2 min 23 s in 1 run with one process for each epoch. 2 min 1 s in 1 run of 32 tests without the registry |
+| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80. 3 min 3 s in 1 run with the 8 tests with ClusterControllers, 33 tests in total. 2 min 23 s in 1 run with one process for each epoch. 2 min 1 s in 1 run of 32 tests without the registry. 3 min 3 s in 1 run of 41 tests, with the 8 tests with a peace cluster |
 | `dst/run.sh -j 5` | 5 | 4 min 6 s |
 
 The machine has 4 performance cores and 6 efficiency cores. The
@@ -1390,6 +1429,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [dst/deadlift_dst.erl](dst/deadlift_dst.erl) | The eta harness: the workload and the invariants |
 | [dst/deadlift_dst_client.erl](dst/deadlift_dst_client.erl) | The processes that perform the operations of the simulation |
 | [dst/deadlift_dst_tests.erl](dst/deadlift_dst_tests.erl) | The simulation suite |
+| [dst/deadlift_dst_machine.erl](dst/deadlift_dst_machine.erl) | The machine of the peace cluster of a simulation run |
 | [bench/deadlift_bench.erl](bench/deadlift_bench.erl), [bench/run.sh](bench/run.sh) | The benchmark of a cluster on one computer |
 | [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
 | [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which has no child |
