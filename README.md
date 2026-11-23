@@ -258,11 +258,20 @@ end).
   table, and 1,915 ns for the state of a transaction with 2 reads and 2
   writes.
 - A read returns a write of the same transaction (paper, section 2.4.1).
-- Another read goes to the ETS table of the StorageServer in the process
-  of the client, without a message. The StorageServer publishes its
-  version and its oldest version for this purpose. If the StorageServer
-  has not applied the read version, the read goes to the StorageServer
-  process, which waits for the version.
+- Another read goes to a StorageServer. A database names one
+  StorageServer or several, and each of them has every key:
+  1. The read puts the StorageServers in an order. A hash of the read
+     version selects the first one.
+  2. The read tries each StorageServer on the node of the client. It
+     reads the ETS table of the StorageServer in the process of the
+     client, without a message. The StorageServer publishes its version
+     and its oldest version for this purpose.
+  3. If no StorageServer on the node has applied the read version, the
+     read sends a message to each StorageServer in the order, on any
+     node. The StorageServer process waits for the version. The read has
+     5 seconds in total, in equal parts for the StorageServers. When a
+     StorageServer is not alive or does not answer in its part of the
+     time, the read continues with the next one.
 - `get/2` returns a future, as in erlfdb. The future of deadlift is the
   result itself, and `wait/1` returns its argument.
 - An error is `error({erlfdb_error, Code})` with the error code of
@@ -409,13 +418,58 @@ version of the epoch. This is the rollback of the paper. A read at a read
 version from a Proxy is not affected, because a read version is the LSN of
 a record that no recovery discards.
 
+#### Several StorageServers
+
+Several StorageServers can run at the same time, on one Erlang node or on
+several. This is the replication of the whole key space.
+
+- Each StorageServer has every key. Each one reads every record from the
+  LogServers, and has its own version, its own oldest version, its own
+  ETS tables and its own rollbacks.
+- The StorageServers send no message to each other. A LogServer keeps one
+  request for each StorageServer.
+- A read version is one version for the whole database. At a read
+  version, each StorageServer returns the same result, or waits for the
+  version, or answers that the read version is too old.
+- The client chooses the StorageServer of a read. See "The client".
+- A StorageServer on another Erlang node finds the LogServers through the
+  registry. See "LogServer identifiers".
+
+FoundationDB divides the key space into shards. Each shard has a team of
+StorageServers, and each mutation has the tags of the team of its key
+(paper, section 2.4.3). deadlift has one shard with the whole key space.
+The team is the list of StorageServers that the caller of
+`deadlift:open/1` names.
+
 ### LogServer identifiers
 
 The coordinated state identifies a LogServer with `{Epoch, Index}`. A
 LogServer registers its identifier with
-[deadlift_registry](src/deadlift_registry.erl), a registry of the
-processes of one node. The Sequencer and the Proxy find a LogServer
-through the registry. They send a request only to a LogServer that runs.
+[deadlift_registry](src/deadlift_registry.erl). The Sequencer, the Proxy
+and the StorageServer find a LogServer through the registry. They send a
+request only to a LogServer that runs.
+
+Each Erlang node has one registry process. A lookup reads an ETS table of
+the local node and sends no message. The registries exchange the names:
+
+- The registry of a node sends each name that a process registers to the
+  registries of the connected nodes, and sends the names of its node to a
+  node that connects.
+- When the connection to a node ends, a registry keeps the names of the
+  processes of that node, because the processes can be alive.
+- The registry of a node receives a name after the registration on the
+  other node has returned. Three parts of deadlift handle this time:
+  1. A Sequencer adds the name of each LogServer and of the Resolver that
+     it recruits to the registry of its own node.
+  2. A Proxy waits at its start, for at most 1 second, until the registry
+     has the names of the Resolver and of the LogServers of its epoch.
+  3. A recovery waits, for at most the time of the lock, until the
+     registry has the names of enough LogServers of the previous epoch.
+- A StorageServer sends its requests again at an interval, so it needs
+  no such wait.
+
+The simulation found the need for the three parts: with one registry on
+each simulated node and without them, no transaction was acknowledged.
 
 ### Departures from the paper
 
@@ -445,8 +499,12 @@ through the registry. They send a request only to a LogServer that runs.
   older data to disk. This part is not in the paper.
 - The rule for the oldest version of the StorageServer is not taken from
   the FoundationDB source.
-- One StorageServer has every key. FoundationDB divides the key space
-  into shards.
+- Each StorageServer has every key. FoundationDB divides the key space
+  into shards, and each shard has a team of StorageServers.
+- The client selects the first StorageServer of a read with a hash of the
+  read version. The client of FoundationDB selects a StorageServer from a
+  model of the latency of each one, and sends a second request to
+  another one when the first is slow.
 - The StorageServer reads the log systems from the coordinated state. A
   StorageServer of FoundationDB receives them from the ClusterController.
   This part is not in the paper.
@@ -470,7 +528,7 @@ through the registry. They send a request only to a LogServer that runs.
 | Level | What it checks | Command | Time |
 |---|---|---|---|
 | Unit tests | The coordinated state machine, alone and on a peace cluster of three servers on one node. One LogServer: the order of the LSNs, the KCV, repeated records and the lock. The recovery on a peace cluster: the first epoch, a second epoch with records to copy, 1 and 2 LogServers down, and two recoveries at the same time. The Proxy: commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down | `make test` | 3 seconds |
-| Simulation | The LogServer, the recovery, the Sequencer, the Resolver, the Proxy and the StorageServer under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 4 minutes |
+| Simulation | The LogServer, the recovery, the Sequencer, the Resolver, the Proxy and the StorageServer under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 3 minutes |
 | Model checking | The logging protocol, the recovery, the read versions, the StorageServer and the Resolver, with 2 epochs | `make tlc` | about 5 minutes |
 | Model checking | The logging protocol, the recovery and the StorageServer, with 3 epochs | `make tlc-long` | about 4 hours |
 
@@ -485,8 +543,14 @@ of eta. The harness is [dst/deadlift_dst.erl](dst/deadlift_dst.erl).
 The simulated system has one process for the coordinated state
 ([deadlift_cstate_local](src/deadlift_cstate_local.erl)) in the place of a
 peace cluster, 3 LogServers for each epoch and a replication degree of 2.
-One StorageServer runs at a time. The coordinated state, the
-StorageServer, each Sequencer, each Proxy, each Resolver and each
+A run has 1, 2 or 3 StorageServers. The number depends on the seed. Each
+node with a Sequencer, a LogServer, a Resolver, a Proxy or a
+StorageServer has its own registry process, and the registries exchange
+the names over the simulated network. A Sequencer starts each LogServer,
+the Resolver and the Proxy on their nodes through `erpc`. The harness
+connects each new node to the other nodes, as an Erlang cluster does by
+default. The
+coordinated state, each StorageServer, each Sequencer, each Proxy, each Resolver and each
 LogServer run on a simulated node of their own. The network loses 0.1% of the messages
 between nodes and delays 20% of them.
 
@@ -494,7 +558,7 @@ The workload has these operations:
 
 - start a Sequencer and, after its recovery, a Proxy;
 - run a transaction: get a read version from a Proxy of any epoch, read
-  the read keys from the StorageServer at the read version, and commit
+  the read keys from the StorageServers at the read version, and commit
   through a Proxy of any epoch, with read keys and write keys from 4
   keys. One client in three waits 20 ms to 100 ms before the commit, so
   that a recovery can end the epoch of the read version;
@@ -502,8 +566,11 @@ The workload has these operations:
 - kill a Sequencer, also during its recovery;
 - kill a Proxy;
 - kill the Resolver of an epoch;
-- kill the StorageServer, and start a new StorageServer without data,
-  which reads every record from the LogServers of every epoch;
+- kill one StorageServer, and start a new StorageServer without data,
+  which reads every record from the LogServers of every epoch. The
+  clients read from the other StorageServers in that time. 1 client in
+  2 runs on the node of a StorageServer and reads the ETS table of that
+  StorageServer. The other clients read by message;
 - cut the connection between two nodes, and remove every cut.
 
 The harness checks these invariants after every step:
@@ -518,7 +585,8 @@ The harness checks these invariants after every step:
 | `no_conflict` | No acknowledged transaction read a key that another acknowledged transaction wrote between the read version and the commit version of the first one |
 | `read_version_order` | A read version is at or above the commit version of every transaction that was acknowledged before the client asked for it, in any epoch |
 | `read_value` | A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer |
-| `storage_rollback` | When the StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one |
+| `storage_rollback` | When a StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one |
+| `replicas_agree` | Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -527,21 +595,24 @@ Results of `make dst` on 2026-11-22:
 | Test | Runs | Result |
 |---|---|---|
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 20 seeds, 3 runs each | Pass |
-| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 150 operations each | No violation. 10,417 acknowledged transactions, of which 2,643 with a read range, 1,301 with a clear of keys and 2,028 in a batch with another acknowledged transaction, 9,262 rejected for a conflict, 1,627 too old, 22,244 transactions with reads, 2 reads below the MVCC window of the StorageServer, 2,298 recoveries |
-| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 150 operations each | No violation. 3,097 acknowledged transactions, of which 755 with a read range, 378 with a clear of keys and 580 in a batch with another acknowledged transaction, 4,575 rejected for a conflict, 2,890 too old, 22,886 transactions with reads, of which 7,264 from a StorageServer that started after a kill, 137 reads below the MVCC window of the StorageServer, 455 rollbacks of the StorageServer, 6,246 recoveries, 3,315 kills, of which 380 of the StorageServer, 618 partitions |
-| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 1, `kcv_below_dv`. In 40 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
+| No kills, no partitions, no lost or delayed messages | 200 seeds in 4 tests, 80 operations each, 399 StorageServers at the start of the runs | No violation. 5,540 acknowledged transactions, of which 1,474 with a read range, 679 with a clear of keys and 784 in a batch with another acknowledged transaction, 3,227 rejected for a conflict, 455 too old, 9,436 transactions with reads, of which 3,783 with direct reads on the node of a StorageServer and 1,888 by message only, 0 reads below the MVCC window of the StorageServer, 1,127 recoveries, 344 failed recoveries |
+| Kills, partitions, lost and delayed messages | 500 seeds in 5 tests, 80 operations each, 999 StorageServers at the start of the runs | No violation. 1,067 acknowledged transactions, of which 227 with a read range, 134 with a clear of keys and 205 in a batch with another acknowledged transaction, 1,623 rejected for a conflict, 742 too old, 6,882 transactions with reads, of which 1,067 after the start of a new StorageServer, 217 while one of several StorageServers was not alive, 2,741 with direct reads on the node of a StorageServer and 1,362 by message only, 42 reads below the MVCC window of the StorageServer, 245 rollbacks of StorageServers, 2,300 recoveries, 2,838 failed recoveries, 1,560 kills, of which 203 of a StorageServer, 272 partitions |
+| Planted defect: the Proxy answers after 2 of 3 LogServers | Seeds from 1 | Found at seed 15, `kcv_below_dv`. In 120 seeds the defect also violates `durable`, the counterexample of `RecoveryAckReplicasOnly` |
 | Planted defect: a recovery copies no record | Seeds from 1 | Found at seed 1, `copied` |
 | Planted defect: the coordinated state accepts any write | Seeds from 1 | Found at seed 1, `durable` |
 | Planted defect: the Resolver admits every transaction | Seeds from 1 | Found at seed 1, `no_conflict` |
 | Planted defect: the Resolver does not check the read ranges | Seeds from 1 | Found at seed 2, `no_conflict` |
-| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 1, `no_conflict` between the transactions with the indexes 1 and 2 of one batch |
+| Planted defect: the Resolver does not check a transaction against the earlier transactions of its batch | Seeds from 1 | Found at seed 2, `no_conflict` between two transactions of one batch |
 | Planted defect: the Resolver does not record the write ranges | Seeds from 1 | Found at seed 3, `no_conflict`: a transaction read a key that another transaction cleared in a range |
-| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` between a transaction of epoch 14 and a write of epoch 13 |
+| Planted defect: the first commit version of an epoch is the Recovery Version plus 1 | Seeds from 1 | Found at seed 2, `no_conflict` between a transaction of epoch 6 and a write of epoch 1 |
 | Planted defect: a Proxy does not report a committed LSN to the Sequencer | Seeds from 1 | Found at seed 1, `read_version_order` |
-| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 2, `read_version_order`: a Proxy of epoch 3 gave a read version below a commit of epoch 4 |
-| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 4, `storage_rollback` |
-| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 6, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
-| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 1, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
+| Planted defect: a Proxy gives a read version without the confirmation that its epoch is live | Seeds from 1 | Found at seed 39, `read_version_order`: a Proxy of epoch 3 gave a read version below a commit of epoch 4 |
+| Planted defect: the StorageServer keeps the writes above the end version of an epoch | Seeds from 1 | Found at seed 9, `storage_rollback` |
+| Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 130, `read_value`: a read returned no value for a key that an acknowledged transaction wrote below the read version |
+| Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 3, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
+| Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
+| Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 2, `read_value` |
+| Planted defect: a registry sends no name to the registry of another node | Seeds 1 to 10, runs without faults | No violation, as expected. 0 acknowledged transactions and 10 recoveries, 1 in each run. The runs without the defect have 5,540 acknowledged transactions in 200 seeds |
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](dst/run.sh)). The runs without faults
@@ -551,7 +622,7 @@ seeds. `dst/run.sh` prints the sums of the statistics of these tests.
 | Command | Nodes at the same time | Time |
 |---|---|---|
 | `make dst-serial` | 1 | 10 min 38 s |
-| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs |
+| `make dst` | 8 | 3 min 32 s and 3 min 47 s in 2 runs with one StorageServer and one registry. 7 min 7 s in 1 run with 1 to 3 StorageServers and a registry on each simulated node. 3 min 4 s in 1 run after the change of a run from 150 operations to 80 |
 | `dst/run.sh -j 5` | 5 | 4 min 6 s |
 
 The machine has 4 performance cores and 6 efficiency cores. The
@@ -625,8 +696,26 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   versionstamped keys and values, no watches, no transaction options, no
   tenants and no `get_last_error/0`. It has no tuple layer, no subspaces
   and no directory layer.
-- A database of the client is a Proxy and a StorageServer that the caller
-  names. deadlift has no process that tells a client which Proxy runs.
+- A database of the client is a Proxy and a list of StorageServers that
+  the caller names. deadlift has no process that tells a client which
+  Proxy and which StorageServers run.
+- A read by message waits for its part of the 5 seconds at a
+  StorageServer that is behind or cut off, before it continues with the
+  next StorageServer. The client has no record of the StorageServers that
+  did not answer an earlier read.
+- A registry receives names only from the nodes to which its node is
+  connected, and it does not connect nodes. The nodes of an Erlang
+  cluster connect to each other by default. In the simulation, the
+  harness connects each new node to the other nodes.
+- A process cannot tell a LogServer whose name has not arrived from a
+  LogServer that does not run.
+- The registry keeps the name of a process on a node that has stopped.
+- One unit test,
+  [test/deadlift_nodes_tests.erl](test/deadlift_nodes_tests.erl), uses two
+  Erlang nodes on one computer. The test starts Erlang distribution and
+  needs `epmd`. No test cuts the connection between two Erlang nodes.
+  The simulation cuts the connection between simulated nodes.
+- Two processes on two nodes can register one name at the same time.
   The client raises the error 1037 when the Proxy does not answer. The
   client of FoundationDB waits for a new Proxy.
 - A transaction of `create_transaction/1` keeps its ETS table until its
@@ -653,8 +742,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   transaction without a known result cleared the key at any version.
 - The MVCC window of the StorageServer and the MVCC window of the Resolver
   are two options. No part of deadlift checks that they are equal.
-- The simulation has one StorageServer at a time. A new StorageServer
-  starts without data after a kill. The simulation kills at most 1
+- In the simulation, a new StorageServer starts without data after a
+  kill. The simulation kills at most 1
   LogServer of each epoch, so a LogServer with each body runs.
 - A request for a read version waits until the timeout of the client
   when a message to a LogServer or its answer is lost. The Proxy does not

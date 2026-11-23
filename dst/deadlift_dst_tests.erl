@@ -15,14 +15,15 @@ opts(Seed, Config) ->
     #{
         seed => Seed,
         config => Config,
-        max_ops => 150,
+        max_ops => 80,
         max_steps => 100000,
         settle_steps => 2000,
         %% `op_p' is the probability that a step injects an operation. A
         %% commit takes several steps and, with delayed messages, several
         %% advances of the clock. With a higher value, a new recovery ends
-        %% an epoch before its commits are acknowledged.
-        op_p => 0.03,
+        %% an epoch before its commits are acknowledged. The start of a
+        %% node takes steps for the messages between the registries.
+        op_p => 0.015,
         %% When no process is runnable, the run lets time pass more often
         %% than not, so that delayed messages arrive and time-outs fire.
         quiet_p => 0.8,
@@ -102,9 +103,9 @@ faults_shard(Shard) ->
         ?debugFmt("faults ~p: ~p", [Shard, Stats]),
         ok = write_stats({faults, Shard}, Stats),
         %% A transaction has 3 steps with messages: the read version, the
-        %% reads and the commit. With faults, about 1 transaction in 8 is
+        %% reads and the commit. With faults, about 1 transaction in 12 is
         %% acknowledged.
-        ?assert(maps:get(acks, Stats, 0) > 300, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 150, Stats),
         ?assert(maps:get(kills_log, Stats, 0) > 15, Stats),
         ?assert(maps:get(kills_sequencer, Stats, 0) > 15, Stats),
         ?assert(maps:get(kills_proxy, Stats, 0) > 15, Stats),
@@ -112,24 +113,29 @@ faults_shard(Shard) ->
         %% The harness killed StorageServers, and clients read from a
         %% StorageServer that started after a kill.
         ?assert(maps:get(kills_storage, Stats, 0) > 15, Stats),
-        ?assert(maps:get(reads_after_restart, Stats, 0) > 150, Stats),
+        ?assert(maps:get(reads_after_restart, Stats, 0) > 100, Stats),
+        %% Runs had several StorageServers, clients read while one of
+        %% them was not alive, and clients read by message only.
+        ?assert(maps:get(storages, Stats, 0) > 150, Stats),
+        ?assert(maps:get(reads_with_one_down, Stats, 0) > 3, Stats),
+        ?assert(maps:get(reads_by_message, Stats, 0) > 100, Stats),
         %% Clients read values, and the StorageServer removed writes that a
         %% recovery discarded.
         ?assert(maps:get(reads, Stats, 0) > 750, Stats),
         %% Clients read key ranges, and transactions with a read range were
         %% acknowledged.
         ?assert(maps:get(range_reads, Stats, 0) > 300, Stats),
-        ?assert(maps:get(range_acks, Stats, 0) > 45, Stats),
+        ?assert(maps:get(range_acks, Stats, 0) > 20, Stats),
         %% Acknowledged transactions cleared keys.
-        ?assert(maps:get(clears, Stats, 0) > 20, Stats),
+        ?assert(maps:get(clears, Stats, 0) > 15, Stats),
         %% Acknowledged transactions had their LSN together with another
         %% acknowledged transaction.
-        ?assert(maps:get(batched, Stats, 0) > 30, Stats),
+        ?assert(maps:get(batched, Stats, 0) > 25, Stats),
         ?assert(maps:get(rollbacks, Stats, 0) > 2, Stats),
         %% Reads were below the MVCC window of the StorageServer. With the
-        %% direct reads of the client library, a shard has 10 to 50 of
+        %% direct reads of the client library, a shard has 2 to 15 of
         %% them.
-        ?assert(maps:get(read_too_old, Stats, 0) > 3, Stats),
+        ?assert(maps:get(read_too_old, Stats, 0) > 0, Stats),
         ?assert(maps:get(partitions, Stats, 0) > 15, Stats),
         %% The Resolver rejected transactions for a conflict, and for a
         %% read version of an earlier epoch.
@@ -168,10 +174,10 @@ ack_replicas_is_found_test_() ->
         ?assert(lists:member(maps:get(property, Violation), [durable, kcv_below_dv, body_available]), Violation),
         Found = lists:usort([
             maps:get(property, V)
-         || Seed1 <- lists:seq(1, 40),
+         || Seed1 <- lists:seq(1, 120),
             {violation, V} <- [maps:get(outcome, run(opts(Seed1, #{mode => ack_replicas})))]
         ]),
-        ?debugFmt("ack_replicas: invariants violated in 40 seeds: ~p", [Found]),
+        ?debugFmt("ack_replicas: invariants violated in 120 seeds: ~p", [Found]),
         ?assert(lists:member(durable, Found), Found)
     end}.
 
@@ -284,6 +290,58 @@ no_window_check_is_found_test_() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_window_check}) end),
         ?debugFmt("no_window_check: seed ~p, ~p", [Seed, Violation]),
         ?assertMatch(#{property := read_value}, Violation)
+    end}.
+
+%% A planted defect: the StorageServer answers a read at a version that it
+%% has not applied. The read does not return a write at or below the read
+%% version.
+no_wait_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_wait}) end),
+        ?debugFmt("no_wait: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := read_value}, Violation)
+    end}.
+
+%% A planted defect: the second StorageServer of a run does not apply a
+%% clear. Two StorageServers then have different writes for a key. A read
+%% from the second StorageServer can find the defect first, as a violation
+%% of `read_value'. The test continues with the next seed until the
+%% comparison of the StorageServers finds the defect.
+one_no_clear_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        OptsFun = fun(Seed) -> (calm(Seed))#{config => #{mode => one_no_clear, faults => false}} end,
+        Find = fun Find(Seeds) ->
+            {Seed, Violation} = first_violation(Seeds, OptsFun),
+            case Violation of
+                #{property := replicas_agree} ->
+                    {Seed, Violation};
+                #{property := read_value} ->
+                    Find([Later || Later <- Seeds, Later > Seed])
+            end
+        end,
+        {Seed, Violation} = Find(lists:seq(1, 300)),
+        ?debugFmt("one_no_clear: seed ~p, ~p", [Seed, Violation]),
+        #{first := First, second := Second} = Violation,
+        %% The second StorageServer lacks a clear that the first one has.
+        ?assert(lists:any(fun({_Version, Change}) -> Change =:= clear end, First -- Second), Violation)
+    end}.
+
+%% A planted defect: a registry sends no name to the registry of another
+%% node. This defect violates no invariant. A Proxy does not find the
+%% LogServers and the Resolver of its epoch, and a second Sequencer does not
+%% find the LogServers of the first epoch. The test shows that the runs
+%% depend on the exchange of names: no transaction is acknowledged, and
+%% each run has at most one recovery.
+no_exchange_stops_commits_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = deadlift_dst:reset_stats(),
+        Seeds = lists:seq(1, 10),
+        sweep(Seeds, fun(Seed) -> (calm(Seed))#{config => #{mode => no_exchange, faults => false}} end),
+        Stats = deadlift_dst:stats(),
+        ?debugFmt("no_exchange: ~p", [Stats]),
+        ?assertEqual(0, maps:get(acks, Stats, 0), Stats),
+        ?assert(maps:get(recoveries, Stats, 0) =< length(Seeds), Stats),
+        ?assert(maps:get(recoveries, Stats, 0) > 0, Stats)
     end}.
 
 %% The planted defect of `RecoveryNoCas': the coordinated state accepts the

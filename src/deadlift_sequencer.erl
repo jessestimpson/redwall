@@ -278,9 +278,18 @@ handle_call(read_version, _From, State = #state{live = Live}) ->
 handle_call(recovered, _From, State = #state{recovered = Recovered}) ->
     {reply, {ok, Recovered}, State}.
 
-recruit_resolver(Recruit, ResolverOptions) ->
+recruit_resolver(Recruit, ResolverOptions = #{epoch := Epoch}) ->
     case Recruit(ResolverOptions) of
-        {ok, Resolver} -> {ok, Resolver};
+        {ok, Resolver} ->
+            %% A Resolver on another node has registered on that node. The
+            %% registry of this node receives the name later, so the
+            %% Sequencer adds the name itself.
+            ok =
+                case is_pid(Resolver) of
+                    true -> deadlift_registry:learn({resolver, Epoch}, Resolver);
+                    false -> ok
+                end,
+            {ok, Resolver};
         {error, Reason} -> {error, {recruit_resolver, Reason}}
     end.
 

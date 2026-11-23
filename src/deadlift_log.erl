@@ -161,7 +161,8 @@ start(Options) ->
     gen_server:start(?MODULE, Options, []).
 
 %% @doc The process of the LogServer `Id', for the functions of this
-%% module. The result is valid on the node of the LogServer.
+%% module. The LogServer runs on this node or on a connected node (see
+%% {@link deadlift_registry}).
 %%
 %% The result is the atom `undefined' if no LogServer with the identifier
 %% runs. A `gen_server' call to `undefined' fails in the same way as a call

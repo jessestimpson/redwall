@@ -249,6 +249,10 @@
 }).
 
 -define(TIMEOUT_MS, 5000).
+%% The Proxy looks for the names of its Resolver and of its LogServers 100
+%% times at an interval of 10 ms.
+-define(AWAIT_NAMES_TRIES, 100).
+-define(AWAIT_NAMES_MS, 10).
 
 %% ---------------------------------------------------------------------------
 %% Client
@@ -358,10 +362,28 @@ handle_continue(start, State = #state{sequencer = Sequencer}) ->
                 log_system := #{logs := Logs, replication := K},
                 previous_epoch_end_version := PEV
             } = Recovered,
+            ok = await_names(Epoch, Logs, ?AWAIT_NAMES_TRIES),
             {noreply, State#state{epoch = Epoch, logs = Logs, replication = K, kcv = PEV}}
     catch
         exit:Reason ->
             {stop, {shutdown, {sequencer, Reason}}, State}
+    end.
+
+%% Waits until the registry of this node has the name of the Resolver and
+%% of every LogServer of the epoch, for at most 1 second. A process on
+%% another node registers on that node, and the registry of this node
+%% receives the name in a message (see {@link deadlift_registry}). After
+%% the time, the Proxy continues. A commit then stops the Proxy if the
+%% Resolver or a LogServer has no name.
+await_names(_Epoch, _Logs, 0) ->
+    ok;
+await_names(Epoch, Logs, Tries) ->
+    case lists:member(undefined, [deadlift_resolver:ref(Epoch) | [deadlift_log:ref(Log) || Log <- Logs]]) of
+        false ->
+            ok;
+        true ->
+            ok = timer:sleep(?AWAIT_NAMES_MS),
+            await_names(Epoch, Logs, Tries - 1)
     end.
 
 %% @private

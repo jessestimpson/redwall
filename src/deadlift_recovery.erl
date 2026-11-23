@@ -94,6 +94,7 @@
 }.
 
 -define(LOCK_TIMEOUT_MS, 1000).
+-define(AWAIT_NAMES_MS, 10).
 -define(CSTATE_TIMEOUT_MS, 5000).
 
 %% @doc Performs a recovery. The result gives the epoch and the log system
@@ -150,12 +151,33 @@ end_previous_epoch(_Epoch, #{current := undefined}, _Options) ->
 end_previous_epoch(Epoch, #{current := #{logs := OldLogs, replication := OldK}}, Options) ->
     Needed = length(OldLogs) - OldK + 1,
     maybe
-        {ok, Replies} ?= lock_logs(OldLogs, Epoch, maps:get(lock_timeout_ms, Options, ?LOCK_TIMEOUT_MS)),
+        LockTimeoutMs = maps:get(lock_timeout_ms, Options, ?LOCK_TIMEOUT_MS),
+        ok = await_names(OldLogs, Needed, LockTimeoutMs div ?AWAIT_NAMES_MS),
+        {ok, Replies} ?= lock_logs(OldLogs, Epoch, LockTimeoutMs),
         true ?= length(Replies) >= Needed orelse {error, {too_few_replies, length(Replies), Needed}},
         PEV = lists:max([KCV || {_Log, #{kcv := KCV}} <- Replies]),
         RV = lists:min([DV || {_Log, #{dv := DV}} <- Replies]),
         {ok, Records} ?= copy([Log || {Log, _} <- Replies], PEV, RV),
         {ok, #{pev => PEV, rv => RV, records => Records, end_version => RV}}
+    end.
+
+%% Waits until the registry of this node has the names of `Needed' of the
+%% old LogServers, for at most the time of the lock. A LogServer on
+%% another node registers on that node, and the registry of this node
+%% receives the name in a message (see {@link deadlift_registry}). A
+%% Sequencer on a new node starts before its registry has the names. The
+%% recovery cannot tell a LogServer without a name from a LogServer that
+%% does not run. With fewer than `Needed' names the recovery fails, so the
+%% wait adds no time to a recovery that can succeed at once.
+await_names(_OldLogs, _Needed, Tries) when Tries =< 0 ->
+    ok;
+await_names(OldLogs, Needed, Tries) ->
+    case length([Log || Log <- OldLogs, deadlift_log:ref(Log) =/= undefined]) >= Needed of
+        true ->
+            ok;
+        false ->
+            ok = timer:sleep(?AWAIT_NAMES_MS),
+            await_names(OldLogs, Needed, Tries - 1)
     end.
 
 %% Sends a lock to every old LogServer, and collects the answers until
@@ -263,7 +285,15 @@ recruit(Index, M, _LogOptions, _Recruit, Logs) when Index > M ->
 recruit(Index, M, LogOptions = #{epoch := Epoch}, Recruit, Logs) ->
     Id = {Epoch, Index},
     case Recruit(LogOptions#{id => Id}) of
-        {ok, _Started} ->
+        {ok, Started} ->
+            %% A LogServer on another node has registered its identifier
+            %% on that node. The registry of this node receives the name
+            %% later, so the recovery adds the name itself.
+            ok =
+                case is_pid(Started) of
+                    true -> deadlift_registry:learn({log, Id}, Started);
+                    false -> ok
+                end,
             recruit(Index + 1, M, LogOptions, Recruit, [Id | Logs]);
         {error, Reason} ->
             stop_logs(Logs),

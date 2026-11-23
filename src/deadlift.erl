@@ -43,16 +43,55 @@
 %%   transaction uses this version.</li>
 %% <li>A read returns a write of the same transaction (paper, section
 %%   2.4.1). Such a read adds no read conflict key.</li>
-%% <li>Another read goes to the ETS table of the StorageServer in the
-%%   process of the caller (`deadlift_storage:read_direct/3'). If the
-%%   StorageServer has not applied the read version, the read goes to the
-%%   StorageServer process, which waits for the version.</li>
+%% <li>Another read goes to a StorageServer. See "StorageServers"
+%%   below.</li>
 %% <li>A read of a transaction adds a read conflict key or a read conflict
 %%   range. A read of a snapshot (`snapshot/1') adds none.</li>
 %% <li>`get/2' returns a future, as in erlfdb. The future of deadlift is
 %%   the result itself, and `wait/1' returns its argument. `wait/1' of
 %%   erlfdb also returns an argument that is not a future.</li>
 %% </ul>
+%%
+%% == StorageServers ==
+%%
+%% A database names one StorageServer or several. Each StorageServer has
+%% every key (see {@link deadlift_storage}), so each of them can answer
+%% each read. A read uses the StorageServers in this way:
+%%
+%% <ol>
+%% <li>The read puts the StorageServers in an order. The first one is
+%%   selected by a hash of the read version, so that the transactions use
+%%   the StorageServers in equal parts, and the reads of one transaction
+%%   start at the same StorageServer.</li>
+%% <li>The read tries each StorageServer on the node of the caller, in the
+%%   order. It reads the ETS table of the StorageServer in the process of
+%%   the caller, without a message
+%%   (`deadlift_storage:read_direct/3'). A StorageServer that has applied
+%%   the read version gives the result. An ETS table cannot be read from
+%%   another node.</li>
+%% <li>If no StorageServer gave a result, the read sends a message to each
+%%   StorageServer in the order, on any node. The StorageServer process
+%%   waits for the read version. The read has 5 seconds in total, in equal
+%%   parts for the StorageServers. When a StorageServer is not alive, or
+%%   does not answer in its part of the time, the read continues with the
+%%   next one.</li>
+%% <li>When a StorageServer answers that the read version is too old, the
+%%   read raises 1007 and tries no other StorageServer.</li>
+%% <li>When no StorageServer answered, the read raises 1009 if a
+%%   StorageServer did not answer in time, and 1037 otherwise.</li>
+%% </ol>
+%%
+%% The option `direct => false' of `open/1' turns step 2 off.
+%%
+%% The client of FoundationDB chooses a StorageServer of the team from a
+%% model of the latency of each one, and sends a second request to another
+%% one when the first is slow (`fdbrpc/LoadBalance.actor.h'). It tries the
+%% next StorageServer after a failed delivery and after `process_behind',
+%% and returns `future_version' and `transaction_too_old' to the caller.
+%% deadlift has no model of the latency and no second request. A
+%% StorageServer of deadlift does not answer `future_version', so the
+%% client continues with the next StorageServer after its part of the
+%% time.
 %%
 %% == Errors ==
 %%
@@ -69,8 +108,8 @@
 %% <li>1021, `commit_unknown_result': the transaction is committed or is
 %%   not committed.</li>
 %% <li>1025, `transaction_cancelled'.</li>
-%% <li>1037, `process_behind': the Proxy or the StorageServer does not
-%%   answer. FoundationDB has this code for a StorageServer that is
+%% <li>1037, `process_behind': the Proxy does not answer, or no
+%%   StorageServer is alive. FoundationDB has this code for a StorageServer that is
 %%   behind. The client of FoundationDB waits for a new Proxy instead of
 %%   raising an error.</li>
 %% </ul>
@@ -97,8 +136,9 @@
 %% <li>The module has no key selectors, no options of `get_range', no
 %%   atomic operations, no versionstamped keys and values, no watches, no
 %%   transaction options, no tenants and no `get_last_error/0'.</li>
-%% <li>A database is a Proxy and a StorageServer that the caller names.
-%%   deadlift has no process that tells a client which Proxy runs.</li>
+%% <li>A database is a Proxy and a list of StorageServers that the caller
+%%   names. deadlift has no process that tells a client which Proxy and
+%%   which StorageServers run.</li>
 %% <li>A key and a value are Erlang terms. A key and a value of erlfdb are
 %%   binaries.</li>
 %% <li>A transaction that `create_transaction/1' returns keeps its table
@@ -111,6 +151,8 @@
 %%   cases.</li>
 %% </ul>
 -module(deadlift).
+
+-include("deadlift_eta.hrl").
 
 -export([open/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, set/3, clear/2, clear_range/3]).
@@ -127,7 +169,16 @@
 %% A process, or a function that returns the process that runs now.
 -type server() :: gen_server:server_ref() | fun(() -> gen_server:server_ref() | undefined).
 
--type database() :: {deadlift_database, #{proxy := server(), storage := server()}}.
+%% One StorageServer, a list of StorageServers, or a function that returns
+%% the StorageServers that run now.
+-type storage() ::
+    gen_server:server_ref()
+    | [gen_server:server_ref()]
+    | fun(() -> gen_server:server_ref() | [gen_server:server_ref()] | undefined).
+
+-type servers() :: #{proxy := server(), storage := storage(), direct => boolean()}.
+
+-type database() :: {deadlift_database, servers()}.
 -type transaction() :: {deadlift_transaction, ets:tid()}.
 -type snapshot() :: {deadlift_snapshot, transaction()}.
 
@@ -153,11 +204,14 @@
 %% Database and transaction
 %% ---------------------------------------------------------------------------
 
-%% @doc Returns a database for a Proxy and a StorageServer. Each one is a
-%% process, or a function that returns the process that runs now.
--spec open(#{proxy := server(), storage := server()}) -> database().
+%% @doc Returns a database for a Proxy and for one StorageServer or
+%% several. The Proxy is a process, or a function that returns the process
+%% that runs now. `storage' is a process, a list of processes, or a
+%% function that returns one of the two. With `direct => false', no read
+%% uses the ETS table of a StorageServer.
+-spec open(servers()) -> database().
 open(Servers = #{proxy := _, storage := _}) ->
-    {deadlift_database, maps:with([proxy, storage], Servers)}.
+    {deadlift_database, maps:with([proxy, storage, direct], Servers)}.
 
 -spec create_transaction(database()) -> transaction().
 create_transaction({deadlift_database, Servers}) ->
@@ -262,49 +316,96 @@ cleared(Table, Key) ->
     Guards = [{'=<', '$1', {const, Key}}, {'<', {const, Key}, '$2'}],
     ets:select_count(Table, [{{{cr, '_'}, '$1', '$2'}, Guards, [true]}]) > 0.
 
-%% Reads from the StorageServer at the read version of the transaction.
+%% Reads from a StorageServer at the read version of the transaction. See
+%% "StorageServers" in the module documentation.
 read(Table, Query) ->
     Version = read_version(Table),
-    case direct(Table, Query, Version) of
-        {ok, Result} ->
-            Result;
-        too_old ->
-            error({erlfdb_error, ?TRANSACTION_TOO_OLD});
-        _BehindOrGone ->
-            %% The StorageServer process waits for the version.
-            Storage = server(Table, storage),
-            Answer =
-                case Query of
-                    {key, Key} -> deadlift_storage:read_with_version(Storage, Key, Version, ?TIMEOUT_MS);
-                    {range, Begin, End} -> deadlift_storage:read_range_with_version(Storage, Begin, End, Version, ?TIMEOUT_MS)
-                end,
-            case Answer of
-                {error, transaction_too_old} -> error({erlfdb_error, ?TRANSACTION_TOO_OLD});
-                {error, {timeout, _}} -> error({erlfdb_error, ?FUTURE_VERSION});
-                {error, _Reason} -> error({erlfdb_error, ?PROCESS_BEHIND});
-                Result -> Result
+    Storages = storages(Table, Version),
+    case read_direct(Table, Storages, Query, Version) of
+        {ok, Result} -> Result;
+        too_old -> error({erlfdb_error, ?TRANSACTION_TOO_OLD});
+        none -> read_by_message(Storages, Query, Version, ?TIMEOUT_MS div length(Storages), ?PROCESS_BEHIND)
+    end.
+
+%% The StorageServers of the database, in the order of this read version.
+storages(Table, Version) ->
+    [{db, #{storage := Storage}}] = ets:lookup(Table, db),
+    Named =
+        case is_function(Storage, 0) of
+            true -> Storage();
+            false -> Storage
+        end,
+    case Named of
+        undefined ->
+            error({erlfdb_error, ?PROCESS_BEHIND});
+        [] ->
+            error({erlfdb_error, ?PROCESS_BEHIND});
+        [_ | _] ->
+            {Before, From} = lists:split(erlang:phash2(Version, length(Named)), Named),
+            From ++ Before;
+        One ->
+            [One]
+    end.
+
+%% Reads the table of each StorageServer on this node in this process,
+%% until one of them has applied the read version. The transaction keeps
+%% the handle of a StorageServer from the first read on.
+read_direct(Table, Storages, Query, Version) ->
+    [{db, Servers}] = ets:lookup(Table, db),
+    case maps:get(direct, Servers, true) of
+        true -> read_direct_each(Table, [Storage || Storage <- Storages, local(Storage)], Query, Version);
+        false -> none
+    end.
+
+read_direct_each(_Table, [], _Query, _Version) ->
+    none;
+read_direct_each(Table, [Storage | Storages], Query, Version) ->
+    Answer =
+        case handle(Table, Storage) of
+            none -> gone;
+            Handle -> deadlift_storage:read_direct(Handle, Query, Version)
+        end,
+    case Answer of
+        {ok, Result} -> {ok, Result};
+        too_old -> too_old;
+        _BehindOrGone -> read_direct_each(Table, Storages, Query, Version)
+    end.
+
+handle(Table, Storage) ->
+    case ets:lookup(Table, {storage_handle, Storage}) of
+        [{_, Kept}] ->
+            Kept;
+        [] ->
+            case deadlift_storage:handle(Storage) of
+                {ok, New} ->
+                    true = ets:insert(Table, {{storage_handle, Storage}, New}),
+                    New;
+                {error, _Reason} ->
+                    none
             end
     end.
 
-%% Reads the table of the StorageServer in this process. The transaction
-%% keeps the handle of the StorageServer from its first read on.
-direct(Table, Query, Version) ->
-    Handle =
-        case ets:lookup(Table, storage_handle) of
-            [{_, Kept}] ->
-                Kept;
-            [] ->
-                case deadlift_storage:handle(server(Table, storage)) of
-                    {ok, New} ->
-                        true = ets:insert(Table, {storage_handle, New}),
-                        New;
-                    {error, _Reason} ->
-                        none
-                end
+%% The StorageServer runs on the node of the caller.
+local(Storage) when is_pid(Storage) -> node(Storage) =:= node();
+local(Storage) when is_atom(Storage) -> true;
+local({Name, Node}) when is_atom(Name), is_atom(Node) -> Node =:= node();
+local(_Other) -> false.
+
+%% Sends the read to each StorageServer in the order, until one of them
+%% answers. `Code' is the error for the case that none answers.
+read_by_message([], _Query, _Version, _Timeout, Code) ->
+    error({erlfdb_error, Code});
+read_by_message([Storage | Storages], Query, Version, Timeout, Code) ->
+    Answer =
+        case Query of
+            {key, Key} -> deadlift_storage:read_with_version(Storage, Key, Version, Timeout);
+            {range, Begin, End} -> deadlift_storage:read_range_with_version(Storage, Begin, End, Version, Timeout)
         end,
-    case Handle of
-        none -> gone;
-        _ -> deadlift_storage:read_direct(Handle, Query, Version)
+    case Answer of
+        {error, transaction_too_old} -> error({erlfdb_error, ?TRANSACTION_TOO_OLD});
+        {error, {timeout, _}} -> read_by_message(Storages, Query, Version, Timeout, ?FUTURE_VERSION);
+        {error, _Reason} -> read_by_message(Storages, Query, Version, Timeout, Code);
+        Result -> Result
     end.
 
 %% ---------------------------------------------------------------------------
@@ -491,9 +592,9 @@ read_version(Table) ->
             end
     end.
 
-%% The Proxy or the StorageServer of the database of the transaction.
-server(Table, Role) ->
-    [{db, #{Role := Server}}] = ets:lookup(Table, db),
+%% The Proxy of the database of the transaction.
+server(Table, proxy) ->
+    [{db, #{proxy := Server}}] = ets:lookup(Table, db),
     case is_function(Server, 0) of
         true ->
             case Server() of

@@ -133,6 +133,20 @@
 %% one row for each version, and with a NIF. The benchmark is not part of
 %% this repository. See "The store of the StorageServer" in README.md.
 %%
+%% == Replicas ==
+%%
+%% Several StorageServers can run at the same time, on one node or on
+%% several nodes. Each of them has every key. Each of them reads every
+%% record from the LogServers, and has its own version, its own oldest
+%% version, its own tables and its own rollbacks. A LogServer keeps one
+%% request for each StorageServer. The StorageServers send no message to
+%% each other.
+%%
+%% Two StorageServers apply the same chain of records. At a read version,
+%% each of them returns the same result, or waits for the version, or
+%% answers that the read version is too old. The client chooses the
+%% StorageServer of a read (see {@link deadlift}).
+%%
 %% == MVCC window ==
 %%
 %% The StorageServer keeps the versions of the MVCC window (paper, section
@@ -164,8 +178,9 @@
 %%   below the MVCC window. A StorageServer of FoundationDB keeps the
 %%   versions of the MVCC window in memory and writes older data to disk.
 %%   This part is not in the paper.</li>
-%% <li>One StorageServer has every key. FoundationDB divides the key space
-%%   into shards, and a StorageServer reads the records with its tags.</li>
+%% <li>Each StorageServer has every key. FoundationDB divides the key
+%%   space into shards. Each shard has a team of StorageServers, and a
+%%   StorageServer reads the records with its tag.</li>
 %% <li>The StorageServer reads the log systems from the coordinated state.
 %%   A StorageServer of FoundationDB receives them from the
 %%   ClusterController. This part is not in the paper.</li>
@@ -177,7 +192,7 @@
 -behaviour(gen_server).
 
 -include("deadlift_eta.hrl").
--eta_observe({state, [version, data, rollbacks]}).
+-eta_observe({state, [version, oldest, data, rollbacks]}).
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1]).
@@ -196,7 +211,9 @@
 %% StorageServer keeps the writes above the end version of an epoch.
 %% `check_window => false' plants a second defect: the StorageServer
 %% answers a read below the oldest version. `clear => false' plants a third
-%% defect: the StorageServer does not apply a clear.
+%% defect: the StorageServer does not apply a clear. `wait => false' plants
+%% a fourth defect: the StorageServer answers a read at a version that it
+%% has not applied.
 -type options() :: #{
     coordinators := deadlift_cstate:servers(),
     poll_ms => pos_integer(),
@@ -204,13 +221,14 @@
     mvcc_window => pos_integer() | infinity,
     rollback => boolean(),
     check_window => boolean(),
-    clear => boolean()
+    clear => boolean(),
+    wait => boolean()
 }.
 
 %% The table of the data and the published versions of a StorageServer.
 %% Element 1 of `published' is the version, and element 2 is the oldest
-%% version.
--type handle() :: #{data := ets:tid(), published := atomics:atomics_ref()}.
+%% version. `wait' is `false' only with the planted defect `wait => false'.
+-type handle() :: #{data := ets:tid(), published := atomics:atomics_ref(), wait => boolean()}.
 
 -type query() :: {key, term()} | {range, term(), term()}.
 
@@ -222,6 +240,7 @@
     window :: pos_integer() | infinity,
     check_window :: boolean(),
     clear :: boolean(),
+    wait :: boolean(),
     %% The LSN of the last record that the StorageServer has applied.
     version = 0 :: version(),
     %% The oldest version that a read can have.
@@ -367,8 +386,8 @@ handle(Storage) ->
 %% <li>`gone': the table does not exist. The StorageServer has stopped.</li>
 %% </ul>
 -spec read_direct(handle(), query(), version()) -> {ok, term()} | behind | too_old | gone.
-read_direct(#{data := Data, published := Published}, Query, Version) ->
-    case atomics:get(Published, 1) >= Version of
+read_direct(Handle = #{data := Data, published := Published}, Query, Version) ->
+    case atomics:get(Published, 1) >= Version orelse not maps:get(wait, Handle, true) of
         false ->
             behind;
         true ->
@@ -410,6 +429,7 @@ init(Options = #{coordinators := Coordinators}) ->
         window = maps:get(mvcc_window, Options, ?MVCC_WINDOW),
         check_window = maps:get(check_window, Options, true),
         clear = maps:get(clear, Options, true),
+        wait = maps:get(wait, Options, true),
         data = ets:new(deadlift_storage_data, [ordered_set, protected, {read_concurrency, true}]),
         changes = ets:new(deadlift_storage_changes, [ordered_set, private]),
         buffer = gb_trees:empty(),
@@ -425,7 +445,7 @@ handle_call({read, Key, Version}, From, State) ->
 handle_call({read_range, Begin, End, Version}, From, State) ->
     read_at({range, Begin, End}, Version, From, State);
 handle_call(handle, _From, State = #state{data = Data, published = Published}) ->
-    {reply, #{data => Data, published => Published}, State};
+    {reply, #{data => Data, published => Published, wait => State#state.wait}, State};
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
     Epoch =
         case System of
@@ -757,7 +777,7 @@ prune([], _Oldest) ->
 %% has the version.
 read_at(_Query, Version, _From, State = #state{oldest = Oldest, check_window = true}) when Version < Oldest ->
     {reply, {error, transaction_too_old}, State};
-read_at(Query, Version, _From, State = #state{version = Mine}) when Version =< Mine ->
+read_at(Query, Version, _From, State = #state{version = Mine, wait = Wait}) when Version =< Mine; not Wait ->
     {reply, lookup(Query, Version, State#state.data), State};
 read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
     {noreply, State#state{waiting = [{From, Query, Version} | Waiting]}}.

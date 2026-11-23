@@ -77,6 +77,17 @@ commits and recoveries, and no run violates an invariant.
 - [x] Limit the versions in flight in the Sequencer, so that a discarded
       record has an LSN below every version of the next epoch.
 - [x] Kill the StorageServer in the simulation and start a new one.
+- [x] Run several StorageServers that each have every key, on one Erlang
+      node or on several. The client reads from a StorageServer that
+      answers.
+- [x] Find a LogServer on another Erlang node through the registry.
+- [x] Run a registry on each simulated node, and start each LogServer on
+      its own simulated node, so that the simulation covers the exchange
+      of names between registries.
+- [ ] Record the node of each LogServer in the coordinated state, as
+      FoundationDB records the interface of each LogServer, so that a
+      process can tell a LogServer whose name has not arrived from a
+      LogServer that does not run.
 - [x] Reduce the time of the simulation suite: run each test in a node of
       its own, with several nodes at the same time.
 - [ ] Find where a simulation run waits without the use of a processor,
@@ -122,7 +133,17 @@ has the basic functions. The remaining parts, in the planned order:
       ClusterController starts a Sequencer when a Sequencer or a LogServer
       fails.
 - [ ] Recruit LogServers on other nodes.
-- [ ] Shard the key space over StorageServers, with tags on log records.
+- [ ] Shard the key space over StorageServers, with tags on log records:
+  - [ ] A shard map from a key range to a team of StorageServers, fixed
+        at the start of the cluster.
+  - [ ] Tags on the mutations of a log record, and a tail request of a
+        StorageServer for its tag.
+  - [ ] A cache of the shard map in the client, and a read of a key range
+        over several shards.
+  - [ ] The copy of records in a recovery for each tag, in the code and in
+        the model.
+  - [ ] The shard map in system keys, changed by transactions, and the
+        move of a shard between StorageServers.
 - [ ] Run more than one Proxy and more than one Resolver.
 - [ ] Write the records of a LogServer to disk, and start a LogServer
       again from the disk.

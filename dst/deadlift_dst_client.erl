@@ -8,7 +8,7 @@
 
 -include("deadlift_eta.hrl").
 
--export([recover/4, transaction/5]).
+-export([recover/4, transaction/5, join/2, start_log/3, start_resolver/3, start_proxy/3]).
 -export([sequencer_node/1, proxy_node/1, log_node/1, resolver_node/1, storage_node/1, keys/0]).
 
 %% Starts a Sequencer, waits for the end of its recovery, and starts a
@@ -17,9 +17,10 @@
 %%
 %% `N' is the number of the operation. `Mode' selects a planted defect.
 recover(Tab, N, CState, Mode) ->
+    ok = join(Tab, Mode),
     %% Each LogServer runs on a simulated node of its own. The Sequencer
-    %% starts the LogServer, so the LogServer starts on the node of the
-    %% Sequencer, and is placed on its node at once.
+    %% starts the LogServer on that node through `erpc'. The call has a
+    %% limit of time, because the network can lose the request.
     Recruit = fun(Log = #{id := Id}) ->
         Log1 =
             case Mode of
@@ -28,24 +29,23 @@ recover(Tab, N, CState, Mode) ->
                 no_copy -> Log#{records := []};
                 _ -> Log
             end,
-        case deadlift_log:start(Log1) of
-            {ok, Pid} ->
-                ok = eta_net:place(log_node(Id), [Pid]),
-                true = ets:insert(Tab, {{node, log_node(Id)}, true}),
-                {ok, Pid};
-            Error ->
-                Error
+        ok = eta_net:place(log_node(Id), []),
+        try
+            erpc:call(log_node(Id), ?MODULE, start_log, [Tab, Log1, Mode], 1000)
+        catch
+            error:{erpc, Reason} -> {error, {erpc, Reason}};
+            Class:Reason -> {error, {Class, Reason}}
         end
     end,
     %% The Resolver of the epoch runs on a node of its own.
     RecruitResolver = fun(Resolver) ->
-        case deadlift_resolver:start(Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range}) of
-            {ok, Pid} ->
-                ok = eta_net:place(resolver_node(N), [Pid]),
-                true = ets:insert(Tab, {{node, resolver_node(N)}, true}),
-                {ok, Pid};
-            Error ->
-                Error
+        Options = Resolver#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range},
+        ok = eta_net:place(resolver_node(N), []),
+        try
+            erpc:call(resolver_node(N), ?MODULE, start_resolver, [Tab, Options, Mode], 1000)
+        catch
+            error:{erpc, Reason} -> {error, {erpc, Reason}};
+            Class:Reason -> {error, {Class, Reason}}
         end
     end,
     Options0 = #{
@@ -74,17 +74,21 @@ recover(Tab, N, CState, Mode) ->
                     _ -> all
                 end,
             %% The batch time of the Proxy is 0 ms, 5 ms or 50 ms of the
-            %% virtual clock.
-            {ok, Proxy} = deadlift_proxy:start(#{
+            %% virtual clock. The Proxy starts on a node of its own.
+            ProxyOptions = #{
                 sequencer => Sequencer,
                 ack => Ack,
                 report => Mode =/= no_report,
                 confirm => Mode =/= no_confirm,
                 batch_ms => lists:nth(N rem 3 + 1, [0, 5, 50])
-            }),
-            ok = eta_net:place(proxy_node(N), [Proxy]),
-            true = ets:insert(Tab, {{node, proxy_node(N)}, true}),
-            true = ets:insert(Tab, {{proxy, N}, Proxy, Epoch}),
+            },
+            ok = eta_net:place(proxy_node(N), []),
+            try erpc:call(proxy_node(N), ?MODULE, start_proxy, [Tab, ProxyOptions, Mode], 1000) of
+                {ok, Proxy} -> true = ets:insert(Tab, {{proxy, N}, Proxy, Epoch})
+            catch
+                %% The epoch has no Proxy.
+                _:_ -> true = ets:insert(Tab, {{no_proxy, N}, Epoch})
+            end,
             true = ets:insert(Tab, {{recovered, N}, Epoch, PEV, RV})
     catch
         exit:{{shutdown, {recovery, Reason}}, _Call} ->
@@ -93,6 +97,43 @@ recover(Tab, N, CState, Mode) ->
             %% The Sequencer was killed, or did not answer in time.
             true = ets:insert(Tab, {{recovery_failed, N}, {exit, reason(Reason)}})
     end.
+
+%% Starts the registry of the node of the caller, and connects the node to
+%% every node of the run that has a registry. The function does nothing if
+%% the node has a registry. With the planted defect `no_exchange', the
+%% registry sends no name to another registry.
+join(Tab, Mode) ->
+    Node = node(),
+    case deadlift_registry:start(#{exchange => Mode =/= no_exchange}) of
+        {ok, Registry} ->
+            Others = [Other || [Other] <- ets:match(Tab, {{registry, '$1'}, '_'}), Other =/= Node],
+            true = ets:insert(Tab, [{{node, Node}, true}, {{registry, Node}, Registry}]),
+            lists:foreach(fun(Other) -> net_kernel:connect_node(Other) end, lists:sort(Others));
+        {error, {already_started, _Registry}} ->
+            ok
+    end.
+
+%% Starts a LogServer on the node of the caller. `erpc' calls this
+%% function on the node of the LogServer.
+start_log(Tab, Log = #{id := Id}, Mode) ->
+    ok = join(Tab, Mode),
+    case deadlift_log:start(Log) of
+        {ok, Pid} ->
+            true = ets:insert(Tab, {{log, Id}, Pid}),
+            {ok, Pid};
+        Error ->
+            Error
+    end.
+
+%% Starts a Resolver on the node of the caller.
+start_resolver(Tab, Options, Mode) ->
+    ok = join(Tab, Mode),
+    deadlift_resolver:start(Options).
+
+%% Starts a Proxy on the node of the caller.
+start_proxy(Tab, Options, Mode) ->
+    ok = join(Tab, Mode),
+    deadlift_proxy:start(Options).
 
 %% Runs one transaction. `C' is the number of the client.
 %%
@@ -148,10 +189,16 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
         end,
     %% The transaction of the client library. Its Proxy is the Proxy that
     %% the row `{commit_proxy, C}' names at the time of the commit. Its
-    %% StorageServer is the StorageServer that runs at the time of a read.
+    %% StorageServers are the StorageServers that the table of the run has
+    %% at the time of a read. One of them can be killed, with its new
+    %% StorageServer not yet started. The client library reads the ETS
+    %% table of a StorageServer on the node of this process. 1 client in
+    %% 5 reads by message in every case.
+    Direct = R rem 5 =/= 0,
     Db = deadlift:open(#{
         proxy => fun() -> ets:lookup_element(Tab, {commit_proxy, C}, 2) end,
-        storage => fun() -> element(2, hd(ets:lookup(Tab, storage))) end
+        storage => fun() -> storages(Tab) end,
+        direct => Direct
     }),
     Tx = deadlift:create_transaction(Db),
     Start = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
@@ -163,8 +210,8 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
             true = ets:insert(Tab, {{read, C}, Read}),
             case read_keys(Tab, Tx, Reads, Ranges) of
-                {ok, Values, Generation} ->
-                    true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation}}),
+                {ok, Values, Generation, Down} ->
+                    true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation, down => Down, direct => Direct, local => node() =/= clients}}),
                     commit(Tab, C, Tx, Read, {Reads, Ranges}, Writes, Chosen, R);
                 {error, transaction_too_old} ->
                     %% The read version is below the MVCC window of the
@@ -184,9 +231,11 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
 %% return the LSN of the record that wrote a value. The harness finds that
 %% LSN in the records of the LogServers.
 read_keys(Tab, Tx, Keys, Ranges) ->
-    %% `Generation' is the number of StorageServers before the one that
-    %% runs. The harness starts a new StorageServer after a kill.
-    [{storage, _Storage, Generation, _Node}] = ets:lookup(Tab, storage),
+    %% `Generation' is the number of StorageServers that the harness
+    %% started after a kill. `Down' is the number of StorageServers that
+    %% are not alive, and the number of StorageServers.
+    Generation = lists:sum([G || [G] <- ets:match(Tab, {{storage, '_'}, '_', '$1', '_'})]),
+    Down = {length([x || Storage <- storages(Tab), not is_process_alive(Storage)]), length(storages(Tab))},
     try
         Single = [{Key, found(deadlift:wait(deadlift:get(Tx, Key)))} || Key <- Keys],
         InRanges = lists:append([
@@ -200,11 +249,15 @@ read_keys(Tab, Tx, Keys, Ranges) ->
             end
          || Range = {Begin, End} <- Ranges
         ]),
-        {ok, Single ++ InRanges, Generation}
+        {ok, Single ++ InRanges, Generation, Down}
     catch
         error:{erlfdb_error, 1007} -> {error, transaction_too_old};
         error:{erlfdb_error, Code} -> {error, Code}
     end.
+
+%% The StorageServers that the table of the run has.
+storages(Tab) ->
+    [Storage || [_Slot, Storage] <- lists:sort(ets:match(Tab, {{storage, '$1'}, '$2', '_', '_'}))].
 
 found(not_found) -> not_found;
 found(Value) -> {Value, unknown}.
@@ -287,9 +340,9 @@ proxy_node(N) -> list_to_atom("proxy_" ++ integer_to_list(N)).
 
 resolver_node(N) -> list_to_atom("resolver_" ++ integer_to_list(N)).
 
-%% The node of the StorageServer that the operation `N' started. The first
-%% StorageServer has the number 0.
-storage_node(N) -> list_to_atom("storage_" ++ integer_to_list(N)).
+%% The node of the StorageServer of the place `Slot' that the operation
+%% `N' started. The first StorageServer of a place has the number 0.
+storage_node({Slot, N}) -> list_to_atom(lists:concat(["storage_", Slot, "_", N])).
 
 log_node({Epoch, Index}) ->
     list_to_atom("log_" ++ integer_to_list(Epoch) ++ "_" ++ integer_to_list(Index)).

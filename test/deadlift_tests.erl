@@ -15,7 +15,9 @@ client_test_() ->
         fun(Db) -> {timeout, 30, fun() -> retry(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> two_processes(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> lifecycle(Db) end} end,
-        fun(Db) -> {timeout, 30, fun() -> too_old(Db) end} end
+        fun(Db) -> {timeout, 30, fun() -> too_old(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> replicas(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> replica_behind(Db) end} end
     ]}.
 
 setup() ->
@@ -262,3 +264,69 @@ too_old(Db) ->
         end)
     ),
     ?assertEqual(2, counters:get(Count, 1)).
+
+%% Three StorageServers. A read has the same result with direct reads and
+%% with reads by message. The reads continue after the stop of two of the
+%% three StorageServers, and fail with 1037 after the stop of the third.
+replicas({deadlift_database, Servers = #{storage := First}}) ->
+    Options = #{coordinators => coordinators(First), poll_ms => 5, mvcc_window => 20},
+    {ok, Second} = deadlift_storage:start(Options),
+    {ok, Third} = deadlift_storage:start(Options),
+    Direct = deadlift:open(Servers#{storage := [First, Second, Third]}),
+    Message = deadlift:open(Servers#{storage := fun() -> [First, Second, Third] end, direct => false}),
+    Read = fun(Db) -> deadlift:transactional(Db, fun(Tx) -> {deadlift:get(Tx, a), deadlift:get_range(Tx, a, z)} end) end,
+    %% Several transactions, so that the reads start at each of the three.
+    lists:foreach(
+        fun(N) ->
+            ok = deadlift:transactional(Direct, fun(Tx) -> deadlift:set(Tx, a, N) end),
+            ?assertEqual({N, [{a, N}]}, Read(Direct)),
+            ?assertEqual({N, [{a, N}]}, Read(Message))
+        end,
+        lists:seq(1, 6)
+    ),
+    ok = deadlift_storage:stop(First),
+    ok = deadlift_storage:stop(Third),
+    lists:foreach(
+        fun(N) ->
+            ok = deadlift:transactional(Direct, fun(Tx) -> deadlift:set(Tx, a, N) end),
+            ?assertEqual({N, [{a, N}]}, Read(Direct)),
+            ?assertEqual({N, [{a, N}]}, Read(Message))
+        end,
+        lists:seq(7, 12)
+    ),
+    ok = deadlift_storage:stop(Second),
+    Tx = deadlift:create_transaction(Direct),
+    ?assertError({erlfdb_error, 1037}, deadlift:get(Tx, a)),
+    ?assertError({erlfdb_error, 1037}, deadlift:get(deadlift:create_transaction(Message), a)),
+    %% A database without a StorageServer.
+    None = deadlift:open(Servers#{storage := fun() -> [] end}),
+    ?assertError({erlfdb_error, 1037}, deadlift:get(deadlift:create_transaction(None), a)).
+
+%% A second StorageServer that does not apply records: its coordinated
+%% state has no epoch. A read does not wait for it when the first
+%% StorageServer has the read version. With the second StorageServer
+%% alone, the read has the error 1009 after 5 seconds.
+replica_behind({deadlift_database, Servers = #{storage := First}}) ->
+    {ok, Empty} = deadlift_cstate_local:start(#{}),
+    {ok, Behind} = deadlift_storage:start(#{coordinators => {local, Empty}, poll_ms => 5}),
+    Db = deadlift:open(Servers#{storage := [First, Behind]}),
+    Message = deadlift:open(Servers#{storage := [Behind, First], direct => false}),
+    lists:foreach(
+        fun(N) ->
+            ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, a, N) end),
+            ?assertEqual(N, deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, a) end))
+        end,
+        lists:seq(1, 4)
+    ),
+    %% By message, the read waits for one half of 5 seconds at the
+    %% StorageServer that is behind, when that one is the first of the
+    %% order.
+    ?assertEqual(4, deadlift:transactional(Message, fun(Tx) -> deadlift:get(Tx, a) end)),
+    Alone = deadlift:open(Servers#{storage := Behind}),
+    Tx = deadlift:create_transaction(Alone),
+    ok = deadlift:set_read_version(Tx, deadlift:transactional(Db, fun(T) -> deadlift:get_read_version(T) end)),
+    ?assertError({erlfdb_error, 1009}, deadlift:get(Tx, a)).
+
+%% The coordinators of a StorageServer.
+coordinators(Storage) ->
+    element(2, sys:get_state(Storage)).
