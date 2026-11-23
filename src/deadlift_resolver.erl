@@ -62,7 +62,10 @@
 %%   `Cv - Window' is too old, and is not committed.</li>
 %% <li>A transaction without read keys is never too old.</li>
 %% <li>The Resolver removes the entries of `lastCommit' below
-%%   `Cv - Window'.</li>
+%%   `Cv - Window'. The removal examines every entry. The Resolver
+%%   therefore removes when the oldest version has risen by an eighth of
+%%   the window since the last removal. An entry that waits for its
+%%   removal gives no conflict.</li>
 %% </ul>
 %%
 %% The Resolver of a new epoch has no history. The first commit version of
@@ -162,6 +165,8 @@
 -opaque history() :: #{
     last_commit := gb_trees:tree(bound(), version()),
     oldest := integer(),
+    %% The oldest version at the last removal of entries.
+    pruned := integer(),
     window := pos_integer() | infinity
 }.
 
@@ -212,7 +217,7 @@ ref(Epoch) ->
 %% @doc A history without a transaction.
 -spec new(pos_integer() | infinity) -> history().
 new(Window) ->
-    #{last_commit => gb_trees:empty(), oldest => 0, window => Window}.
+    #{last_commit => gb_trees:empty(), oldest => 0, pruned => 0, window => Window}.
 
 %% @doc Checks the transaction `Transaction' with the commit version
 %% `Version'. Returns the result and the history after the transaction.
@@ -222,10 +227,17 @@ check(Transaction = #{read_version := ReadVersion}, Version, History) ->
     Reads = intervals(reads, read_ranges, Transaction),
     Writes = intervals(writes, write_ranges, Transaction),
     NewOldest = new_oldest(Version, Window, Oldest0),
-    LastCommit =
-        case NewOldest > Oldest0 of
-            true -> prune(NewOldest, LastCommit0);
-            false -> LastCommit0
+    %% The removal examines every entry, so the Resolver removes at an
+    %% interval of an eighth of the window, and not for every batch. An
+    %% entry below the oldest version gives no conflict before its
+    %% removal: a transaction with read keys and a read version below the
+    %% oldest version is too old, and the entry is at or below every other
+    %% read version.
+    Pruned0 = maps:get(pruned, History, 0),
+    {LastCommit, Pruned} =
+        case is_integer(Window) andalso NewOldest - Pruned0 >= max(1, Window div 8) of
+            true -> {prune(NewOldest, LastCommit0), NewOldest};
+            false -> {LastCommit0, Pruned0}
         end,
     Result =
         case ReadVersion < NewOldest andalso Reads =/= [] of
@@ -242,7 +254,7 @@ check(Transaction = #{read_version := ReadVersion}, Version, History) ->
             committed -> lists:foldl(fun({Begin, End}, Acc) -> set_version(Begin, End, Version, Acc) end, LastCommit, Writes);
             _ -> LastCommit
         end,
-    {Result, History#{last_commit := LastCommit1, oldest := NewOldest}}.
+    {Result, History#{last_commit := LastCommit1, oldest := NewOldest, pruned => Pruned}}.
 
 %% @doc Checks the transactions of one batch, in their order, with the
 %% commit version `Version'. Returns one result for each transaction, and

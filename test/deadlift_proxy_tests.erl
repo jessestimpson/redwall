@@ -16,7 +16,9 @@ proxy_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> transactions(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> versions(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> read_version_of_ended_epoch(Ids) end} end,
-        fun(Ids) -> {timeout, 30, fun() -> read_version_with_log_down(Ids) end} end
+        fun(Ids) -> {timeout, 30, fun() -> read_version_with_log_down(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> idle_batches(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> shared_read_versions(Ids) end} end
     ]}.
 
 setup() ->
@@ -83,7 +85,7 @@ commit(Ids) ->
     ?assertEqual({ok, 2}, deadlift_proxy:commit(Proxy, a)),
     ?assertEqual({ok, 3}, deadlift_proxy:commit(Proxy, b)),
     ?assertEqual({ok, 4}, deadlift_proxy:commit(Proxy, c)),
-    ?assertEqual(#{epoch => 1, kcv => 4, waiting => 0}, deadlift_proxy:info(Proxy)),
+    ?assertEqual(#{epoch => 1, kcv => 4, waiting => 0}, maps:remove(stats, deadlift_proxy:info(Proxy))),
     %% Every LogServer has every LSN. The record 4 carried the KCV 3.
     [?assertMatch(#{dv := 4, kcv := 3}, info(L)) || L <- Logs],
     %% Each body is on 2 of the 3 LogServers.
@@ -129,7 +131,7 @@ commits_at_once(Ids) ->
 %% and, after the batch time, one batch of 10 transactions.
 batches(Ids) ->
     {Sequencer, _Proxy, Logs} = epoch(Ids),
-    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300, batch_max => 20}),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300, batch_idle => false, batch_max => 20}),
     Answers = commit_at_once(Proxy, [#{writes => [{N, N}]} || N <- lists:seq(1, 50)]),
     Pairs = lists:sort([{LSN, Index} || {ok, LSN, Index} <- Answers]),
     Expected = [{2, I} || I <- lists:seq(0, 19)] ++ [{3, I} || I <- lists:seq(0, 19)] ++ [{4, I} || I <- lists:seq(0, 9)],
@@ -151,6 +153,65 @@ batches(Ids) ->
     ?assertEqual({ok, 5, 0}, deadlift_proxy:commit_with_index(Proxy, #{writes => [{a, 1}]}, 5000)),
     ?assert(erlang:monotonic_time(millisecond) - Start >= 300).
 
+%% A Proxy with the default options for a batch, and a batch time of
+%% 2,000 ms. A transaction that arrives at an idle Proxy does not wait for
+%% the batch time. 200 commits at the same time form batches while an
+%% earlier batch is in progress, and none of them waits for the batch
+%% time.
+idle_batches(Ids) ->
+    {Sequencer, _Proxy, Logs} = epoch(Ids),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 2000}),
+    Start = erlang:monotonic_time(millisecond),
+    ?assertEqual({ok, 2, 0}, deadlift_proxy:commit_with_index(Proxy, #{writes => [{a, 1}]}, 5000)),
+    ?assertEqual({ok, 3, 0}, deadlift_proxy:commit_with_index(Proxy, #{writes => [{a, 2}]}, 5000)),
+    Answers = commit_at_once(Proxy, [#{writes => [{N, N}]} || N <- lists:seq(1, 200)]),
+    ?assert(erlang:monotonic_time(millisecond) - Start < 1000),
+    Pairs = lists:sort([{LSN, Index} || {ok, LSN, Index} <- Answers]),
+    ?assertEqual(200, length(lists:usort(Pairs))),
+    LSNs = lists:usort([LSN || {LSN, _Index} <- Pairs]),
+    %% The indexes of each LSN start at 0 and have no gap.
+    lists:foreach(
+        fun(LSN) ->
+            Indexes = [Index || {L, Index} <- Pairs, L =:= LSN],
+            ?assertEqual(lists:seq(0, length(Indexes) - 1), Indexes)
+        end,
+        LSNs
+    ),
+    %% One batch is in progress at a time, so the LSNs have no gap.
+    ?assertEqual(lists:seq(4, 3 + length(LSNs)), LSNs),
+    #{stats := #{batches := Batches, transactions := 202}} = deadlift_proxy:info(Proxy),
+    ?assertEqual(2 + length(LSNs), Batches),
+    Last = lists:last(LSNs),
+    [?assertMatch(#{dv := Last}, info(L)) || L <- Logs].
+
+%% 300 clients ask for a read version at the same time. The Proxy answers
+%% each of them, and the requests that arrive during a confirmation share
+%% the next confirmation. A Proxy with `read_version_share => false' has
+%% one confirmation for each request.
+shared_read_versions(Ids) ->
+    {Sequencer, Proxy, _Logs} = epoch(Ids),
+    {ok, 2} = deadlift_proxy:commit(Proxy, #{writes => [{a, 1}]}),
+    Ask = fun(P) ->
+        Self = self(),
+        Clients = [spawn_link(fun() -> Self ! {self(), deadlift_proxy:read_version(P)} end) || _ <- lists:seq(1, 300)],
+        [
+            receive
+                {Client, Answer} -> Answer
+            after 5000 -> error(no_answer)
+            end
+         || Client <- Clients
+        ]
+    end,
+    ?assertEqual([{ok, 2}], lists:usort(Ask(Proxy))),
+    #{stats := #{read_versions := 300, read_rounds := Rounds}} = deadlift_proxy:info(Proxy),
+    ?assert(Rounds < 300, Rounds),
+    %% A read version after a commit is at or above the commit version.
+    {ok, 3} = deadlift_proxy:commit(Proxy, #{writes => [{a, 2}]}),
+    ?assertEqual({ok, 3}, deadlift_proxy:read_version(Proxy)),
+    {ok, Single} = deadlift_proxy:start(#{sequencer => Sequencer, read_version_share => false}),
+    ?assertEqual([{ok, 3}], lists:usort(Ask(Single))),
+    ?assertMatch(#{stats := #{read_versions := 300, read_rounds := 300}}, deadlift_proxy:info(Single)).
+
 order(Answers) ->
     [{LSN, Index} || {ok, LSN, Index} <- Answers].
 
@@ -158,7 +219,7 @@ order(Answers) ->
 %% the first one. The second one has a conflict with the first one.
 conflict_in_batch(Ids) ->
     {Sequencer, _Proxy, Logs} = epoch(Ids),
-    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300}),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300, batch_idle => false}),
     {ok, 1} = deadlift_proxy:read_version(Proxy),
     Answers = commit_at_once(Proxy, [
         #{read_version => 1, reads => [x], writes => [{x, a}]},
@@ -195,7 +256,7 @@ recovery_keeps_commits(Ids) ->
     ?assertEqual({error, commit_unknown_result}, deadlift_proxy:commit(P1, {one, 5})),
     ?assertEqual({shutdown, {log, 5, stopped}}, await_down(Monitor)),
     ?assertEqual({ok, 1005}, deadlift_proxy:commit(P2, {two, 1005})),
-    ?assertEqual(#{epoch => 2, kcv => 1005, waiting => 0}, deadlift_proxy:info(P2)).
+    ?assertEqual(#{epoch => 2, kcv => 1005, waiting => 0}, maps:remove(stats, deadlift_proxy:info(P2))).
 
 %% One LogServer is not alive. The Proxy cannot acknowledge a commit.
 log_down(Ids) ->
@@ -241,7 +302,7 @@ transactions(Ids) ->
         deadlift_proxy:commit(Proxy, #{read_version => 4, read_ranges => [{a, z}], writes => [{w, 5}]})
     ),
     {ok, 7} = deadlift_proxy:commit(Proxy, #{read_version => 5, read_ranges => [{a, z}], writes => [{w, 5}]}),
-    ?assertEqual(#{epoch => 1, kcv => 7, waiting => 0}, deadlift_proxy:info(Proxy)),
+    ?assertEqual(#{epoch => 1, kcv => 7, waiting => 0}, maps:remove(stats, deadlift_proxy:info(Proxy))),
     [?assertMatch(#{dv := 7}, info(L)) || L <- Logs],
     %% The records 4 and 6 have no transaction. Each body is on 2
     %% LogServers.

@@ -81,7 +81,12 @@ recover(Tab, N, CState, Mode) ->
                 ack => Ack,
                 report => Mode =/= no_report,
                 confirm => Mode =/= no_confirm,
-                batch_ms => lists:nth(N rem 3 + 1, [0, 5, 50])
+                batch_ms => lists:nth(N rem 3 + 1, [0, 5, 50]),
+                %% 1 Proxy in 2 closes a batch at once when no batch is
+                %% in progress, and 1 Proxy in 2 shares the confirmations
+                %% for read versions.
+                batch_idle => N rem 2 =:= 0,
+                read_version_share => N div 2 rem 2 =:= 0
             },
             ok = eta_net:place(proxy_node(N), []),
             try erpc:call(proxy_node(N), ?MODULE, start_proxy, [Tab, ProxyOptions, Mode], 1000) of
@@ -152,7 +157,10 @@ start_role(Tab, Node, Mode, Role, Options0) ->
         case {Role, Mode} of
             {log, no_copy} -> Options0#{records := []};
             {resolver, _} -> Options0#{check => Mode =/= no_check, check_ranges => Mode =/= no_range_check, check_batch => Mode =/= no_batch_check, check_write_ranges => Mode =/= no_write_range};
-            {proxy, _} -> Options0#{batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50])};
+            %% 1 Proxy in 2 closes a batch at once when no batch is in
+            %% progress, and 1 Proxy in 2 shares the confirmations for
+            %% read versions.
+            {proxy, _} -> Options0#{batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50]), batch_idle => Count rem 2 =:= 0, read_version_share => Count div 2 rem 2 =:= 0};
             _ -> Options0
         end,
     Start =

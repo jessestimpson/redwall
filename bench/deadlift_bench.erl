@@ -35,6 +35,11 @@
 %% <li>`read': the read of one key at a read version that the client has.
 %%   The clients are on the node of the benchmark and read by message, or
 %%   on the node of the StorageServer and read the ETS table.</li>
+%% <li>`read_after_write': a client commits a write, and reads the key at
+%%   the commit version. The row has the time of the read, which ends
+%%   when the StorageServer has applied the record.</li>
+%% <li>The mean times of the steps of a batch in the Proxy, from
+%%   `deadlift_proxy:info/1'.</li>
 %% <li>The time without an acknowledged commit after the kill of one
 %%   process: a LogServer, the Resolver, the Proxy, the Sequencer and the
 %%   ClusterController.</li>
@@ -58,7 +63,7 @@
 %% </ul>
 -module(deadlift_bench).
 
--export([main/0, main/1]).
+-export([main/0, main/1, depth/1]).
 -export([run/4, client/5]).
 
 -define(KEYS, 1000000).
@@ -83,28 +88,60 @@ main(Options) ->
         ]),
         ok = preload(Db),
         header(),
-        [row(write, N, run(write, Db, N, Ms)) || N <- Counts],
+        Writes = [with_stats(Proxy, N, fun() -> row(write, N, run(write, Db, N, Ms)) end) || N <- Counts],
         [row(read_write, N, run(read_write, Db, N, Ms)) || N <- Counts],
         row(conflict, 64, run(conflict, Db, 64, Ms)),
-        [row(read_version, N, run(read_version, Db, N, Ms)) || N <- Counts],
+        Versions = [with_stats(Proxy, N, fun() -> row(read_version, N, run(read_version, Db, N, Ms)) end) || N <- Counts],
+        [row(read_after_write, N, run(read_after_write, Db, N, Ms)) || N <- [1, 16]],
         [row(read_by_message, N, run(read, Db, N, Ms)) || N <- [1, 16, 64]],
         Direct = deadlift:open(#{proxy => Proxy, storage => Storage}),
         [row(read_direct, N, erpc:call(StorageNode, ?MODULE, run, [read, Direct, N, Ms], infinity)) || N <- [1, 2, 16]],
+        breakdown(Writes, Versions),
         io:format("~nThe default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):~n~n"),
         failures(Cluster)
     after
         stop_cluster(Cluster)
     end,
     %% A second cluster, whose ClusterController recruits 35 ms after a
-    %% failure. FoundationDB waits for that time
-    %% (`ATTEMPT_RECRUITMENT_DELAY').
-    Fast = start_cluster(#{retry_ms => 35}),
+    %% failure, and places the Sequencer, the Resolver and the Proxy on
+    %% one node. FoundationDB waits 35 ms (`ATTEMPT_RECRUITMENT_DELAY').
+    Fast = #{storage := Storage2} = start_cluster(#{retry_ms => 35, stateless => together}),
     try
-        io:format("~n`retry_ms` 35:~n~n"),
+        #{proxies := [Proxy2]} = db_info(Fast),
+        Db2 = deadlift:open(#{proxy => Proxy2, storage => Storage2, direct => false}),
+        io:format("~nThe Sequencer, the Resolver and the Proxy on one node (`stateless` `together`):~n~n"),
+        header(),
+        Writes2 = [with_stats(Proxy2, N, fun() -> row(write, N, run(write, Db2, N, Ms)) end) || N <- Counts],
+        [row(read_write, N, run(read_write, Db2, N, Ms)) || N <- Counts],
+        Versions2 = [with_stats(Proxy2, N, fun() -> row(read_version, N, run(read_version, Db2, N, Ms)) end) || N <- Counts],
+        breakdown(Writes2, Versions2),
+        io:format("~n`retry_ms` 35 and `stateless` `together`:~n~n"),
         failures(Fast)
     after
         stop_cluster(Fast)
     end.
+
+%% @doc Measures `write' for several values of the option `batch_depth' of
+%% the Proxy, with the Sequencer, the Resolver and the Proxy on one node
+%% or on three nodes. Each value has a cluster of its own.
+depth(Options) ->
+    Ms = round(1000 * maps:get(seconds, Options, 3)),
+    lists:foreach(
+        fun({Stateless, Depth}) ->
+            Cluster = #{storage := Storage} = start_cluster(#{stateless => Stateless, proxy => #{batch_depth => Depth}}),
+            try
+                #{proxies := [Proxy]} = db_info(Cluster),
+                Db = deadlift:open(#{proxy => Proxy, storage => Storage, direct => false}),
+                io:format("~n`stateless` `~s`, `batch_depth` ~b:~n~n", [Stateless, Depth]),
+                header(),
+                Writes = [with_stats(Proxy, N, fun() -> row(write, N, run(write, Db, N, Ms)) end) || N <- [1, 16, 64, 256]],
+                breakdown(Writes, [])
+            after
+                stop_cluster(Cluster)
+            end
+        end,
+        [{Stateless, Depth} || Stateless <- maps:get(stateless, Options, [together, spread]), Depth <- maps:get(depths, Options, [1, 2, 4, 8])]
+    ).
 
 %% ---------------------------------------------------------------------------
 %% Runs
@@ -153,10 +190,13 @@ loop(Op, Context, Measure, End, Latencies, Attempts) ->
         true ->
             {Latencies, Attempts};
         false ->
-            Tried = op(Op, Context),
-            T1 = erlang:monotonic_time(microsecond),
+            {Us, Tried} =
+                case op(Op, Context) of
+                    {time, Time} -> {Time, 1};
+                    Count -> {erlang:monotonic_time(microsecond) - T0, Count}
+                end,
             case T0 >= Measure of
-                true -> loop(Op, Context, Measure, End, [T1 - T0 | Latencies], Attempts + Tried);
+                true -> loop(Op, Context, Measure, End, [Us | Latencies], Attempts + Tried);
                 false -> loop(Op, Context, Measure, End, Latencies, Attempts)
             end
     end.
@@ -173,6 +213,10 @@ op(conflict, Db) ->
 op(read_version, {deadlift_database, #{proxy := Proxy}}) ->
     {ok, _Version} = deadlift_proxy:read_version(Proxy),
     1;
+op(read_after_write, Db) ->
+    %% The loop measures this whole operation. The row of the table has
+    %% the time of the read only, which `read_after_write/1' returns.
+    read_after_write(Db);
 op(read, Tx) ->
     _ = deadlift:wait(deadlift:get(Tx, rand:uniform(10000))),
     1.
@@ -187,6 +231,21 @@ read_write(Db, Keys) ->
         deadlift:set(Tx, Write, value())
     end),
     counters:get(Counter, 1).
+
+%% Commits a write, and reads the key at the commit version. The read
+%% returns when the StorageServer has applied the record. The result is
+%% the time of the read in microseconds, as `{time, Us}'.
+read_after_write(Db) ->
+    Key = rand:uniform(?KEYS),
+    Tx = deadlift:create_transaction(Db),
+    ok = deadlift:set(Tx, Key, value()),
+    ok = deadlift:wait(deadlift:commit(Tx)),
+    Version = deadlift:get_committed_version(Tx),
+    Read = deadlift:create_transaction(Db),
+    ok = deadlift:set_read_version(Read, Version),
+    T0 = erlang:monotonic_time(microsecond),
+    _ = deadlift:wait(deadlift:get(Read, Key)),
+    {time, erlang:monotonic_time(microsecond) - T0}.
 
 %% A value of 100 bytes.
 value() ->
@@ -221,6 +280,40 @@ row(Label, Clients, #{count := Count, us := Us, latencies := Latencies, attempts
         percentile(Latencies, Count, 0.999),
         Attempts / max(1, Count)
     ]).
+
+%% Runs `Fun', and returns the number of clients with the sums that the
+%% Proxy added in that time (`deadlift_proxy:info/1').
+with_stats(Proxy, Clients, Fun) ->
+    #{stats := Before} = deadlift_proxy:info(Proxy),
+    _ = Fun(),
+    #{stats := After} = deadlift_proxy:info(Proxy),
+    {Clients, maps:map(fun(Key, Value) -> Value - maps:get(Key, Before, 0) end, After)}.
+
+%% Prints the times of the steps of a batch in the Proxy, and the
+%% confirmations for read versions.
+breakdown(Writes, Versions) ->
+    io:format("~nThe steps of a `write` batch in the Proxy, as the mean time of a batch:~n~n"),
+    io:format("| Clients | Transactions per batch | Wait for the close (us) | Commit version (us) | Resolver (us) | LogServers (us) | Report (us) |~n"),
+    io:format("|---|---|---|---|---|---|---|~n"),
+    lists:foreach(
+        fun({Clients, Stats = #{batches := Batches, transactions := Transactions}}) ->
+            Mean = fun(Key) -> round(maps:get(Key, Stats, 0) / max(1, Batches)) end,
+            io:format("| ~b | ~.1f | ~b | ~b | ~b | ~b | ~b |~n", [
+                Clients, Transactions / max(1, Batches), Mean(wait_us), Mean(version_us), Mean(resolve_us), Mean(push_us), Mean(report_us)
+            ])
+        end,
+        Writes
+    ),
+    io:format("~nThe confirmations of the Proxy for `read_version`:~n~n"),
+    io:format("| Clients | Requests per confirmation | Time of a confirmation (us) |~n"),
+    io:format("|---|---|---|~n"),
+    lists:foreach(
+        fun({Clients, Stats}) ->
+            Rounds = max(1, maps:get(read_rounds, Stats, 0)),
+            io:format("| ~b | ~.1f | ~b |~n", [Clients, maps:get(read_versions, Stats, 0) / Rounds, round(maps:get(read_us, Stats, 0) / Rounds)])
+        end,
+        Versions
+    ).
 
 percentile(_Latencies, 0, _P) ->
     0;

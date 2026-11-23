@@ -189,3 +189,26 @@ order_test_() ->
             ?assertEqual({error, {handled, 101}}, gen_server:call(Resolver, {resolve, 7, 100, 101, [txn(100, [], [a])]})),
             ok = deadlift_resolver:stop(Resolver)
         end}.
+
+%% The Resolver removes old entries at an interval of an eighth of the
+%% window. An entry that waits for its removal gives no conflict, and a
+%% read version below the oldest version is too old.
+prune_interval_test() ->
+    Write = fun(Key) -> #{read_version => 0, reads => [], writes => [Key]} end,
+    Read = fun(Key, Version) -> #{read_version => Version, reads => [Key], writes => []} end,
+    H0 = deadlift_resolver:new(80),
+    {committed, H1} = deadlift_resolver:check(Write(a), 3, H0),
+    %% The oldest version is 5, which is less than 10 above the last
+    %% removal at 0. The entry of `a' stays.
+    {committed, H2} = deadlift_resolver:check(Write(b), 85, H1),
+    ?assertEqual(4, gb_trees:size(maps:get(last_commit, H2))),
+    ?assertMatch({too_old, _}, deadlift_resolver:check(Read(a, 4), 86, H2)),
+    ?assertMatch({committed, _}, deadlift_resolver:check(Read(a, 6), 86, H2)),
+    ?assertMatch({conflict, _}, deadlift_resolver:check(Read(b, 84), 86, H2)),
+    %% The oldest version is 10. The Resolver removes the entry of `a'.
+    {committed, H3} = deadlift_resolver:check(Write(c), 90, H2),
+    ?assertEqual(4, gb_trees:size(maps:get(last_commit, H3))),
+    ?assertMatch({conflict, _}, deadlift_resolver:check(Read(b, 84), 91, H3)),
+    %% Every entry is below the oldest version 400.
+    {committed, H4} = deadlift_resolver:check(#{read_version => 0, reads => [], writes => []}, 480, H3),
+    ?assertEqual(0, gb_trees:size(maps:get(last_commit, H4))).

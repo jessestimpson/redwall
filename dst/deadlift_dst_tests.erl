@@ -83,7 +83,7 @@ calm_shard(Shard) ->
         ok = write_stats({calm, Shard}, Stats),
         ?assert(maps:get(acks, Stats, 0) > 1000, Stats),
         ?assert(maps:get(recoveries, Stats, 0) > 25, Stats),
-        ?assert(maps:get(batched, Stats, 0) > 100, Stats),
+        ?assert(maps:get(batched, Stats, 0) > 60, Stats),
         ?assert(maps:get(range_acks, Stats, 0) > 100, Stats)
     end}.
 
@@ -130,7 +130,7 @@ faults_shard(Shard) ->
         ?assert(maps:get(clears, Stats, 0) > 15, Stats),
         %% Acknowledged transactions had their LSN together with another
         %% acknowledged transaction.
-        ?assert(maps:get(batched, Stats, 0) > 25, Stats),
+        ?assert(maps:get(batched, Stats, 0) > 10, Stats),
         ?assert(maps:get(rollbacks, Stats, 0) > 2, Stats),
         %% Reads were below the MVCC window of the StorageServer. With the
         %% direct reads of the client library, a shard has 2 to 15 of

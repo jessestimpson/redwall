@@ -199,6 +199,27 @@ placement_test_() ->
         end)
     end}.
 
+%% With `stateless => together', the Sequencer, the Resolver and the Proxy
+%% are on one worker of the class `stateless'.
+together_test_() ->
+    {timeout, 60, fun() ->
+        with_controller(#{min_workers => 3, stateless => together}, fun(Controller, _CState) ->
+            L1 = fake(Controller, l1, log),
+            S1 = fake(Controller, s1, stateless),
+            S2 = fake(Controller, s2, stateless),
+            {recruiting, 1, Plan1} = next(recruiting),
+            #{sequencer := First, resolver := First, proxy := First} = Plan1,
+            ?assert(lists:member(First, [S1, S2])),
+            ?assertEqual(L1, hd(maps:get(logs, Plan1))),
+            {recovered, #{epoch := 1}} = next(recovered),
+            %% The next attempt uses the other worker of the class.
+            ok = deadlift_cluster_controller:force_recovery(Controller),
+            {recruiting, 2, #{sequencer := Second, resolver := Second, proxy := Second}} = next(recruiting),
+            ?assertEqual([S1, S2], lists:sort([First, Second])),
+            {recovered, #{epoch := 2}} = next(recovered)
+        end)
+    end}.
+
 %% A role does not start. The leader recruits again.
 start_failure_test_() ->
     {timeout, 60, fun() ->

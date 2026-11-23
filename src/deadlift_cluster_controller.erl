@@ -58,7 +58,11 @@
 %%   each. For the Sequencer, the Resolver and the Proxy, the workers of
 %%   the class `stateless' come first and the workers of the class `log'
 %%   last. The first three workers of this order receive one of these
-%%   roles each. With fewer workers, a worker receives several roles.</li>
+%%   roles each. With fewer workers, a worker receives several roles.
+%%   With the option `stateless => together', the first worker of this
+%%   order receives the three roles. A message between two of them then
+%%   stays inside one node. The failure of each of the three roles starts
+%%   a recovery in both cases.</li>
 %% <li>The leader starts the Sequencer. The Sequencer performs the
 %%   recovery, and starts the LogServers and the Resolver on the chosen
 %%   workers.</li>
@@ -138,6 +142,10 @@
     logs => pos_integer(),
     replication => pos_integer(),
     min_workers => pos_integer(),
+    %% `spread' places the Sequencer, the Resolver and the Proxy on three
+    %% workers. `together' places them on one worker. The default is
+    %% `spread'.
+    stateless => spread | together,
     sequencer => map(),
     proxy => map(),
     poll_ms => pos_integer(),
@@ -450,7 +458,7 @@ maybe_recruit(State = #state{role = leader, generation = undefined, waiting = fa
     case map_size(Workers) >= maps:get(min_workers, Options, 1) of
         true ->
             Attempt = Attempt0 + 1,
-            Plan = plan(Workers, Logs, Attempt),
+            Plan = plan(Workers, Logs, Attempt, maps:get(stateless, Options, spread)),
             ok = notify({recruiting, Attempt, Plan}, State),
             Recruiter = spawn_monitor(?MODULE, recruit, [self(), Attempt, Plan, Options]),
             State#state{attempt = Attempt, generation = #generation{attempt = Attempt, recruiter = Recruiter}};
@@ -462,7 +470,7 @@ maybe_recruit(State) ->
 
 %% The workers of the roles of one attempt. The workers are in the order
 %% of their nodes, and the attempt selects the first worker.
-plan(Workers, Logs, Attempt) ->
+plan(Workers, Logs, Attempt, Stateless0) ->
     Sorted = lists:sort([{Node, Class, Worker} || {Worker, {Node, Class, _Monitor}} <- maps:to_list(Workers)]),
     Count = length(Sorted),
     %% The workers of one rank in the order of their nodes, with a first
@@ -484,11 +492,18 @@ plan(Workers, Logs, Attempt) ->
     ForLogs = Order(#{log => 0, unset => 1, stateless => 2}),
     Stateless = Order(#{stateless => 0, unset => 1, log => 2}),
     Nth = fun(N, List) -> lists:nth(N rem Count + 1, List) end,
+    %% With `together', the three roles are on the first worker of the
+    %% order.
+    Step =
+        case Stateless0 of
+            spread -> 1;
+            together -> 0
+        end,
     #{
         logs => [Nth(N, ForLogs) || N <- lists:seq(0, Logs - 1)],
         sequencer => Nth(0, Stateless),
-        resolver => Nth(1, Stateless),
-        proxy => Nth(2, Stateless)
+        resolver => Nth(Step, Stateless),
+        proxy => Nth(2 * Step, Stateless)
     }.
 
 %% @private

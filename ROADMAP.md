@@ -66,8 +66,19 @@ commits and recoveries, and no run violates an invariant.
       in the StorageServer.
 - [x] Collect the transactions of a short time into one batch with one
       commit version in the Proxy.
+- [x] Close a batch at once when no batch is in progress, and share one
+      confirmation among the requests for a read version.
 - [ ] Change the time of a batch with the load, as FoundationDB does, and
       limit the bytes of a batch.
+- [ ] Remove the old entries of the Resolver without an examination of
+      every entry. Today the Resolver examines every entry at an interval
+      of an eighth of the MVCC window. The choice between implementations
+      needs a benchmark.
+- [ ] Find the cause of the p99.9 of a commit in the benchmark, which is
+      1 ms to 85 ms.
+- [ ] Decide the defaults of `retry_ms` (500 ms today, 35 ms in
+      FoundationDB) and of the placement of the Sequencer, the Resolver
+      and the Proxy (`spread` today) from the benchmark.
 - [x] Kill the Resolver in the simulation.
 - [x] Implement a StorageServer that pulls records from the LogServers,
       answers reads at a version, and discards the records above the

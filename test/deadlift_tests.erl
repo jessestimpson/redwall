@@ -252,6 +252,9 @@ too_old(Db) ->
     Tx = deadlift:create_transaction(Db),
     Old = deadlift:get_read_version(Tx),
     [ok = deadlift:transactional(Db, fun(T) -> deadlift:set(T, x, N) end) || N <- lists:seq(1, 40)],
+    %% A read at a new read version returns when the StorageServer has
+    %% applied the 40 records.
+    ?assertEqual(40, deadlift:transactional(Db, fun(T) -> deadlift:get(T, x) end)),
     ?assertError({erlfdb_error, 1007}, deadlift:get(Tx, x)),
     ?assertError({erlfdb_error, 1007}, deadlift:get_range(Tx, a, z)),
     Count = counters:new(1, []),

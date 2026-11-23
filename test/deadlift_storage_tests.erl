@@ -185,7 +185,7 @@ all_data(Storage) ->
 batch(Ids) ->
     Options = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0},
     {ok, Sequencer} = deadlift_sequencer:start(Options),
-    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300}),
+    {ok, Proxy} = deadlift_proxy:start(#{sequencer => Sequencer, batch_ms => 300, batch_idle => false}),
     Storage = storage(Ids),
     Self = self(),
     Clients = [

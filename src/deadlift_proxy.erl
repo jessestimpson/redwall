@@ -18,6 +18,16 @@
 %%   epoch is live (`deadlift_log:confirm/2').</li>
 %% </ul>
 %%
+%% The requests of several clients share these messages. While the Proxy
+%% waits for the answers of one confirmation, the requests that arrive
+%% wait. When the Proxy has answered the clients of that confirmation, it
+%% starts one confirmation for all the requests that wait. A request does
+%% not use a confirmation that started before the request arrived, because
+%% the read version of that confirmation can be below a commit that was
+%% acknowledged in between. The GrvProxy of FoundationDB also answers a
+%% batch of requests with one read version. The option
+%% `read_version_share => false' gives each request its own messages.
+%%
 %% The Proxy answers the client when the Sequencer and k LogServers have
 %% answered, where k is the replication degree. FoundationDB has the same
 %% rule (`getLiveCommittedVersion' in `fdbserver/GrvProxyServer.actor.cpp'
@@ -50,15 +60,25 @@
 %%
 %% The Proxy collects the transactions that arrive in a short time into
 %% one batch. A batch has one commit version and is one log record (paper,
-%% section 2.4.1). The Proxy closes a batch in two cases:
+%% section 2.4.1). The Proxy closes a batch in three cases:
 %%
 %% <ul>
+%% <li>Fewer than `batch_depth' earlier batches are in progress, and none
+%%   of them waits for the Resolver. The default of `batch_depth' is 1. A
+%%   transaction that arrives at an idle Proxy is then a batch of its
+%%   own, and does not wait for a timer. While a batch is in progress,
+%%   the transactions that arrive form the next batch, and the Proxy
+%%   closes that batch when the Sequencer has the report of the earlier
+%%   one. The option `batch_idle => false' removes this case.</li>
 %% <li>`batch_ms' milliseconds have passed since the first transaction of
 %%   the batch arrived. The default is 1 ms. With 0, the batch has the
 %%   transactions that are in the message queue of the Proxy at that
 %%   time.</li>
 %% <li>The batch has `batch_max' transactions. The default is 1,000.</li>
 %% </ul>
+%%
+%% The first case is not taken from FoundationDB, which changes the time
+%% of a batch with the load. This part is not in the paper.
 %%
 %% The order of the transactions in a batch is the order of their arrival.
 %% The index of a transaction is its position in the batch, from 0.
@@ -177,7 +197,15 @@
     %% The time of a batch in milliseconds, and the highest number of
     %% transactions in a batch.
     batch_ms => non_neg_integer(),
-    batch_max => pos_integer()
+    batch_max => pos_integer(),
+    %% Whether the Proxy closes a batch at once when fewer than
+    %% `batch_depth' batches are in progress. The defaults are `true' and
+    %% 1.
+    batch_idle => boolean(),
+    batch_depth => pos_integer(),
+    %% Whether the requests for a read version that arrive during a
+    %% confirmation share the next confirmation. The default is `true'.
+    read_version_share => boolean()
 }.
 
 %% A transaction. `reads' are the keys that the transaction read at
@@ -210,12 +238,17 @@
     %% The entries of the batch, in the order of the batch.
     entries :: [term()],
     %% The number of LogServers that have not answered.
-    left = 0 :: non_neg_integer()
+    left = 0 :: non_neg_integer(),
+    %% The time of the last step of the batch, in microseconds.
+    time = 0 :: integer()
 }).
 
 %% A request for a read version that the Proxy has not answered.
 -record(read, {
-    from :: gen_server:from(),
+    %% The clients that this confirmation answers.
+    from :: [gen_server:from()],
+    %% The time of the start, in microseconds.
+    time = 0 :: integer(),
     %% The read version of the Sequencer, or `undefined' before the answer.
     version :: version() | undefined,
     %% The number of confirmations that the Proxy still needs.
@@ -244,6 +277,20 @@
     %% of each transaction, with the last transaction first.
     batch = [] :: [{gen_server:from(), deadlift_resolver:transaction(), term()}],
     batch_timer :: reference() | undefined,
+    batch_idle = true :: boolean(),
+    batch_depth = 1 :: pos_integer(),
+    %% The time at which the first transaction of the open batch arrived.
+    batch_opened = 0 :: integer(),
+    %% The number of batches that wait for the answer of the Resolver.
+    resolving = 0 :: non_neg_integer(),
+    read_version_share = true :: boolean(),
+    %% The number of the confirmation in progress that later requests for
+    %% a read version wait for, and those requests, newest first.
+    read_round :: pos_integer() | undefined,
+    read_queue = [] :: [gen_server:from()],
+    %% Sums for `info/1': numbers of batches and transactions, and times
+    %% in microseconds.
+    stats = #{} :: #{atom() => non_neg_integer()},
     reads = #{} :: #{pos_integer() => #read{}},
     next_read = 1 :: pos_integer()
 }).
@@ -330,8 +377,17 @@ read_version(Proxy, Timeout) ->
         exit:Reason -> {error, Reason}
     end.
 
+%% @doc Returns the epoch, the KCV, the number of batches in progress, and
+%% sums since the start of the Proxy in `stats'. The sums are the numbers
+%% of batches (`batches'), transactions (`transactions'), confirmations
+%% for read versions (`read_rounds') and answered requests for a read
+%% version (`read_versions'), and times in microseconds: from the arrival
+%% of the first transaction of a batch to the close of the batch
+%% (`wait_us'), for the commit version (`version_us'), for the Resolver
+%% (`resolve_us'), for the LogServers (`push_us'), for the report to the
+%% Sequencer (`report_us'), and for the confirmations (`read_us').
 -spec info(gen_server:server_ref()) ->
-    #{epoch := deadlift_cstate:epoch(), kcv := version(), waiting := non_neg_integer()}.
+    #{epoch := deadlift_cstate:epoch(), kcv := version(), waiting := non_neg_integer(), stats := #{atom() => non_neg_integer()}}.
 info(Proxy) ->
     gen_server:call(Proxy, info).
 
@@ -348,6 +404,9 @@ init(Options = #{sequencer := Sequencer}) ->
         confirm = maps:get(confirm, Options, true),
         batch_ms = maps:get(batch_ms, Options, 1),
         batch_max = maps:get(batch_max, Options, 1000),
+        batch_idle = maps:get(batch_idle, Options, true),
+        batch_depth = maps:get(batch_depth, Options, 1),
+        read_version_share = maps:get(read_version_share, Options, true),
         requests = gen_server:reqids_new()
     },
     {ok, State, {continue, start}}.
@@ -394,36 +453,22 @@ handle_call({commit, Transaction}, From, State = #state{batch = Batch, batch_ms 
         Max ->
             close_batch(State1);
         1 ->
-            {noreply, State1#state{batch_timer = erlang:send_after(Ms, self(), close_batch)}};
+            case idle(State1) of
+                true -> close_batch(State1#state{batch_opened = now_us()});
+                false -> {noreply, State1#state{batch_opened = now_us(), batch_timer = erlang:send_after(Ms, self(), close_batch)}}
+            end;
         _ ->
             {noreply, State1}
     end;
-handle_call(read_version, From, State = #state{sequencer = Sequencer, epoch = Epoch, logs = Logs, replication = K}) ->
-    #state{requests = Requests, reads = Reads, next_read = Id} = State,
-    Requests1 = gen_server:send_request(Sequencer, read_version, {live, Id}, Requests),
-    %% The Proxy sends to a LogServer only if the LogServer runs.
-    Pids =
-        case State#state.confirm of
-            true -> [deadlift_log:ref(Log) || Log <- Logs];
-            false -> []
-        end,
-    Running = [Pid || Pid <- Pids, Pid =/= undefined],
-    Requests2 = lists:foldl(
-        fun(Pid, Acc) -> gen_server:send_request(Pid, {confirm, Epoch}, {confirm, Id}, Acc) end,
-        Requests1,
-        Running
-    ),
-    Needed =
-        case State#state.confirm of
-            true -> K;
-            %% The planted defect `confirm => false'.
-            false -> 0
-        end,
-    Read = #read{from = From, needed = Needed, unreachable = length(Pids) - length(Running)},
-    State1 = State#state{requests = Requests2, reads = Reads#{Id => Read}, next_read = Id + 1},
-    read_progress(Id, noproc, State1);
+handle_call(read_version, From, State = #state{read_round = Round, read_queue = Queue}) when Round =/= undefined ->
+    %% A confirmation is in progress. Its read version can be below a
+    %% commit that was acknowledged before this request, so this request
+    %% waits for the next confirmation.
+    {noreply, State#state{read_queue = [From | Queue]}};
+handle_call(read_version, From, State) ->
+    confirm([From], State);
 handle_call(info, _From, State = #state{epoch = Epoch, kcv = KCV, commits = Commits}) ->
-    {reply, #{epoch => Epoch, kcv => KCV, waiting => map_size(Commits)}, State}.
+    {reply, #{epoch => Epoch, kcv => KCV, waiting => map_size(Commits), stats => State#state.stats}, State}.
 
 %% @private
 handle_cast(_Message, State) ->
@@ -461,13 +506,18 @@ handle_info(Message, State = #state{requests = Requests}) ->
 close_batch(State0 = #state{sequencer = Sequencer, epoch = Epoch, batch = Batch0, batch_timer = Timer}) ->
     _ = is_reference(Timer) andalso erlang:cancel_timer(Timer),
     Batch = lists:reverse(Batch0),
-    State = State0#state{batch = [], batch_timer = undefined},
+    Closed = now_us(),
+    State = add(
+        #{batches => 1, transactions => length(Batch), wait_us => Closed - State0#state.batch_opened},
+        State0#state{batch = [], batch_timer = undefined}
+    ),
     Clients = lists:enumerate(0, [From || {From, _Resolved, _Entry} <- Batch]),
     Entries = [Entry || {_From, _Resolved, Entry} <- Batch],
     try deadlift_sequencer:commit_version(Sequencer) of
         {ok, Epoch, Prev, LSN} ->
-            Commit = #commit{clients = Clients, prev = Prev, entries = Entries},
-            State1 = State#state{commits = (State#state.commits)#{LSN => Commit}},
+            Versioned = now_us(),
+            Commit = #commit{clients = Clients, prev = Prev, entries = Entries, time = Versioned},
+            State1 = add(#{version_us => Versioned - Closed}, State#state{commits = (State#state.commits)#{LSN => Commit}}),
             %% The Proxy sends to a process only if the process runs. A
             %% request to a process that does not run would be answered by
             %% a `DOWN' message from the VM.
@@ -477,7 +527,7 @@ close_batch(State0 = #state{sequencer = Sequencer, epoch = Epoch, batch = Batch0
                 Resolver ->
                     Request = {resolve, Epoch, Prev, LSN, [Resolved || {_From, Resolved, _Entry} <- Batch]},
                     Requests = gen_server:send_request(Resolver, Request, {resolve, LSN}, State1#state.requests),
-                    {noreply, State1#state{requests = Requests}}
+                    {noreply, State1#state{requests = Requests, resolving = State1#state.resolving + 1}}
             end;
         {error, Reason} ->
             %% The Sequencer has assigned no version to this batch.
@@ -520,6 +570,38 @@ split(Transaction) when is_map(Transaction) ->
 split(Entry) ->
     {#{read_version => 0, reads => [], writes => []}, Entry}.
 
+%% Starts a confirmation for the clients `Froms': asks the Sequencer for
+%% the read version, and asks the LogServers whether the epoch is live.
+confirm(Froms, State = #state{sequencer = Sequencer, epoch = Epoch, logs = Logs, replication = K}) ->
+    #state{requests = Requests, reads = Reads, next_read = Id} = State,
+    Requests1 = gen_server:send_request(Sequencer, read_version, {live, Id}, Requests),
+    %% The Proxy sends to a LogServer only if the LogServer runs.
+    Pids =
+        case State#state.confirm of
+            true -> [deadlift_log:ref(Log) || Log <- Logs];
+            false -> []
+        end,
+    Running = [Pid || Pid <- Pids, Pid =/= undefined],
+    Requests2 = lists:foldl(
+        fun(Pid, Acc) -> gen_server:send_request(Pid, {confirm, Epoch}, {confirm, Id}, Acc) end,
+        Requests1,
+        Running
+    ),
+    Needed =
+        case State#state.confirm of
+            true -> K;
+            %% The planted defect `confirm => false'.
+            false -> 0
+        end,
+    Read = #read{from = Froms, time = now_us(), needed = Needed, unreachable = length(Pids) - length(Running)},
+    Round =
+        case State#state.read_version_share of
+            true -> Id;
+            false -> undefined
+        end,
+    State1 = State#state{requests = Requests2, reads = Reads#{Id => Read}, next_read = Id + 1, read_round = Round},
+    read_progress(Id, noproc, State1).
+
 %% Answers the request for a read version `Id' when the Sequencer and
 %% enough LogServers have answered. Stops the Proxy when more than m - k
 %% LogServers of the epoch do not run: the epoch cannot be confirmed, and
@@ -529,9 +611,19 @@ read_progress(Id, Reason, State = #state{logs = Logs, replication = K, reads = R
     case Reads of
         #{Id := #read{unreachable = N}} when N > length(Logs) - K ->
             fail({shutdown, {log, read_version, Reason}}, State);
-        #{Id := #read{from = From, version = Version, needed = 0}} when Version =/= undefined ->
-            gen_server:reply(From, {ok, Version}),
-            {noreply, State#state{reads = maps:remove(Id, Reads)}};
+        #{Id := #read{from = Froms, time = Time, version = Version, needed = 0}} when Version =/= undefined ->
+            lists:foreach(fun(From) -> gen_server:reply(From, {ok, Version}) end, Froms),
+            State1 = add(#{read_rounds => 1, read_versions => length(Froms), read_us => now_us() - Time}, State#state{reads = maps:remove(Id, Reads)}),
+            case State1 of
+                #state{read_round = Id, read_queue = []} ->
+                    {noreply, State1#state{read_round = undefined}};
+                #state{read_round = Id, read_queue = Queue} ->
+                    %% The requests that arrived during this confirmation
+                    %% share the next one.
+                    confirm(lists:reverse(Queue), State1#state{read_round = undefined, read_queue = []});
+                _ ->
+                    {noreply, State1}
+            end;
         _ ->
             {noreply, State}
     end.
@@ -555,8 +647,11 @@ answered({confirm, _Id}, {error, Reason}, State) ->
     %% A Sequencer of a later epoch has locked the LogServer. The epoch of
     %% the Proxy has ended.
     fail({shutdown, {log, read_version, Reason}}, State);
-answered({resolve, LSN}, Results, State = #state{commits = Commits}) when is_list(Results) ->
-    #{LSN := Commit = #commit{clients = Clients, entries = Entries}} = Commits,
+answered({resolve, LSN}, Results, State0 = #state{commits = Commits}) when is_list(Results) ->
+    #{LSN := Commit0 = #commit{clients = Clients, entries = Entries, time = Time}} = Commits,
+    Now = now_us(),
+    Commit = Commit0#commit{time = Now},
+    State = add(#{resolve_us => Now - Time}, State0#state{resolving = State0#state.resolving - 1}),
     %% The Proxy answers the client of each transaction that the Resolver
     %% did not admit. The entry of that transaction has no write.
     Resolved = lists:zipwith3(
@@ -578,7 +673,10 @@ answered({resolve, LSN}, Results, State = #state{commits = Commits}) when is_lis
     ),
     {Admitted, Entries1} = lists:unzip(Resolved),
     %% The LSN goes to the LogServers also when no transaction is admitted.
-    push(LSN, State#state{commits = Commits#{LSN := Commit#commit{clients = lists:append(Admitted), entries = Entries1}}});
+    case push(LSN, State#state{commits = Commits#{LSN := Commit#commit{clients = lists:append(Admitted), entries = Entries1}}}) of
+        {noreply, State1} -> close_if_idle(State1);
+        Other -> Other
+    end;
 answered({resolve, LSN}, {error, Reason}, State) ->
     fail({shutdown, {resolver, LSN, Reason}}, State);
 answered({push, LSN}, {ok, _DV}, State) ->
@@ -587,9 +685,9 @@ answered({push, LSN}, {error, Reason}, State) ->
     fail({shutdown, {log, LSN, Reason}}, State);
 answered({report, LSN}, ok, State = #state{commits = Commits}) ->
     case maps:take(LSN, Commits) of
-        {#commit{clients = Clients}, Commits1} ->
+        {#commit{clients = Clients, time = Time}, Commits1} ->
             ok = reply_committed(LSN, Clients),
-            {noreply, State#state{commits = Commits1}};
+            close_if_idle(add(#{report_us => now_us() - Time}, State#state{commits = Commits1}));
         error ->
             {noreply, State}
     end.
@@ -634,16 +732,17 @@ stored(LSN, State = #state{sequencer = Sequencer, kcv = KCV, requests = Requests
             %% The planted defect `report => false'.
             ok = reply_committed(LSN, Clients),
             {noreply, State#state{kcv = max(KCV, LSN), commits = maps:remove(LSN, Commits)}};
-        #{LSN := Commit = #commit{left = 1}} ->
+        #{LSN := Commit = #commit{left = 1, time = Time}} ->
             %% The Sequencer learns that the LSN is committed before the
             %% client does.
             Requests1 = gen_server:send_request(Sequencer, {committed, LSN}, {report, LSN}, Requests),
+            Now = now_us(),
             State1 = State#state{
                 kcv = max(KCV, LSN),
                 requests = Requests1,
-                commits = Commits#{LSN := Commit#commit{left = 0}}
+                commits = Commits#{LSN := Commit#commit{left = 0, time = Now}}
             },
-            {noreply, State1};
+            {noreply, add(#{push_us => Now - Time}, State1)};
         #{LSN := Commit = #commit{left = N}} when N > 1 ->
             {noreply, State#state{commits = Commits#{LSN := Commit#commit{left = N - 1}}}};
         _ ->
@@ -651,6 +750,29 @@ stored(LSN, State = #state{sequencer = Sequencer, kcv = KCV, requests = Requests
             %% with the planted defect `ack => replicas'.
             {noreply, State}
     end.
+
+%% Whether the Proxy closes the open batch at once: no earlier batch
+%% waits for the Resolver, and fewer than `batch_depth' batches are in
+%% progress.
+idle(#state{batch_idle = Idle, resolving = Resolving, commits = Commits, batch_depth = Depth}) ->
+    Idle andalso Resolving =:= 0 andalso map_size(Commits) < Depth.
+
+%% Closes the open batch, which has the transactions that arrived while
+%% earlier batches were in progress, if the Proxy is idle now.
+close_if_idle(State = #state{batch = [_ | _]}) ->
+    case idle(State) of
+        true -> close_batch(State);
+        false -> {noreply, State}
+    end;
+close_if_idle(State) ->
+    {noreply, State}.
+
+now_us() ->
+    erlang:monotonic_time(microsecond).
+
+%% Adds to the sums of `info/1'.
+add(Sums, State = #state{stats = Stats}) ->
+    State#state{stats = maps:merge_with(fun(_Key, A, B) -> A + B end, Stats, Sums)}.
 
 fail(Reason, State) ->
     {stop, Reason, unknown(State)}.
