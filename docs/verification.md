@@ -10,6 +10,23 @@
 The models have 10 planted bugs. TLC finds a counterexample for each. See
 [formal/README.md](../formal/README.md).
 
+## Dependencies
+
+The verification of redwall depends on the verification of
+[peace](https://github.com/jessestimpson/peace):
+
+- redwall stores the coordinated state in a peace cluster. The recovery
+  and the election of the ClusterController are correct only if peace
+  decides one value for each operation on the coordinated state.
+- The models of redwall treat the coordinated state as one register with
+  atomic operations. Most simulation runs of redwall use one process in
+  the place of the peace cluster.
+- peace has its own verification. See the README of peace.
+
+The dependencies form a sequence: etx depends on redwall, and redwall
+depends on peace. A result of a higher level holds only if the
+verification of each level below it holds.
+
 ## Simulation
 
 `make dst` runs the system under the scheduler and the simulated network

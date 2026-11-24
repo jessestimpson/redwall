@@ -153,6 +153,21 @@ transactions conflict, and a read returns the last acknowledged write at
 or below its read version. See
 [docs/verification.md](docs/verification.md).
 
+The verification of redwall depends on the verification of
+[peace](https://github.com/jessestimpson/peace):
+
+- redwall stores the coordinated state in a peace cluster. The recovery
+  and the election of the ClusterController are correct only if peace
+  decides one value for each operation on the coordinated state.
+- The models of redwall treat the coordinated state as one register with
+  atomic operations. Most simulation runs of redwall use one process in
+  the place of the peace cluster.
+- peace has its own verification. See the README of peace.
+
+The dependencies form a sequence: etx depends on redwall, and redwall
+depends on peace. A result of a higher level holds only if the
+verification of each level below it holds.
+
 GitHub Actions runs the unit tests and the simulation on each push to
 `main` and on each pull request, and the quick TLC configs when a file
 in `formal/` changes.
