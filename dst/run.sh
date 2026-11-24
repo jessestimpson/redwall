@@ -1,12 +1,12 @@
 #!/bin/sh
-# Runs the simulation suite, dst/deadlift_dst_tests.erl. Each test runs in
+# Runs the simulation suite, dst/redwall_dst_tests.erl. Each test runs in
 # an Erlang node of its own, and several nodes run at the same time.
 #
 # Usage: dst/run.sh [-j JOBS] [TEST...]
 #
 #   -j JOBS  The number of nodes that run at the same time. The default is
 #            the number of processors minus 2, and at least 1.
-#   TEST     The name of a test of deadlift_dst_tests, for example
+#   TEST     The name of a test of redwall_dst_tests, for example
 #            faults_1_test_. The default is every test.
 #
 # Each node has one scheduler thread. The output of each test is in
@@ -21,7 +21,7 @@ set -e
 cd "$(dirname "$0")/.."
 build=_build/dst+test
 logs=_build/dst-logs
-paths="-pa $PWD/$build/lib/deadlift/ebin -pa $PWD/$build/lib/deadlift/dst"
+paths="-pa $PWD/$build/lib/redwall/ebin -pa $PWD/$build/lib/redwall/dst"
 for dep in eta peace; do
     if [ -d "$build/checkouts/$dep" ]; then
         paths="$paths -pa $PWD/$build/checkouts/$dep/ebin"
@@ -39,8 +39,8 @@ if [ "$1" = "--one" ]; then
     start=$(date +%s)
     status=ok
     # shellcheck disable=SC2086
-    DEADLIFT_DST_DISK_DIR=$disk DEADLIFT_DST_STATS_DIR=$PWD/$logs erl +S 1 -noshell $paths -eval "
-        case eunit:test({generator, deadlift_dst_tests, $name}, [verbose]) of
+    REDWALL_DST_DISK_DIR=$disk REDWALL_DST_STATS_DIR=$PWD/$logs erl +S 1 -noshell $paths -eval "
+        case eunit:test({generator, redwall_dst_tests, $name}, [verbose]) of
             ok -> halt(0);
             _ -> halt(1)
         end." >"$logs/$name.log" 2>&1 || status=FAILED
@@ -68,7 +68,7 @@ if [ $# -gt 0 ]; then
 else
     # shellcheck disable=SC2086
     tests=$(erl -noshell $paths -eval '
-        Names = [atom_to_list(F) || {F, 0} <- deadlift_dst_tests:module_info(exports)],
+        Names = [atom_to_list(F) || {F, 0} <- redwall_dst_tests:module_info(exports)],
         [io:format("~s~n", [N]) || N <- Names, lists:suffix("_test_", N)],
         halt().')
 fi

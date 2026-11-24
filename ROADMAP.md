@@ -1,6 +1,6 @@
 # Roadmap
 
-deadlift follows the design of FoundationDB as the paper describes it. See
+redwall follows the design of FoundationDB as the paper describes it. See
 [README.md](README.md) for the sources.
 
 ## Current status
@@ -42,7 +42,7 @@ before the commit path is complete.
 - [x] Run the simulation with the network of eta: lost and delayed
       messages, and nodes that are cut off.
 - [x] Run the coordinated state on a peace cluster in the simulation.
-- [x] Require a disk for a coordinator (`deadlift_coordinator`), give the
+- [x] Require a disk for a coordinator (`redwall_coordinator`), give the
       coordinators a disk in the simulation, and start a killed
       coordinator again.
 - [ ] Replace a coordinator whose data is lost, and change the
@@ -117,7 +117,7 @@ commits and recoveries, and no run violates an invariant.
       its own, with several nodes at the same time.
 - [ ] Find where a simulation run waits without the use of a processor,
       which is about 30% of the time of a run. The wait is not in the
-      harness of deadlift. A change of eta needs the agreement of the
+      harness of redwall. A change of eta needs the agreement of the
       owner of eta.
 - [x] Keep only the versions of the MVCC window in the StorageServer.
 - [x] Write a client: get a read version, read, commit, retry on conflict.
@@ -129,13 +129,13 @@ and partitions.
 
 ### The API of erlfdb
 
-The goal is that deadlift replaces erlfdb in an application. The client
+The goal is that redwall replaces erlfdb in an application. The client
 has the basic functions. The remaining parts, in the planned order:
 
 - [x] `select/4`: evaluate an ETS match spec on a key range in the
       StorageServer with ETS tables. erlfdb has no such function.
 - [x] `get_mapped_range/4,5` with the mapper of FoundationDB, and the
-      tuple layer (`deadlift_tuple`). The argument `{term, Term}` is
+      tuple layer (`redwall_tuple`). The argument `{term, Term}` is
       reserved for a mapper that is an Erlang term.
 - [ ] A mapper that is an Erlang term, for `get_mapped_range`. The
       design is open. FoundationDB has no such mapper.
@@ -178,7 +178,7 @@ has the basic functions. The remaining parts, in the planned order:
         acknowledged in the time of the cache.
   - [ ] A read version without the confirmation of the LogServers, as
         `CAUSAL_READ_RISKY` of FoundationDB.
-- [ ] Run the test suite of erlfdb against deadlift.
+- [ ] Run the test suite of erlfdb against redwall.
 
 ### Milestone 3: Scale and operations
 
@@ -194,8 +194,8 @@ has the basic functions. The remaining parts, in the planned order:
 - [x] Let the worker start the candidate for the ClusterController of
       its node, as two linked processes. One process for both was
       considered and not done: the two state machines are simpler apart.
-- [x] Name the module of the process of an epoch `deadlift_epoch`. Its
-      earlier name was `deadlift_proxy`.
+- [x] Name the module of the process of an epoch `redwall_epoch`. Its
+      earlier name was `redwall_proxy`.
 - [ ] Decide whether a candidate replaces the ClusterController only
       after a majority of the coordinators has no heartbeat, as in
       FoundationDB. Today one candidate without a connection to the
@@ -225,12 +225,15 @@ has the basic functions. The remaining parts, in the planned order:
         the model.
   - [ ] The shard map in system keys, changed by transactions, and the
         move of a shard between StorageServers.
-- [ ] Decide how deadlift scales the conflict check and the entry point
+- [ ] Decide how redwall scales the conflict check and the entry point
       for clients. The Sequencer, the Resolver and the Proxy of an epoch
       are one process, so the items "more than one Proxy" and "more than
       one Resolver" of FoundationDB do not apply in their form.
 - [ ] Write the records of a LogServer to disk, and start a LogServer
       again from the disk.
+- [x] Copy the data of a StorageServer from another StorageServer, so
+      that a new StorageServer does not need every record of the
+      LogServers of every epoch.
 - [ ] Discard the records of a LogServer that every StorageServer has
       stored (the pop of FoundationDB).
 - [ ] Remove the LogServers of an ended epoch when no StorageServer needs

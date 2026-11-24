@@ -9,7 +9,7 @@ compile:
 test:
 	rebar3 eunit
 
-# Deterministic simulation with eta. See dst/deadlift_dst.erl. A node has
+# Deterministic simulation with eta. See dst/redwall_dst.erl. A node has
 # one scheduler thread, so that the scheduler of eta is the only source of
 # the order of the processes. `dst' runs each test in an Erlang node of its
 # own, and several nodes at the same time. See dst/run.sh. `dst-serial'
@@ -21,7 +21,7 @@ dst-serial:
 	ERL_FLAGS="+S 1" rebar3 as dst eunit
 
 # The benchmark of a cluster of 8 Erlang nodes on this computer. See
-# bench/deadlift_bench.erl.
+# bench/redwall_bench.erl.
 bench:
 	bench/run.sh
 

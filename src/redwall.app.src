@@ -1,0 +1,15 @@
+{application, redwall, [
+    {description, "The transaction system of FoundationDB, with peace in the role of the Coordinators"},
+    {vsn, "0.1.0"},
+    {registered, [redwall_sup]},
+    {mod, {redwall_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        peace
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+ ]}.

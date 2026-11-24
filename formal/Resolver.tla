@@ -18,7 +18,7 @@
 (*   - transactions with a read version, a set of read keys and a set of   *)
 (*     write keys.                                                         *)
 (*   - commit versions that rise by 1 to MaxStep, as the clock does in     *)
-(*     deadlift.                                                           *)
+(*     redwall.                                                           *)
 (*   - batches: several transactions with one commit version. The Resolver *)
 (*     checks them in the order of the batch.                              *)
 (*   - the start of a new epoch: a Resolver without history, and a first   *)
@@ -28,8 +28,8 @@
 (*   - LogServers, the recovery and the StorageServer. Recovery.tla models *)
 (*     them. This model assumes that a recovery keeps every record.        *)
 (*   - the bounds of a key range. A read range and a write range of        *)
-(*     deadlift are sets of keys in this model. The model does not have    *)
-(*     the ordered set of bounds that the Resolver of deadlift keeps.      *)
+(*     redwall are sets of keys in this model. The model does not have    *)
+(*     the ordered set of bounds that the Resolver of redwall keeps.      *)
 (*   - more than one Resolver in an epoch.                                 *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -111,7 +111,7 @@ Init ==
     /\ order = [t \in Txns |-> 0]
 
 \* A client starts transaction t with the read keys R and the write keys W.
-\* The read version is the last commit version. In deadlift, a Proxy
+\* The read version is the last commit version. In redwall, a Proxy
 \* reports every stored record to the Sequencer, so the read version
 \* reaches the last commit version. A client that waits before the commit
 \* has an older read version at the time of the commit.

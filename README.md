@@ -1,10 +1,10 @@
-# deadlift
+# redwall
 
-deadlift is an implementation of the transaction system of FoundationDB in
+redwall is an implementation of the transaction system of FoundationDB in
 Erlang. A [peace](https://github.com/jessestimpson/peace) cluster has the
 role of the Coordinators.
 
-deadlift follows this paper, and uses its terms:
+redwall follows this paper, and uses its terms:
 
 > Zhou et al., "FoundationDB: A Distributed Unbundled Transactional Key
 > Value Store", SIGMOD 2021.
@@ -15,7 +15,7 @@ calls it "the recovery document".
 
 ## Use cases
 
-deadlift is intended to support these use cases. deadlift supports none of
+redwall is intended to support these use cases. redwall supports none of
 them yet.
 
 - A general transactional key-value store, as FoundationDB is.
@@ -26,7 +26,7 @@ them yet.
 
 ## Status
 
-deadlift is at the start. The repository contains:
+redwall is at the start. The repository contains:
 
 - two TLA+ models, checked with TLC: one of the logging protocol, the
   recovery, read versions and the StorageServer, and one of the
@@ -58,22 +58,22 @@ erlfdb only. Every part keeps its data in memory. See
 In FoundationDB, consensus is not on the commit path. The Coordinators store
 a small record, the coordinated state. Every other part of the transaction
 system is created again in each epoch (paper, sections 2.3.4 and 2.3.5).
-deadlift keeps this design.
+redwall keeps this design.
 
-| Role in the paper | Function | In deadlift |
+| Role in the paper | Function | In redwall |
 |---|---|---|
-| Coordinators | Store the coordinated state | A peace cluster that runs [deadlift_cstate](src/deadlift_cstate.erl) |
-| ClusterController | Monitors the roles and recruits the Sequencer | [deadlift_cluster_controller](src/deadlift_cluster_controller.erl) and [deadlift_worker](src/deadlift_worker.erl). Not modelled |
-| Sequencer | Assigns read versions and commit versions, and performs the recovery | A role of the process of an epoch, [deadlift_epoch](src/deadlift_epoch.erl), with the rules in [deadlift_sequencer](src/deadlift_sequencer.erl) and [deadlift_recovery](src/deadlift_recovery.erl). The recovery, the recovery transaction and the versions are modelled in [formal/Recovery.tla](formal/Recovery.tla) |
-| Proxy | Gives read versions to clients and commits transactions | A role of the process of an epoch, [deadlift_epoch](src/deadlift_epoch.erl). The commit to the LogServers and the read version are modelled |
-| Resolver | Checks a transaction for conflicts | A role of the process of an epoch, with the functions of [deadlift_resolver](src/deadlift_resolver.erl). Modelled in [formal/Resolver.tla](formal/Resolver.tla) |
-| LogServer | Stores the log records of an epoch | [deadlift_log](src/deadlift_log.erl). Modelled |
-| StorageServer | Stores data and answers reads at a version | [deadlift_storage](src/deadlift_storage.erl). Modelled, without keys and values |
+| Coordinators | Store the coordinated state | A peace cluster that runs [redwall_cstate](src/redwall_cstate.erl) |
+| ClusterController | Monitors the roles and recruits the Sequencer | [redwall_cluster_controller](src/redwall_cluster_controller.erl) and [redwall_worker](src/redwall_worker.erl). Not modelled |
+| Sequencer | Assigns read versions and commit versions, and performs the recovery | A role of the process of an epoch, [redwall_epoch](src/redwall_epoch.erl), with the rules in [redwall_sequencer](src/redwall_sequencer.erl) and [redwall_recovery](src/redwall_recovery.erl). The recovery, the recovery transaction and the versions are modelled in [formal/Recovery.tla](formal/Recovery.tla) |
+| Proxy | Gives read versions to clients and commits transactions | A role of the process of an epoch, [redwall_epoch](src/redwall_epoch.erl). The commit to the LogServers and the read version are modelled |
+| Resolver | Checks a transaction for conflicts | A role of the process of an epoch, with the functions of [redwall_resolver](src/redwall_resolver.erl). Modelled in [formal/Resolver.tla](formal/Resolver.tla) |
+| LogServer | Stores the log records of an epoch | [redwall_log](src/redwall_log.erl). Modelled |
+| StorageServer | Stores data and answers reads at a version | [redwall_storage](src/redwall_storage.erl). Modelled, without keys and values |
 
 ### One process for an epoch
 
 The Sequencer, the Resolver and the Proxy of an epoch are one process in
-deadlift ([deadlift_epoch](src/deadlift_epoch.erl)). The sections below
+redwall ([redwall_epoch](src/redwall_epoch.erl)). The sections below
 use the names of the three roles for the parts of its work.
 
 - FoundationDB has one process for each role. A process of FoundationDB
@@ -90,7 +90,7 @@ use the names of the three roles for the parts of its work.
   needed.
 - A commit has one round trip between nodes, to the LogServers.
 - One process is one place for the conflict check. FoundationDB can add
-  Proxies and Resolvers on more machines. deadlift cannot, in this
+  Proxies and Resolvers on more machines. redwall cannot, in this
   design.
 
 This part is not in the paper.
@@ -167,7 +167,7 @@ LSN is the first commit version of the epoch, and its previous LSN is the
 RV. The process of the epoch sends it to every LogServer of the epoch,
 and gives its version to the conflict check of the Resolver. The read version at the
 start of an epoch is therefore the LSN of a record that exists, and a
-StorageServer reaches it. The recovery transaction of deadlift has no
+StorageServer reaches it. The recovery transaction of redwall has no
 content.
 
 The Sequencer then assigns the LSNs above the recovery transaction. If a
@@ -182,7 +182,7 @@ FoundationDB 7.3, from `fdbserver/ClusterRecovery.actor.cpp`,
 `fdbserver/masterserver.actor.cpp`, `fdbserver/Resolver.actor.cpp`,
 `fdbserver/SkipList.cpp` and `fdbclient/ServerKnobs.cpp`.
 
-| Rule | Value in deadlift and in FoundationDB |
+| Rule | Value in redwall and in FoundationDB |
 |---|---|
 | Versions for each second | 1,000,000 |
 | A commit version | The last commit version plus the versions of the time since then; at least 1 more, at most 5,000,000 more |
@@ -194,7 +194,7 @@ The gap at the start of an epoch is larger than the MVCC window. The
 Resolver of a new epoch has no history. Because of the gap, it treats a
 transaction with a read version of the previous epoch as too old.
 
-The Sequencer of deadlift assigns a commit version only if the version is
+The Sequencer of redwall assigns a commit version only if the version is
 less than 100,000,000 above the read version. Otherwise the Sequencer
 answers `{error, versions_in_flight}` and the Proxy stops. With this
 limit, no LogServer stores a record of a client at or above the first
@@ -203,7 +203,7 @@ discards therefore has an LSN below every version of the next epoch. A
 discarded recovery transaction can have the first LSN of the next epoch;
 it has no content. The StorageServer depends on this
 rule. FoundationDB uses the constant `MAX_VERSIONS_IN_FLIGHT` for the gap.
-The limit in the Sequencer of deadlift is not taken from the FoundationDB
+The limit in the Sequencer of redwall is not taken from the FoundationDB
 source.
 
 ### The Resolver
@@ -225,7 +225,7 @@ the range.
 - A request has the transactions of one batch of the Proxy. The Resolver
   checks them in the order of the batch. A transaction has a conflict
   with an earlier transaction of the batch that the Resolver admitted.
-- `deadlift_storage:read_range/4` reads the keys of a range at a read
+- `redwall_storage:read_range/4` reads the keys of a range at a read
   version.
 - The Resolver handles the commit versions in their order. A request that
   arrives before the request with the previous version waits.
@@ -238,7 +238,7 @@ the range.
 
 #### The store of the StorageServer
 
-FoundationDB has an ordered keyspace. Every structure of deadlift that
+FoundationDB has an ordered keyspace. Every structure of redwall that
 holds keys keeps the keys in their order.
 
 - The data of the StorageServer is an ETS table of type `ordered_set`
@@ -252,7 +252,7 @@ holds keys keeps the keys in their order.
   removes. A rise of the oldest version examines only the versions that
   leave the MVCC window.
 - The table of the data is readable by other processes.
-  `deadlift_storage:info/1` returns it. No part of deadlift reads it
+  `redwall_storage:info/1` returns it. No part of redwall reads it
   directly yet.
 
 A benchmark on 2026-11-22 compared four stores with 1,000,000 keys of 12
@@ -279,16 +279,16 @@ under "Benchmark".
 
 ### The client
 
-The module [deadlift](src/deadlift.erl) is the client. The functions have
+The module [redwall](src/redwall.erl) is the client. The functions have
 the names, the arguments and the results of
 [erlfdb](https://github.com/foundationdb-beam/erlfdb) 1.2.3, so that
-deadlift can replace erlfdb in an application later.
+redwall can replace erlfdb in an application later.
 
 ```erlang
-Db = deadlift:open(#{proxy => Proxy, storage => Storage}),
-deadlift:transactional(Db, fun(Tx) ->
-    Balance = deadlift:wait(deadlift:get(Tx, account)),
-    deadlift:set(Tx, account, Balance + 1)
+Db = redwall:open(#{proxy => Proxy, storage => Storage}),
+redwall:transactional(Db, fun(Tx) ->
+    Balance = redwall:wait(redwall:get(Tx, account)),
+    redwall:set(Tx, account, Balance + 1)
 end).
 ```
 
@@ -302,7 +302,7 @@ end).
 | Conflict ranges and status | `add_read_conflict_key/2`, `add_read_conflict_range/3`, `is_read_only/1` |
 
 - A transaction of erlfdb is a mutable object of the C library of
-  FoundationDB. A transaction of deadlift is an ETS table of type
+  FoundationDB. A transaction of redwall is an ETS table of type
   `ordered_set`, so that several processes can use one transaction, as
   with erlfdb. A benchmark measured 213 ns to create and delete such a
   table, and 1,915 ns for the state of a transaction with 2 reads and 2
@@ -322,7 +322,7 @@ end).
      5 seconds in total, in equal parts for the StorageServers. When a
      StorageServer is not alive or does not answer in its part of the
      time, the read continues with the next one.
-- `get/2` returns a future, as in erlfdb. The future of deadlift is the
+- `get/2` returns a future, as in erlfdb. The future of redwall is the
   result itself, and `wait/1` returns its argument.
 - An error is `error({erlfdb_error, Code})` with the error code of
   FoundationDB 7.3: 1007 `transaction_too_old`, 1009 `future_version`,
@@ -332,19 +332,19 @@ end).
   `fdbclient/NativeAPI.actor.cpp`. After 1020, 1021 and 1037 it waits for a
   random part of a backoff that starts at 10 ms, doubles with each error
   and is at most 1 s. After 1007 and 1009 it waits for 10 ms. The options
-  `retry_delay_ms` and `max_retry_delay_ms` of `deadlift:open/1` set the
+  `retry_delay_ms` and `max_retry_delay_ms` of `redwall:open/1` set the
   first backoff and the highest backoff. FoundationDB has the
   transaction option `max_retry_delay` for the highest backoff, and no
   option for the first one.
 - A profile is a set of client options for one kind of StorageServer.
-  `deadlift:open/1` takes the option `profile`, and an option of
+  `redwall:open/1` takes the option `profile`, and an option of
   `open/1` replaces the option of the profile. A StorageServer with
   another store gets a profile of its own.
 
   | Profile | For | `retry_delay_ms` | `max_retry_delay_ms` | `direct` |
   |---|---|---|---|---|
   | `default` | The values of FoundationDB | 10 | 1,000 | `true` |
-  | `ets` | The StorageServer of deadlift, with the data in ETS tables in memory | 1 | 100 | `true` |
+  | `ets` | The StorageServer of redwall, with the data in ETS tables in memory | 1 | 100 | `true` |
   `transactional/2` then runs the function again.
 
 ### Idempotency ids
@@ -356,10 +356,10 @@ A transaction with an idempotency id is applied once. The design follows
 `design/idempotency_ids.md` of FoundationDB 7.3.62.
 
 ```erlang
-Db = deadlift:open(#{automatic_idempotency => true}),
-deadlift:transactional(Db, fun(Tx) ->
-    N = deadlift:get(Tx, counter),
-    deadlift:set(Tx, counter, N + 1)
+Db = redwall:open(#{automatic_idempotency => true}),
+redwall:transactional(Db, fun(Tx) ->
+    N = redwall:get(Tx, counter),
+    redwall:set(Tx, counter, N + 1)
 end).
 ```
 
@@ -375,7 +375,7 @@ end).
 4. After a commit with an answer, the client tells the Proxy that the
    record is not needed, and the Proxy clears it with its next batch.
 
-- `deadlift:set_option(Tx, automatic_idempotency)` gives an id to one
+- `redwall:set_option(Tx, automatic_idempotency)` gives an id to one
   transaction.
 - The Proxy removes the records that are older than
   `idempotency_min_age_ms` (default 1 hour) and records that time. A
@@ -385,8 +385,8 @@ end).
   while no Proxy runs.
 - A transaction with an id and without a read asks the Proxy for a read
   version at its commit.
-- A key of the form `{'$deadlift', _, _}` is reserved. The records of the
-  ids have such keys ([deadlift_idempotency](src/deadlift_idempotency.erl)).
+- A key of the form `{'$redwall', _, _}` is reserved. The records of the
+  ids have such keys ([redwall_idempotency](src/redwall_idempotency.erl)).
 - Differences from FoundationDB: the key of a record has the id, so the
   client reads one key and not the keys of every possible commit version.
   The time of an id is the time of the client. An application cannot
@@ -401,14 +401,14 @@ three nodes on one computer, the p50 of `update_counter/3` is 135 us to
 
 ### Select
 
-`deadlift:select/4` evaluates an ETS match spec on the keys of a range,
+`redwall:select/4` evaluates an ETS match spec on the keys of a range,
 and returns the results in the order of the keys:
 
 ```erlang
 %% The numbers of the users with the status `active'.
 Spec = [{{{user, '$1'}, #{status => active}}, [], ['$1']}],
-deadlift:transactional(Db, fun(Tx) ->
-    deadlift:select(Tx, {user, 0}, {user, 1000000}, Spec, [{limit, 100}])
+redwall:transactional(Db, fun(Tx) ->
+    redwall:select(Tx, {user, 0}, {user, 1000000}, Spec, [{limit, 100}])
 end).
 ```
 
@@ -453,7 +453,7 @@ the range.
 
 ### Mapped range
 
-`deadlift:get_mapped_range/4,5` is `erlfdb:get_mapped_range/4,5`, which
+`redwall:get_mapped_range/4,5` is `erlfdb:get_mapped_range/4,5`, which
 is `getMappedRange` of FoundationDB 7.3. The function reads a key range,
 and the StorageServer performs a second read for each row of the range.
 An application reads the rows of an index and the record of each row in
@@ -461,22 +461,22 @@ one request:
 
 ```erlang
 %% The key of an index row is {<<"index">>, City, Id}, and the key of a
-%% record is {<<"user">>, Id}. Both are packed with deadlift_tuple.
+%% record is {<<"user">>, Id}. Both are packed with redwall_tuple.
 Mapper = {<<"user">>, <<"{K[2]}">>, <<"{...}">>},
-{Begin, End} = deadlift_tuple:range({<<"index">>, <<"Oslo">>}),
-deadlift:transactional(Db, fun(Tx) ->
-    deadlift:get_mapped_range(Tx, Begin, End, Mapper, [{limit, 100}])
+{Begin, End} = redwall_tuple:range({<<"index">>, <<"Oslo">>}),
+redwall:transactional(Db, fun(Tx) ->
+    redwall:get_mapped_range(Tx, Begin, End, Mapper, [{limit, 100}])
 end).
 %% [{{IndexKey, IndexValue}, {SecondBegin, SecondEnd}, [{UserKey, User}]}, ...]
 ```
 
-The mapper describes the key of the second read. deadlift has two kinds
+The mapper describes the key of the second read. redwall has two kinds
 of mapper:
 
 | Mapper | Argument of `get_mapped_range` | Status |
 |---|---|---|
 | The mapper of FoundationDB: a tuple of the tuple layer | A tuple, which the client packs as erlfdb does, or a binary with the packed tuple | Supported |
-| A mapper that is an Erlang term | `{term, Term}` | Reserved. The call raises `{unsupported, term_mapper}`. deadlift is free to define this mapper later, because FoundationDB has none |
+| A mapper that is an Erlang term | `{term, Term}` | Reserved. The call raises `{unsupported, term_mapper}`. redwall is free to define this mapper later, because FoundationDB has none |
 
 The elements of the mapper of FoundationDB:
 
@@ -505,7 +505,7 @@ The elements of the mapper of FoundationDB:
   (`mapper_not_tuple`).
 - The options are a list. `{limit, N}` returns the first `N` rows of the
   range. A caller continues after the key of the last row.
-- [src/deadlift_tuple.erl](src/deadlift_tuple.erl) is the tuple layer:
+- [src/redwall_tuple.erl](src/redwall_tuple.erl) is the tuple layer:
   a copy of `erlfdb_tuple` of erlfdb 1.2.3 (Apache License 2.0).
 - The handle of the StorageServer has the feature `mapped_range`.
 
@@ -555,7 +555,7 @@ The Proxy collects the transactions of a short time into one batch
 (paper, section 2.4.1). A batch has one commit version and is one log
 record.
 
-| Rule | In deadlift | In the FoundationDB source |
+| Rule | In redwall | In the FoundationDB source |
 |---|---|---|
 | A batch closes when no earlier batch is in progress | Yes, with `batch_idle` (default `true`) and `batch_depth` (default 1). A transaction at an idle Proxy does not wait, and the next batch has the transactions that arrive while a batch is in progress | No. This part is not in the paper |
 | A batch closes after a time | `batch_ms`, default 1 ms, fixed. With the rule above, this time is an upper limit | A time that changes with the load (`commitBatcher` in `fdbserver/CommitProxyServer.actor.cpp`) |
@@ -566,7 +566,7 @@ record.
 | The writes of a rejected transaction give no conflict | Yes | Yes |
 
 - The index of a transaction is its position in the batch, from 0.
-  `deadlift_epoch:commit_with_index/3` returns the LSN and the index. The
+  `redwall_epoch:commit_with_index/3` returns the LSN and the index. The
   pair of the LSN and the index gives the order of all committed
   transactions.
 - When two transactions of a batch write one key, the StorageServer keeps
@@ -627,6 +627,42 @@ The Proxy stops in two cases:
 A StorageServer reads the records from the LogServers and applies their
 writes to a store with versions (paper, sections 2.4.3 and 2.4.4).
 
+A StorageServer with the option `peers` that starts without data copies
+the data from another StorageServer, and then reads the log from the
+version of the copy. FoundationDB copies the data of a shard in the same
+way (`fetchKeys` of `fdbserver/storageserver.actor.cpp`).
+
+1. The new StorageServer asks each peer for the start of a copy. A peer
+   with data answers with the version of the copy: the lower one of its
+   version and its Known Committed Version, so no recovery discards a
+   write of the copy.
+2. The new StorageServer reads the keys of the peer in pages of 1,000
+   keys at that version. The peer keeps its oldest version at or below
+   the version of the copy until the copy ends.
+3. The new StorageServer has the version of the copy as its version and
+   as its oldest version, and reads the log of the epoch of that version
+   from there. A read below that version is too old.
+4. If every peer that answers has no data, the new StorageServer reads
+   the log from the start, as at the start of a new cluster.
+
+- Without the copy, a new StorageServer reads every record from the
+  LogServers of every epoch. A LogServer keeps its records in memory, so
+  after the stops of several nodes a record of an earlier epoch can be on
+  no LogServer.
+- A StorageServer that reads an epoch that has ended and applies no
+  record in 10 intervals asks its peers. If a peer has a copy above its
+  version, it removes its data and copies.
+- The StorageServer reads the coordinated state at every tenth interval
+  and after a failed request to a LogServer of its epoch. Before
+  2026-11-23 it waited for an ended epoch without an end when no
+  LogServer of that epoch could answer that it was stopped.
+- In the simulation, a StorageServer that starts after a kill has the
+  other StorageServers of the run as peers. In the suite of 2026-11-24,
+  158 StorageServers finished a copy, without a violation.
+- Limitations: a copy has every key of the peer, the peer keeps the
+  versions above the version of the copy for the time of the copy, and a
+  LogServer still keeps every record.
+
 - The StorageServer has a version: the LSN of the last record that it has
   applied. It applies a record only when the previous LSN of the record is
   its version. The records of all epochs form one chain, because the
@@ -686,9 +722,9 @@ several. This is the replication of the whole key space.
 
 FoundationDB divides the key space into shards. Each shard has a team of
 StorageServers, and each mutation has the tags of the team of its key
-(paper, section 2.4.3). deadlift has one shard with the whole key space.
+(paper, section 2.4.3). redwall has one shard with the whole key space.
 The team is the list of StorageServers that the caller of
-`deadlift:open/1` names.
+`redwall:open/1` names.
 
 ### LogServer processes
 
@@ -703,7 +739,7 @@ started.
 - A StorageServer reads the log systems of all epochs from the
   coordinated state, and so has the process of each LogServer.
 
-No part of deadlift looks up a LogServer by a name, and no part waits
+No part of redwall looks up a LogServer by a name, and no part waits
 for a name. FoundationDB stores the interface of each LogServer in the
 coordinated state in the same way.
 
@@ -716,9 +752,9 @@ and the Proxy became one process.
 ### The ClusterController
 
 A node that can run roles has one worker
-([deadlift_worker](src/deadlift_worker.erl)). A node can also run one
+([redwall_worker](src/redwall_worker.erl)). A node can also run one
 candidate for the ClusterController
-([deadlift_cluster_controller](src/deadlift_cluster_controller.erl)).
+([redwall_cluster_controller](src/redwall_cluster_controller.erl)).
 
 Election:
 
@@ -763,7 +799,7 @@ Recruitment:
 4. The leader starts the process of the epoch on its worker. The process
    performs the recovery, and starts the LogServers on their workers.
 5. The leader sends the epoch and the process of the epoch to every
-   worker. `deadlift_worker:db_info/0` returns them on each node with a
+   worker. `redwall_worker:db_info/0` returns them on each node with a
    worker.
 
 The leader monitors the process of the epoch and the LogServers. When
@@ -782,24 +818,24 @@ answers its requests while a read waits.
 ### Departures from the paper
 
 - FoundationDB stores the coordinated state with Active Disk Paxos on the
-  Coordinators (paper, section 2.5). deadlift stores the coordinated state
+  Coordinators (paper, section 2.5). redwall stores the coordinated state
   in the replicated log of a peace cluster. This part is not in the paper.
-- The coordinated state of deadlift records an owner for the recovery
+- The coordinated state of redwall records an owner for the recovery
   count, so that a lock or a write that is proposed a second time after a
   timeout has no second effect. This part is not in the paper.
-- A LogServer of deadlift keeps the records in memory. FoundationDB writes
+- A LogServer of redwall keeps the records in memory. FoundationDB writes
   the records to disk. This part is not in the paper.
 - The recovery copies each record to every new LogServer. FoundationDB
   copies a record to the new LogServers that replicate the tags of the
   record.
 - FoundationDB keeps the commit versions near the time of the wall clock.
-  deadlift raises the commit version with the elapsed time only.
-- A Proxy of deadlift confirms the epoch for each request of a read
+  redwall raises the commit version with the elapsed time only.
+- A Proxy of redwall confirms the epoch for each request of a read
   version. FoundationDB confirms once for a batch of requests.
-- A Proxy of deadlift stops when a LogServer answers that it is stopped.
+- A Proxy of redwall stops when a LogServer answers that it is stopped.
   A proxy of FoundationDB does not answer the request, and stops when it
   learns of the recovery.
-- The Sequencer of deadlift sends the recovery transaction itself, after
+- The Sequencer of redwall sends the recovery transaction itself, after
   the write of the coordinated state. The master of FoundationDB sends it
   through a proxy, before the write of the coordinated state.
 - The StorageServer keeps the data in memory. A StorageServer of
@@ -840,21 +876,21 @@ answers its requests while a read waits.
 
 ## Start
 
-A node runs deadlift from the environment of the application. The
+A node runs redwall from the environment of the application. The
 application starts a worker and a StorageServer if the environment has
 their options.
 
 | Key of the environment | Value | Process |
 |---|---|---|
-| `worker` | The options of `deadlift_worker:start_link/1`: `coordinators`, `class`, `candidate` for a candidate for the ClusterController on the node, and `name` for a node that runs the workers of several clusters | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
-| `storage` | The options of `deadlift_storage:start_link/1`: `coordinators` | The StorageServer of the node |
-| `coordinator` | The options of `deadlift_coordinator:start_link/1`: `id` and `dir`, both required | The coordinator of the node: one server of the peace cluster with the coordinated state. The supervisor starts it before the worker and the StorageServer |
+| `worker` | The options of `redwall_worker:start_link/1`: `coordinators`, `class`, `candidate` for a candidate for the ClusterController on the node, and `name` for a node that runs the workers of several clusters | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
+| `storage` | The options of `redwall_storage:start_link/1`: `coordinators` | The StorageServer of the node |
+| `coordinator` | The options of `redwall_coordinator:start_link/1`: `id` and `dir`, both required | The coordinator of the node: one server of the peace cluster with the coordinated state. The supervisor starts it before the worker and the StorageServer |
 
 Example, in `sys.config`, for a node that runs every role:
 
 ```erlang
 [
-    {deadlift, [
+    {redwall, [
         {worker, #{coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}], candidate => #{}}},
         {storage, #{coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}]}}
     ]}
@@ -862,24 +898,24 @@ Example, in `sys.config`, for a node that runs every role:
 ```
 
 `coordinators` are the servers of a peace cluster that runs
-`deadlift_cstate:machine/0`.
+`redwall_cstate:machine/0`.
 
 ### Coordinators
 
 A coordinator keeps the coordinated state on a disk, as a coordinator of
-FoundationDB does. [deadlift_coordinator](src/deadlift_coordinator.erl)
+FoundationDB does. [redwall_coordinator](src/redwall_coordinator.erl)
 starts a server of peace with the write-ahead log of peace
 (`peace_storage_wal`), and the option `dir` is required:
 
 ```erlang
-{deadlift, [
-    {coordinator, #{id => {c1, 'a@host'}, dir => "/var/lib/deadlift/coordinator"}},
+{redwall, [
+    {coordinator, #{id => {c1, 'a@host'}, dir => "/var/lib/redwall/coordinator"}},
     {worker, #{coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}], candidate => #{}}}
 ]}
 ```
 
 1. Start the application on each node with a coordinator.
-2. Call `deadlift_coordinator:form([{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}])`
+2. Call `redwall_coordinator:form([{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}])`
    once. peace stores the configuration of the cluster on the disk of
    each coordinator.
 
@@ -889,7 +925,7 @@ starts a server of peace with the write-ahead log of peace
   `{missing_option, dir}`. The options `storage` and `machine` are not
   allowed.
 - A peace cluster that a caller starts with `peace:start_cluster/3` can
-  still be named in `coordinators`. The tests of deadlift do this with
+  still be named in `coordinators`. The tests of redwall do this with
   the storage in memory.
 
 ### Start time
@@ -914,25 +950,25 @@ node, measured on 2026-11-23 in 3 to 5 runs:
   the StorageServer.
 - A peace cluster has no leader until an election timeout has passed.
   `peace:trigger_election/1` starts an election at once. A caller that
-  starts a peace cluster for deadlift calls it after
+  starts a peace cluster for redwall calls it after
   `peace:start_cluster/3`.
 - The same early reads shorten the time after a recovery in which a
   read of a client waits: a StorageServer follows the epoch after a
   recovery within some 10 ms. Before, it followed at its poll interval.
 
-On such a node, `deadlift:open/0` returns a database:
+On such a node, `redwall:open/0` returns a database:
 
 ```erlang
-Db = deadlift:open(),
-ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, key, value) end).
+Db = redwall:open(),
+ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, key, value) end).
 ```
 
 - The Proxy of the database is the process of the current epoch, from
   the information that the worker of the node has.
 - The StorageServer of the database is the StorageServer of the node. A
   read uses its ETS tables in the process of the caller.
-- `deadlift:open/1` takes the same options as before, and each option
-  replaces a default. For example, `deadlift:open(#{profile => ets})`
+- `redwall:open/1` takes the same options as before, and each option
+  replaces a default. For example, `redwall:open(#{profile => ets})`
   uses the profile for the ETS StorageServer.
 
 ## Verification
@@ -950,10 +986,10 @@ The models have 10 planted bugs. TLC finds a counterexample for each. See
 ### Simulation
 
 `make dst` runs the system under the scheduler and the simulated network
-of eta. The harness is [dst/deadlift_dst.erl](dst/deadlift_dst.erl).
+of eta. The harness is [dst/redwall_dst.erl](dst/redwall_dst.erl).
 
 The simulated system has one process for the coordinated state
-([deadlift_cstate_local](src/deadlift_cstate_local.erl)), or a peace
+([redwall_cstate_local](src/redwall_cstate_local.erl)), or a peace
 cluster of 3 servers in the tests with the name `peace_`. It has 3 LogServers for each epoch and a replication degree of 2.
 A run has 1, 2 or 3 StorageServers. The number depends on the seed. Each
 node with the process of an epoch, a LogServer or a StorageServer has
@@ -1027,8 +1063,8 @@ The harness checks these invariants after every step:
 | `read_value` | A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer |
 | `storage_rollback` | When a StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one |
 | `replicas_agree` | Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both |
-| `select_agrees` | A `deadlift:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
-| `mapped_range_agrees` | A `deadlift:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
+| `select_agrees` | A `redwall:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
+| `mapped_range_agrees` | A `redwall:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
 | `own_writes` | Before the commit, the reads of a transaction return its sets and its clears, and `get_mapped_range/4` raises 2039. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation |
 | `coordinators_agree` | In a run with a peace cluster, no two servers have two states of the coordinated state for one index of the log of peace |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
@@ -1096,7 +1132,7 @@ of the repository. Each one was found at seed 1 of the runs with faults:
 
 #### Runs with a peace cluster
 
-In the runs above, the coordinated state is one `deadlift_cstate_local`
+In the runs above, the coordinated state is one `redwall_cstate_local`
 process. The tests with the name `peace_` run a peace cluster of 3
 servers in its place, under the scheduler and the network of eta:
 
@@ -1105,7 +1141,7 @@ servers in its place, under the scheduler and the network of eta:
 - Each server is on a simulated node of its own. The cluster has
   majority quorums.
 - Each server is a coordinator with the configuration of
-  [deadlift_coordinator](src/deadlift_coordinator.erl): it keeps its data
+  [redwall_coordinator](src/redwall_coordinator.erl): it keeps its data
   in the write-ahead log of peace, on the simulated disk of eta.
 - The harness kills the node of a coordinator, and in 1 kill operation
   of 4 the node of every coordinator. A kill is also a crash of the
@@ -1116,7 +1152,7 @@ servers in its place, under the scheduler and the network of eta:
   states of the coordinated state for one index of the log of peace.
 - A partition can cut a server off, and can leave the cluster without a
   majority until the next heal.
-- [dst/deadlift_dst_machine.erl](dst/deadlift_dst_machine.erl) is the
+- [dst/redwall_dst_machine.erl](dst/redwall_dst_machine.erl) is the
   machine of the servers. It records the decided state for the
   invariants, and plants the defects `no_cas` and `no_elect_cas`.
 - A step injects an operation with the probability 0.004 in the place
@@ -1170,9 +1206,9 @@ Limitations of the simulation:
 - A run with a peace cluster and faults acknowledges 4.3 transactions
   on average, against 5.0 without the cluster.
 
-- The application start (`deadlift_sup`) and `deadlift:open/0` are not
+- The application start (`redwall_sup`) and `redwall:open/0` are not
   in the simulation. Unit tests on two nodes cover them.
-- `deadlift:transactional/2` is not in the simulation. A client calls
+- `redwall:transactional/2` is not in the simulation. A client calls
   `on_error/2` after a failed commit, and does not run the transaction
   again.
 - The errors of a mapper are not in the simulation. Unit tests cover
@@ -1206,7 +1242,7 @@ harness take less than 1% of the time.
 
 ## Benchmark
 
-`make bench` runs [bench/deadlift_bench.erl](bench/deadlift_bench.erl). The
+`make bench` runs [bench/redwall_bench.erl](bench/redwall_bench.erl). The
 benchmark is not a test. It has no limits and does not check the results
 of the transactions.
 
@@ -1231,9 +1267,9 @@ A value has 100 bytes.
 | `conflict` | `read_write` with 100 keys. Each key then has several hundred versions in the MVCC window |
 | `read_version` | One read version from the Proxy |
 | `read_after_write` | A client commits a write and reads the key at the commit version. The row has the time of the read, which ends when the StorageServer has applied the record |
-| `select_by_message`, `select_direct` | `deadlift:select/4` on a range of 1,000 of 100,000 rows with values of 1,000 bytes, of which 10 match, from the node of the benchmark and on the node of the StorageServer |
+| `select_by_message`, `select_direct` | `redwall:select/4` on a range of 1,000 of 100,000 rows with values of 1,000 bytes, of which 10 match, from the node of the benchmark and on the node of the StorageServer |
 | `filter_by_message`, `filter_direct` | The same result with `get_range/3` and the match spec in the client |
-| `mapped_by_message`, `mapped_direct` | `deadlift:get_mapped_range/4` on 100 index rows of 10,000, each with a second read of one record with a value of 1,000 bytes, from the node of the benchmark and on the node of the StorageServer |
+| `mapped_by_message`, `mapped_direct` | `redwall:get_mapped_range/4` on 100 index rows of 10,000, each with a second read of one record with a value of 1,000 bytes, from the node of the benchmark and on the node of the StorageServer |
 | `join_by_message`, `join_direct` | The same result with `get_range/3` for the index rows and one `get_range/3` for each record |
 | `read_by_message` | The read of one key at a read version that the client has, from the node of the benchmark |
 | `read_direct` | The same read by a client on the node of the StorageServer, from the ETS table |
@@ -1327,10 +1363,10 @@ Garbage collections and uninterrupted runs of a process of 2 ms or more, since t
 
 | Kind | Process | Count | Longest (ms) | Sum (ms) |
 |---|---|---|---|---|
-| long_gc | `deadlift_log` | 8 | 4 | 27 |
-| long_schedule | `deadlift_storage` | 5 | 14 | 38 |
-| long_gc | `deadlift_storage` | 4 | 13 | 40 |
-| long_schedule | `deadlift_log` | 2 | 3 | 6 |
+| long_gc | `redwall_log` | 8 | 4 | 27 |
+| long_schedule | `redwall_storage` | 5 | 14 | 38 |
+| long_gc | `redwall_storage` | 4 | 13 | 40 |
+| long_schedule | `redwall_log` | 2 | 3 | 6 |
 
 The default options of the ClusterController (`retry_ms` 500, `poll_ms` 1000):
 
@@ -1378,7 +1414,7 @@ the Proxy were three processes, on three nodes or on one node.
 | The Sequencer, the Resolver and the Proxy of an epoch are one process | A commit had 4 round trips between the three processes, and the option that placed them on one node showed that the round trips between nodes were half of the time of a write. The purpose of the change is a simpler design: see "One process for an epoch" |
 | The LogServer keeps its records in an ETS table | The records were on the heap of the LogServer process. The LogServers had 163 garbage collections of 2 ms or more in one run, the longest 90 ms, and the longest wait of a batch for the LogServers was 38 ms. After the change it is 0.4 ms |
 
-`bench/deadlift_bench.erl` also has `depth/1`, which measures `write`
+`bench/redwall_bench.erl` also has `depth/1`, which measures `write`
 for several values of `batch_depth`, the number of batches in progress
 below which the Proxy closes a batch at once. In one run of 2 seconds for
 each row, 256 clients committed 99,997, 86,107, 65,014 and 67,672
@@ -1422,12 +1458,12 @@ structures gave the same result for every transaction.
 | A `gb_trees` tree and a `gb_sets` set of the versions, with a removal for each batch | 20,000 | 212 | 3,814 | 10,324 | 8 | 9 |
 | Two ETS tables of the kind `ordered_set`, with a removal for each batch | 20,000 | 94 | 141 | 165 | 0 | 0 |
 
-The Resolver of deadlift has the third structure. Before this benchmark
+The Resolver of redwall has the third structure. Before this benchmark
 it had the first one.
 
 ### The versions of a hot key
 
-`conflict` has 100 keys. `deadlift_bench:conflicts/1` measures it for
+`conflict` has 100 keys. `redwall_bench:conflicts/1` measures it for
 several values of the client option `retry_delay_ms`, with the number of
 each error code and the steps of a batch in the Proxy. One run on
 2026-11-23:
@@ -1471,7 +1507,7 @@ of 100 bytes. The benchmark is not part of this repository.
 | 1,024 | One row for each version | 330 | 281 | 272 | 10.62 | 28 |
 | 1,024 | The newest version in the row of the key, the older versions in a second table | 491 | 102 | 345 | 9.73 | 8 |
 
-The StorageServer of deadlift has the third layout since this benchmark.
+The StorageServer of redwall has the third layout since this benchmark.
 `conflicts/1` after the change, in one run:
 
 | `retry_delay_ms` | Clients | Operations per second before | Operations per second after | p99.9 before (us) | p99.9 after (us) |
@@ -1538,39 +1574,39 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 
 | Path | Contents |
 |---|---|
-| [src/deadlift_cstate.erl](src/deadlift_cstate.erl) | The coordinated state: a `peace_machine` and its client |
-| [src/deadlift_log.erl](src/deadlift_log.erl) | The LogServer |
-| [src/deadlift_recovery.erl](src/deadlift_recovery.erl) | The recovery |
-| [src/deadlift_sequencer.erl](src/deadlift_sequencer.erl) | The rules of the Sequencer for the versions, as functions |
-| [src/deadlift_resolver.erl](src/deadlift_resolver.erl) | The conflict check of the Resolver, as functions on two ETS tables |
-| [src/deadlift_epoch.erl](src/deadlift_epoch.erl) | The process of an epoch: the Sequencer, the Resolver and the Proxy |
-| [src/deadlift_storage.erl](src/deadlift_storage.erl) | The StorageServer |
-| [src/deadlift.erl](src/deadlift.erl) | The client, with the function names of erlfdb |
-| [src/deadlift_idempotency.erl](src/deadlift_idempotency.erl) | The keys of the idempotency ids |
-| [src/deadlift_mapper.erl](src/deadlift_mapper.erl) | The mapper of a mapped range read |
-| [src/deadlift_tuple.erl](src/deadlift_tuple.erl), [src/deadlift_float.erl](src/deadlift_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |
-| [src/deadlift_cluster_controller.erl](src/deadlift_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |
-| [src/deadlift_worker.erl](src/deadlift_worker.erl) | The worker of one node, which starts roles for the ClusterController |
-| [src/deadlift_coordinator.erl](src/deadlift_coordinator.erl) | A coordinator: a server of the peace cluster with the coordinated state on a disk |
-| [src/deadlift_cstate_local.erl](src/deadlift_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
-| [include/deadlift_eta.hrl](include/deadlift_eta.hrl) | The header that puts a module under the parse transform of eta in the `dst` profile |
-| [dst/deadlift_dst.erl](dst/deadlift_dst.erl) | The eta harness: the workload and the invariants |
-| [dst/deadlift_dst_client.erl](dst/deadlift_dst_client.erl) | The processes that perform the operations of the simulation |
-| [dst/deadlift_dst_tests.erl](dst/deadlift_dst_tests.erl) | The simulation suite |
-| [dst/deadlift_dst_machine.erl](dst/deadlift_dst_machine.erl) | The machine of the peace cluster of a simulation run |
-| [dst/deadlift_dst_nosync_io.erl](dst/deadlift_dst_nosync_io.erl) | A planted defect: file operations of a coordinator that never sync |
-| [test/deadlift_coordinator_tests.erl](test/deadlift_coordinator_tests.erl) | Tests for `deadlift_coordinator`: the options, and the coordinated state after the stop of one coordinator and of every coordinator |
-| [bench/deadlift_bench.erl](bench/deadlift_bench.erl), [bench/run.sh](bench/run.sh) | The benchmark of a cluster on one computer |
+| [src/redwall_cstate.erl](src/redwall_cstate.erl) | The coordinated state: a `peace_machine` and its client |
+| [src/redwall_log.erl](src/redwall_log.erl) | The LogServer |
+| [src/redwall_recovery.erl](src/redwall_recovery.erl) | The recovery |
+| [src/redwall_sequencer.erl](src/redwall_sequencer.erl) | The rules of the Sequencer for the versions, as functions |
+| [src/redwall_resolver.erl](src/redwall_resolver.erl) | The conflict check of the Resolver, as functions on two ETS tables |
+| [src/redwall_epoch.erl](src/redwall_epoch.erl) | The process of an epoch: the Sequencer, the Resolver and the Proxy |
+| [src/redwall_storage.erl](src/redwall_storage.erl) | The StorageServer |
+| [src/redwall.erl](src/redwall.erl) | The client, with the function names of erlfdb |
+| [src/redwall_idempotency.erl](src/redwall_idempotency.erl) | The keys of the idempotency ids |
+| [src/redwall_mapper.erl](src/redwall_mapper.erl) | The mapper of a mapped range read |
+| [src/redwall_tuple.erl](src/redwall_tuple.erl), [src/redwall_float.erl](src/redwall_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |
+| [src/redwall_cluster_controller.erl](src/redwall_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |
+| [src/redwall_worker.erl](src/redwall_worker.erl) | The worker of one node, which starts roles for the ClusterController |
+| [src/redwall_coordinator.erl](src/redwall_coordinator.erl) | A coordinator: a server of the peace cluster with the coordinated state on a disk |
+| [src/redwall_cstate_local.erl](src/redwall_cstate_local.erl) | The coordinated state in one process, for tests and for the simulation |
+| [include/redwall_eta.hrl](include/redwall_eta.hrl) | The header that puts a module under the parse transform of eta in the `dst` profile |
+| [dst/redwall_dst.erl](dst/redwall_dst.erl) | The eta harness: the workload and the invariants |
+| [dst/redwall_dst_client.erl](dst/redwall_dst_client.erl) | The processes that perform the operations of the simulation |
+| [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) | The simulation suite |
+| [dst/redwall_dst_machine.erl](dst/redwall_dst_machine.erl) | The machine of the peace cluster of a simulation run |
+| [dst/redwall_dst_nosync_io.erl](dst/redwall_dst_nosync_io.erl) | A planted defect: file operations of a coordinator that never sync |
+| [test/redwall_coordinator_tests.erl](test/redwall_coordinator_tests.erl) | Tests for `redwall_coordinator`: the options, and the coordinated state after the stop of one coordinator and of every coordinator |
+| [bench/redwall_bench.erl](bench/redwall_bench.erl), [bench/run.sh](bench/run.sh) | The benchmark of a cluster on one computer |
 | [dst/run.sh](dst/run.sh) | Runs each test of the simulation suite in a node of its own |
-| [src/deadlift_app.erl](src/deadlift_app.erl), [src/deadlift_sup.erl](src/deadlift_sup.erl) | The application and its supervisor, which has no child |
-| [test/deadlift_cstate_tests.erl](test/deadlift_cstate_tests.erl) | Tests for `deadlift_cstate` |
-| [test/deadlift_cluster_controller_tests.erl](test/deadlift_cluster_controller_tests.erl) | Tests for `deadlift_cluster_controller` and `deadlift_worker` |
-| [test/deadlift_log_tests.erl](test/deadlift_log_tests.erl) | Tests for `deadlift_log` |
-| [test/deadlift_recovery_tests.erl](test/deadlift_recovery_tests.erl) | Tests for `deadlift_recovery` and `deadlift_sequencer` |
-| [test/deadlift_epoch_tests.erl](test/deadlift_epoch_tests.erl) | Tests for `deadlift_epoch` |
-| [test/deadlift_resolver_tests.erl](test/deadlift_resolver_tests.erl) | Tests for `deadlift_resolver` |
-| [test/deadlift_storage_tests.erl](test/deadlift_storage_tests.erl) | Tests for `deadlift_storage` |
-| [test/deadlift_mapper_tests.erl](test/deadlift_mapper_tests.erl) | Tests for `deadlift_mapper`, with the cases of the unit test of FoundationDB |
+| [src/redwall_app.erl](src/redwall_app.erl), [src/redwall_sup.erl](src/redwall_sup.erl) | The application and its supervisor, which has no child |
+| [test/redwall_cstate_tests.erl](test/redwall_cstate_tests.erl) | Tests for `redwall_cstate` |
+| [test/redwall_cluster_controller_tests.erl](test/redwall_cluster_controller_tests.erl) | Tests for `redwall_cluster_controller` and `redwall_worker` |
+| [test/redwall_log_tests.erl](test/redwall_log_tests.erl) | Tests for `redwall_log` |
+| [test/redwall_recovery_tests.erl](test/redwall_recovery_tests.erl) | Tests for `redwall_recovery` and `redwall_sequencer` |
+| [test/redwall_epoch_tests.erl](test/redwall_epoch_tests.erl) | Tests for `redwall_epoch` |
+| [test/redwall_resolver_tests.erl](test/redwall_resolver_tests.erl) | Tests for `redwall_resolver` |
+| [test/redwall_storage_tests.erl](test/redwall_storage_tests.erl) | Tests for `redwall_storage` |
+| [test/redwall_mapper_tests.erl](test/redwall_mapper_tests.erl) | Tests for `redwall_mapper`, with the cases of the unit test of FoundationDB |
 | [formal/Recovery.tla](formal/Recovery.tla) | TLA+ model of the logging protocol, the recovery, read versions and the StorageServer |
 | [formal/Resolver.tla](formal/Resolver.tla) | TLA+ model of the Resolver |
 | [formal/MCRecovery.tla](formal/MCRecovery.tla), [formal/MCResolver.tla](formal/MCResolver.tla) | Constants and invariants for model checking |
@@ -1588,7 +1624,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   tenants and no `get_last_error/0`. It has the tuple layer, but no subspaces
   and no directory layer.
 - A database of the client is a Proxy and a list of StorageServers that
-  the caller names. deadlift has no process that tells a client which
+  the caller names. redwall has no process that tells a client which
   Proxy and which StorageServers run.
 - A read by message waits for its part of the 5 seconds at a
   StorageServer that is behind or cut off, before it continues with the
@@ -1598,7 +1634,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   that starts again after a stop is another process, and no log system
   names it.
 - Two unit tests, in
-  [test/deadlift_nodes_tests.erl](test/deadlift_nodes_tests.erl), use two
+  [test/redwall_nodes_tests.erl](test/redwall_nodes_tests.erl), use two
   Erlang nodes on one computer. One of them has a worker and a candidate
   for the ClusterController on each node. Each test starts Erlang
   distribution and
@@ -1613,7 +1649,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - Two processes that use one transaction at the same time get no error.
 - The simulation does not use `transactional/2` and `on_error/2`. Unit
   tests cover them.
-- The direct read was not measured in deadlift. The store benchmark
+- The direct read was not measured in redwall. The store benchmark
   measured about 1,000 ns for a read of one key from such a table.
 - The StorageServer keeps the data in memory, and loses the data when it
   stops. A new StorageServer reads every record again
@@ -1630,7 +1666,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - In the simulation, a read that returns no value is accepted when a
   transaction without a known result cleared the key at any version.
 - The MVCC window of the StorageServer and the MVCC window of the Resolver
-  are two options. No part of deadlift checks that they are equal.
+  are two options. No part of redwall checks that they are equal.
 - In the simulation, a new StorageServer starts without data after a
   kill. The simulation kills at most 1
   LogServer of each epoch, so a LogServer with each body runs.
@@ -1666,10 +1702,10 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   the database. They read the process of each LogServer from the
   coordinated state.
 - The client does not find the Proxy from the coordinators.
-  `deadlift:open/0` works on a node with a worker and a StorageServer of
+  `redwall:open/0` works on a node with a worker and a StorageServer of
   the application. On another node, a caller names the Proxy and the
   StorageServers.
-- `deadlift:open/0` reads the StorageServer of the node once. A database
+- `redwall:open/0` reads the StorageServer of the node once. A database
   from before a new start of the StorageServer has the process of the
   earlier one.
 - The worker and the candidate for the ClusterController of a node are
@@ -1680,8 +1716,8 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   process of FoundationDB waits for a change with one request.
 - The application starts the coordinator of a node, and does not form
   the peace cluster. A caller forms it once with
-  `deadlift_coordinator:form/1`.
-- deadlift has no function that replaces a coordinator whose directory
+  `redwall_coordinator:form/1`.
+- redwall has no function that replaces a coordinator whose directory
   is lost, and none that changes the coordinators of a cluster.
 - The recovery waits up to `lock_timeout_ms` (default 1,000 ms) for an old
   LogServer that does not answer.
@@ -1703,7 +1739,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - The models are checked with 3 LogServers, a replication degree of 2, at
   most 3 epochs and 7 versions, and for the Resolver 2 keys and 3
   transactions.
-- deadlift does not send a message again. In the simulation, a lost
+- redwall does not send a message again. In the simulation, a lost
   message to a LogServer stops the commits of the epoch until the next
   recovery.
 - The repository has no licence file.

@@ -77,16 +77,16 @@ model one request. The Proxy answers when the Sequencer has answered and
 |---|---|
 | Resolver | One for each epoch, with `lastCommit` of Algorithm 1 and the oldest version of the MVCC window |
 | Transaction | A read version, a set of read keys and a set of write keys |
-| Commit version | 1 to `MaxStep` above the last one, as with the clock of deadlift |
+| Commit version | 1 to `MaxStep` above the last one, as with the clock of redwall |
 | Batch | A transaction can join the batch of the last commit version. The Resolver checks the transactions of a batch in their order |
 | New epoch | A Resolver without history. The first version is the last version plus `Gap` |
 
 The model assumes that a recovery keeps every record. It does not contain
 LogServers, the StorageServer or more than one Resolver in an epoch.
 
-A read range and a write range of deadlift are sets of keys in the model.
+A read range and a write range of redwall are sets of keys in the model.
 The model does not have the ordered set of bounds that
-`deadlift_resolver` keeps. A unit test compares that set of bounds with one
+`redwall_resolver` keeps. A unit test compares that set of bounds with one
 version for each key, for 3,000 random transactions.
 
 ## Invariants
@@ -187,7 +187,7 @@ Each config must produce a counterexample.
 `ResolverNoGap` fails with a `Gap` of 1. In the model, the gap must be at
 least the window minus 1: the first commit of a client in the new epoch is
 at least `Gap + 1` above the last version of the previous epoch.
-FoundationDB and deadlift use a gap of 100,000,000 versions and a window
+FoundationDB and redwall use a gap of 100,000,000 versions and a window
 of 5,000,000 versions.
 
 ### Reachability configs
@@ -219,7 +219,7 @@ one LogServer, epoch 2 never accepts commits, and epoch 3 has the Recovery
 Version of epoch 2. The two recovery transactions then have the same LSN.
 A recovery transaction has no content, so no read is affected. The
 invariant now applies to the records of clients, and the comments in
-`deadlift_sequencer` and `deadlift_storage` state the exception.
+`redwall_sequencer` and `redwall_storage` state the exception.
 
 ## Commands
 
@@ -265,7 +265,7 @@ again.
 - `Ack` joins the report to the Sequencer and the answer to the client in
   one step. The model does not have the state between the two steps.
 - The StorageServer of the model can apply a record above the end version
-  of an epoch at any time before `SSFollow`. The StorageServer of deadlift
+  of an epoch at any time before `SSFollow`. The StorageServer of redwall
   applies no such record after it has read the coordinated state.
 - The model copies each record in `PEV + 1 .. RV` to every new LogServer.
   FoundationDB copies a record to the LogServers of its tags.

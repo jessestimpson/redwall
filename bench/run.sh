@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs the benchmark, bench/deadlift_bench.erl, and prints the results as
+# Runs the benchmark, bench/redwall_bench.erl, and prints the results as
 # Markdown tables.
 #
 # Usage: bench/run.sh [SECONDS]
@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 seconds=${1:-3}
 build=_build/bench
 rebar3 as bench compile >/dev/null
-paths="-pa $PWD/$build/lib/deadlift/ebin -pa $PWD/$build/lib/deadlift/bench"
+paths="-pa $PWD/$build/lib/redwall/ebin -pa $PWD/$build/lib/redwall/bench"
 if [ -d "$build/checkouts/peace" ]; then
     paths="$paths -pa $PWD/$build/checkouts/peace/ebin"
 else
@@ -22,7 +22,7 @@ else
 fi
 # shellcheck disable=SC2086
 exec erl -noshell $paths -kernel logger_level error -eval "
-    try deadlift_bench:main(#{seconds => $seconds}) of
+    try redwall_bench:main(#{seconds => $seconds}) of
         _ -> halt(0)
     catch
         Class:Reason:Stack ->
