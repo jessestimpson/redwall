@@ -207,6 +207,7 @@
 
 -export([start/1, start_link/1, stop/1, recovered/1, recovered/2]).
 -export([commit/2, commit/3, commit_with_index/3, read_version/1, read_version/2, info/1, reset_stats/1]).
+-export([expire/2]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2]).
 
 -export_type([options/0]).
@@ -271,7 +272,12 @@
 %% `{clear, Key}' removes a key. `{clear_range, Begin, End}' removes every
 %% key `K' with `Begin =< K' and `K < End'. The entry of a transaction in a
 %% log record is a list of mutations.
--type mutation() :: {set, term(), term()} | {clear, term()} | {clear_range, term(), term()}.
+%% `{set_versionstamp, Key}' sets the key to `{CommitVersion, Index}' of its
+%% transaction. The process of the epoch replaces it with a `set' when it
+%% has assigned the commit version, so a LogServer and a StorageServer
+%% receive a `set'. FoundationDB has the mutation
+%% `SetVersionstampedValue' for this.
+-type mutation() :: {set, term(), term()} | {clear, term()} | {clear_range, term(), term()} | {set_versionstamp, term()}.
 
 %% A batch that the Proxy has closed and has not finished.
 -record(commit, {
@@ -333,6 +339,15 @@
     batch_timer :: reference() | undefined,
     batch_idle = true :: boolean(),
     batch_depth = 1 :: pos_integer(),
+    %% The keys of the records of idempotency ids that clients do not
+    %% need, and the time of the last removal of old records, in
+    %% milliseconds.
+    expired = [] :: [term()],
+    cleaned = 0 :: integer(),
+    %% Whether a transaction with an idempotency id has arrived in this
+    %% epoch. The process removes old records only then, so an epoch
+    %% without such a transaction has no transaction of its own.
+    idempotent = false :: boolean(),
     %% The time at which the first transaction of the open batch arrived.
     batch_opened = 0 :: integer(),
     read_version_share = true :: boolean(),
@@ -410,6 +425,14 @@ commit_with_index(Proxy, Transaction, Timeout) ->
     catch
         exit:_ -> {error, commit_unknown_result}
     end.
+
+%% @doc Tells the process that the records of idempotency ids with the
+%% keys `Keys' are not needed. The process clears the keys with its next
+%% batch. The call sends one message and has no answer. See "Idempotency
+%% ids" in the module documentation.
+-spec expire(gen_server:server_ref(), [term()]) -> ok.
+expire(Proxy, Keys) when is_list(Keys) ->
+    gen_server:cast(Proxy, {expire, Keys}).
 
 %% @equiv read_version(Proxy, 5000)
 -spec read_version(gen_server:server_ref()) -> {ok, version()} | {error, term()}.
@@ -553,7 +576,8 @@ recovery_transaction(Recovered, First) ->
 %% @private
 handle_call({commit, Transaction}, From, State = #state{batch = Batch, batch_ms = Ms, batch_max = Max}) ->
     {Resolved, Entry} = split(Transaction),
-    State1 = State#state{batch = [{From, Resolved, Entry} | Batch]},
+    Idempotent = State#state.idempotent orelse (is_map(Transaction) andalso maps:get(idempotent, Transaction, false)),
+    State1 = State#state{batch = [{From, Resolved, Entry} | Batch], idempotent = Idempotent},
     case length(Batch) + 1 of
         Max ->
             close_batch(State1);
@@ -580,6 +604,8 @@ handle_call(info, _From, State = #state{epoch = Epoch, kcv = KCV, commits = Comm
     {reply, #{epoch => Epoch, kcv => KCV, waiting => map_size(Commits), stats => State#state.stats}, State}.
 
 %% @private
+handle_cast({expire, Keys}, State = #state{expired = Expired}) ->
+    {noreply, State#state{expired = Keys ++ Expired}};
 handle_cast(_Message, State) ->
     {noreply, State}.
 
@@ -611,12 +637,13 @@ handle_info(Message, State = #state{requests = Requests}) ->
 %% Closes the open batch. The process assigns the commit version, as the
 %% Sequencer of the paper does, and checks the transactions for conflicts,
 %% as the Resolver does. It then sends the record to the LogServers.
-close_batch(State0 = #state{options = Options, batch = Batch0, batch_timer = Timer, last = Last, live = Live}) ->
+close_batch(State00 = #state{options = Options, batch = Batch0, batch_timer = Timer, last = Last, live = Live}) ->
     _ = is_reference(Timer) andalso erlang:cancel_timer(Timer),
-    Batch = lists:reverse(Batch0),
+    {Internal, State0} = internal(State00),
+    Batch = lists:reverse(Batch0) ++ Internal,
     Closed = now_us(),
     State = add(
-        #{batches => 1, transactions => length(Batch), wait_us => Closed - State0#state.batch_opened},
+        #{batches => 1, transactions => length(Batch0), wait_us => Closed - State0#state.batch_opened},
         State0#state{batch = [], batch_timer = undefined}
     ),
     Clients = lists:enumerate(0, [From || {From, _Resolved, _Entry} <- Batch]),
@@ -630,15 +657,15 @@ close_batch(State0 = #state{options = Options, batch = Batch0, batch_timer = Tim
             %% no write.
             Checked = lists:zipwith3(
                 fun
-                    (Client, Entry, committed) ->
-                        {[Client], Entry};
+                    (Client = {Index, _From}, Entry, committed) ->
+                        {[Client], versionstamps(Entry, LSN, Index)};
                     ({_Index, From}, _Entry, Rejected) ->
                         Error =
                             case Rejected of
                                 conflict -> not_committed;
                                 too_old -> transaction_too_old
                             end,
-                        gen_server:reply(From, {error, Error}),
+                        ok = reply(From, {error, Error}),
                         {[], no_transaction}
                 end,
                 Clients,
@@ -676,6 +703,7 @@ split(Transaction) when is_map(Transaction) ->
         writes => lists:append([
             case Mutation of
                 {set, Key, _Value} -> [Key];
+                {set_versionstamp, Key} -> [Key];
                 {clear, Key} -> [Key];
                 {clear_range, _Begin, _End} -> []
             end
@@ -686,6 +714,51 @@ split(Transaction) when is_map(Transaction) ->
     {Resolved, Mutations};
 split(Entry) ->
     {#{read_version => 0, reads => [], writes => []}, Entry}.
+
+%% Replaces each `{set_versionstamp, Key}' of the entry of a committed
+%% transaction with a `set' of `{CommitVersion, Index}'.
+versionstamps(Entry, LSN, Index) when is_list(Entry) ->
+    [
+        case Mutation of
+            {set_versionstamp, Key} -> {set, Key, {LSN, Index}};
+            _ -> Mutation
+        end
+     || Mutation <- Entry
+    ];
+versionstamps(Entry, _LSN, _Index) ->
+    Entry.
+
+%% The transaction of the process itself for a batch, as a list with one
+%% element of the batch or without an element. The transaction clears the
+%% records of the idempotency ids that clients do not need (`expire/2').
+%% Every `idempotency_clean_ms' it also removes the records of the ids
+%% that are older than `idempotency_min_age_ms'
+%% (`deadlift_idempotency:clean/2'). The transaction has no client, no
+%% read and no read version, so the Resolver admits it.
+internal(State = #state{idempotent = false, expired = []}) ->
+    {[], State};
+internal(State = #state{options = Options, expired = Expired, cleaned = Cleaned}) ->
+    Now = erlang:system_time(millisecond),
+    {Clean, Cleaned1} =
+        case State#state.idempotent andalso Now - Cleaned >= maps:get(idempotency_clean_ms, Options, 10000) of
+            true -> {deadlift_idempotency:clean(Now, maps:get(idempotency_min_age_ms, Options, 3600000)), Now};
+            false -> {[], Cleaned}
+        end,
+    case [{clear, Key} || Key <- Expired] ++ Clean of
+        [] ->
+            {[], State#state{cleaned = Cleaned1}};
+        Mutations ->
+            {Resolved, Entry} = split(#{mutations => Mutations}),
+            {[{internal, Resolved, Entry}], State#state{expired = [], cleaned = Cleaned1}}
+    end.
+
+%% Answers the client of a transaction. The transaction of the process
+%% itself has no client.
+reply(internal, _Reply) ->
+    ok;
+reply(From, Reply) ->
+    gen_server:reply(From, Reply),
+    ok.
 
 %% Starts a confirmation for the clients `Froms': takes the read version,
 %% and asks the LogServers whether the epoch is live. The read version is
@@ -767,7 +840,7 @@ answered({push, LSN}, {error, Reason}, State) ->
     fail({shutdown, {log, LSN, Reason}}, State).
 
 reply_committed(LSN, Clients) ->
-    lists:foreach(fun({Index, From}) -> gen_server:reply(From, {ok, LSN, Index}) end, Clients).
+    lists:foreach(fun({Index, From}) -> reply(From, {ok, LSN, Index}) end, Clients).
 
 %% Sends the record to every LogServer of the epoch.
 push(LSN, State) ->
@@ -875,5 +948,5 @@ unknown(State = #state{commits = Commits, batch = Batch}) ->
     Waiting =
         [From || #commit{clients = Clients} <- maps:values(Commits), {_Index, From} <- Clients] ++
             [From || {From, _Resolved, _Entry} <- Batch],
-    lists:foreach(fun(From) -> gen_server:reply(From, {error, commit_unknown_result}) end, Waiting),
+    lists:foreach(fun(From) -> reply(From, {error, commit_unknown_result}) end, Waiting),
     State#state{commits = #{}, batch = []}.

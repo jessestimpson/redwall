@@ -89,7 +89,14 @@ restart_test_() ->
         %% One coordinator stops and starts again. The other two decide a
         %% value in between.
         ok = kill(C1),
-        {ok, 2, _} = deadlift_cstate:lock(Ids, 1, self(), 5000),
+        %% The stopped coordinator can be the leader. The call is then
+        %% repeated until the other two have a leader.
+        {ok, 2, _} = await(fun() ->
+            case deadlift_cstate:lock(Ids, 1, self(), 1000) of
+                {ok, 2, State1} -> {ok, {ok, 2, State1}};
+                Other1 -> Other1
+            end
+        end, 100),
         C1b = start(Id1, Dir),
         %% The other two stop. The coordinator that started again and one
         %% of them are a majority, so the first one has learned the value.
@@ -103,7 +110,12 @@ restart_test_() ->
         Again = [start(Id, Dir) || Id <- Ids],
         State = await(fun() -> deadlift_cstate:read(Ids, 1000) end, 100),
         ?assertMatch(#{count := 2, owner := Owner} when Owner =:= self(), State),
-        {ok, 3, _} = deadlift_cstate:lock(Ids, 2, self(), 5000),
+        {ok, 3, _} = await(fun() ->
+            case deadlift_cstate:lock(Ids, 2, self(), 1000) of
+                {ok, 3, State3} -> {ok, {ok, 3, State3}};
+                Other3 -> Other3
+            end
+        end, 100),
         %% A coordinator with an empty directory is not a member of the
         %% cluster.
         [ok = kill(C) || C <- Again],

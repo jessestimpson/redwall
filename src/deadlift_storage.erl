@@ -31,7 +31,9 @@
 %% LogServer of the epoch that has received none, because a LogServer can
 %% start after the first request. At every tenth interval, the
 %% StorageServer sends every request again, because a request or an answer
-%% can be lost.
+%% can be lost. At that interval, and when a request to a LogServer of
+%% its epoch fails, it also reads the coordinated state: an epoch can end
+%% while none of its LogServers can answer that it is stopped.
 %%
 %% The body of a record of a Proxy is `{batch, Entries}', with one entry
 %% for each transaction of the batch, in the order of the batch. The entry
@@ -626,8 +628,12 @@ handle_cast(_Message, State) ->
 
 %% @private
 handle_info(poll, State = #state{poll_ms = PollMs, system = System, stopped = Stopped}) ->
+    %% The StorageServer also reads the coordinated state at every tenth
+    %% interval. A LogServer of an ended epoch that does not run, or that
+    %% is cut off, does not answer that it is stopped. Without this read,
+    %% the StorageServer would wait for that epoch without an end.
     State1 =
-        case System =:= undefined orelse Stopped =/= [] of
+        case System =:= undefined orelse Stopped =/= [] orelse (State#state.ticks + 1) rem ?RESEND_TICKS =:= 0 of
             true -> refresh(State);
             false -> State
         end,
@@ -650,6 +656,11 @@ handle_info(Message, State = #state{requests = Requests}) ->
         {{reply, {ok, Records, Stopped, KCV}}, Label, Requests1} ->
             State1 = State#state{requests = Requests1, kcv = max(KCV, State#state.kcv)},
             {noreply, watch(advance_oldest(received(Label, Records, Stopped, State1)))};
+        {{error, _Reason}, {Epoch, _Log, _Number}, Requests1} when Epoch =:= map_get(epoch, State#state.system) ->
+            %% A LogServer of the epoch does not run, or the connection to
+            %% its node has ended. The epoch can have ended, so the
+            %% StorageServer reads the coordinated state.
+            {noreply, watch(refresh(State#state{requests = Requests1}))};
         {_ErrorOrOtherReply, _Label, Requests1} ->
             {noreply, State#state{requests = Requests1}};
         _NoRequestOrNoReply ->

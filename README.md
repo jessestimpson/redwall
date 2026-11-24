@@ -347,6 +347,58 @@ end).
   | `ets` | The StorageServer of deadlift, with the data in ETS tables in memory | 1 | 100 | `true` |
   `transactional/2` then runs the function again.
 
+### Idempotency ids
+
+A client that receives no answer to a commit does not know whether the
+transaction is committed (the error 1021). `transactional/2` runs the
+function again, so a committed transaction can be applied a second time.
+A transaction with an idempotency id is applied once. The design follows
+`design/idempotency_ids.md` of FoundationDB 7.3.62.
+
+```erlang
+Db = deadlift:open(#{automatic_idempotency => true}),
+deadlift:transactional(Db, fun(Tx) ->
+    N = deadlift:get(Tx, counter),
+    deadlift:set(Tx, counter, N + 1)
+end).
+```
+
+1. The commit of the transaction writes a record with the id and the
+   commit version, through the mutation `{set_versionstamp, Key}`, and has
+   a lock key of the id as a read conflict key.
+2. When the commit has no answer, the client commits a transaction that
+   clears the lock key. After this commit, the Resolver rejects the first
+   transaction, and a commit before it is visible to a later read.
+3. The client reads the record of the id. With the record, `commit/1`
+   returns `ok` with the commit version of the record. Without it,
+   `commit/1` raises 1007, and `transactional/2` runs the function again.
+4. After a commit with an answer, the client tells the Proxy that the
+   record is not needed, and the Proxy clears it with its next batch.
+
+- `deadlift:set_option(Tx, automatic_idempotency)` gives an id to one
+  transaction.
+- The Proxy removes the records that are older than
+  `idempotency_min_age_ms` (default 1 hour) and records that time. A
+  client whose id is older cannot determine the result, and `commit/1`
+  raises 1022, `commit_unknown_result_fatal`.
+- `commit/1` does not return while the result is not determined, also
+  while no Proxy runs.
+- A transaction with an id and without a read asks the Proxy for a read
+  version at its commit.
+- A key of the form `{'$deadlift', _, _}` is reserved. The records of the
+  ids have such keys ([deadlift_idempotency](src/deadlift_idempotency.erl)).
+- Differences from FoundationDB: the key of a record has the id, so the
+  client reads one key and not the keys of every possible commit version.
+  The time of an id is the time of the client. An application cannot
+  supply an id.
+
+A unit test puts a process in the place of the Proxy that stops without
+an answer after 2 commits in 7, and before 1 commit in 7. Without an id,
+100 increments of a counter give a value above 110. With an id, 200
+increments return 1 to 200 and give 200. In the benchmark of etx with
+three nodes on one computer, the p50 of `update_counter/3` is 135 us to
+139 us with ids, against 130 us to 135 us without.
+
 ### Select
 
 `deadlift:select/4` evaluates an ETS match spec on the keys of a range,
@@ -1494,6 +1546,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/deadlift_epoch.erl](src/deadlift_epoch.erl) | The process of an epoch: the Sequencer, the Resolver and the Proxy |
 | [src/deadlift_storage.erl](src/deadlift_storage.erl) | The StorageServer |
 | [src/deadlift.erl](src/deadlift.erl) | The client, with the function names of erlfdb |
+| [src/deadlift_idempotency.erl](src/deadlift_idempotency.erl) | The keys of the idempotency ids |
 | [src/deadlift_mapper.erl](src/deadlift_mapper.erl) | The mapper of a mapped range read |
 | [src/deadlift_tuple.erl](src/deadlift_tuple.erl), [src/deadlift_float.erl](src/deadlift_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |
 | [src/deadlift_cluster_controller.erl](src/deadlift_cluster_controller.erl) | The ClusterController: the election, the workers and the recruitment |

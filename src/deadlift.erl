@@ -107,6 +107,9 @@
 %% <li>1020, `not_committed': the transaction has a conflict.</li>
 %% <li>1021, `commit_unknown_result': the transaction is committed or is
 %%   not committed.</li>
+%% <li>1022, `commit_unknown_result_fatal': the record of the idempotency
+%%   id can be removed, so the result of the commit cannot be
+%%   determined.</li>
 %% <li>1025, `transaction_cancelled'.</li>
 %% <li>2030, 2032, 2039, 2041, 2042, 2043 and 2108: the errors of
 %%   `get_mapped_range/5'.</li>
@@ -131,7 +134,50 @@
 %%
 %% `transactional/2' runs the function again after `on_error/2' returns.
 %% After 1021 the first attempt can be committed, so the function must
-%% give the same result when it runs twice.
+%% give the same result when it runs twice, unless the transaction has an
+%% idempotency id.
+%%
+%% == Idempotency ==
+%%
+%% A transaction with an idempotency id is not applied two times by
+%% `transactional/2'. The option `automatic_idempotency => true' of
+%% `open/1' gives an id to every transaction of the database, and
+%% `set_option(Tx, automatic_idempotency)' gives one to a transaction.
+%% FoundationDB has the transaction option `AUTOMATIC_IDEMPOTENCY' for
+%% this (`design/idempotency_ids.md'). See {@link deadlift_idempotency}
+%% for the keys.
+%%
+%% <ol>
+%% <li>`commit/1' adds the mutation `{set_versionstamp, Key}' for the key
+%%   of the id, and the lock key of the id as a read conflict key. A
+%%   committed transaction therefore has a record with its commit version
+%%   in the database.</li>
+%% <li>When the commit has no answer, `commit/1' does not raise 1021. It
+%%   commits a transaction that clears the lock key of the id. After this
+%%   commit, the first transaction cannot commit: the Resolver rejects it
+%%   for its read conflict key. A commit before it is visible to a later
+%%   read.</li>
+%% <li>`commit/1' then reads the record of the id. With the record, the
+%%   transaction is committed, and `commit/1' returns `ok' with the commit
+%%   version of the record. Without the record, the transaction is not
+%%   committed and cannot commit, and `commit/1' raises 1007, so that
+%%   `transactional/2' runs the function again.</li>
+%% <li>The two steps are repeated until they have an answer, also while
+%%   no Proxy runs. `commit/1' does not return in that time.</li>
+%% <li>After a commit with an answer, the client tells the Proxy that the
+%%   record is not needed (`deadlift_epoch:expire/2'), and the Proxy
+%%   clears it with its next batch. The Proxy also removes the records
+%%   that are older than `idempotency_min_age_ms' (default 1 hour), and
+%%   records that time. A client whose id is older than that time cannot
+%%   determine the result, and `commit/1' raises 1022,
+%%   `commit_unknown_result_fatal'.</li>
+%% </ol>
+%%
+%% A transaction with an id has one more mutation and one more read
+%% conflict key. A transaction with an id and without a read asks the
+%% Proxy for a read version at its commit, because the read conflict key
+%% needs one. The transaction keeps its id over `on_error/2', and gets
+%% a new id after a commit.
 %%
 %% == Profiles ==
 %%
@@ -161,7 +207,8 @@
 %%   documentation of the function.</li>
 %% <li>The module has no key selectors, no options of `get_range', no
 %%   atomic operations, no versionstamped keys and values, no watches, no
-%%   transaction options, no tenants and no `get_last_error/0'.</li>
+%%   tenants and no `get_last_error/0'. The only transaction option is
+%%   `automatic_idempotency'.</li>
 %% <li>A database is a Proxy and a list of StorageServers that the caller
 %%   names. deadlift has no process that tells a client which Proxy and
 %%   which StorageServers run.</li>
@@ -183,7 +230,7 @@
 -export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, select/4, select/5, set/3, clear/2, clear_range/3]).
 -export([get_mapped_range/4, get_mapped_range/5]).
--export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2]).
+-export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2, set_option/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
 -export([add_read_conflict_key/2, add_read_conflict_range/3, is_read_only/1]).
 
@@ -217,6 +264,7 @@
     direct => boolean(),
     retry_delay_ms => number(),
     max_retry_delay_ms => number(),
+    automatic_idempotency => boolean(),
     profile => profile()
 }.
 
@@ -241,6 +289,7 @@
 -define(FUTURE_VERSION, 1009).
 -define(NOT_COMMITTED, 1020).
 -define(COMMIT_UNKNOWN_RESULT, 1021).
+-define(COMMIT_UNKNOWN_RESULT_FATAL, 1022).
 -define(TRANSACTION_CANCELLED, 1025).
 -define(PROCESS_BEHIND, 1037).
 -define(GET_MAPPED_RANGE_READS_YOUR_WRITES, 2039).
@@ -276,7 +325,7 @@
 open(Servers) when not is_map_key(proxy, Servers); not is_map_key(storage, Servers) ->
     open(maps:merge(local(), Servers));
 open(Servers = #{proxy := _, storage := _}) ->
-    Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms], Servers),
+    Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms, automatic_idempotency], Servers),
     {deadlift_database, maps:merge(profile(maps:get(profile, Servers, default)), Options)}.
 
 %% @equiv open(#{})
@@ -316,7 +365,17 @@ profile(ets) ->
 create_transaction({deadlift_database, Servers}) ->
     Table = ets:new(deadlift_transaction, [ordered_set, public]),
     true = ets:insert(Table, [{db, Servers}, {state, open}, {seq, 0}, {backoff, maps:get(retry_delay_ms, Servers, ?BACKOFF_MS)}]),
+    _ = maps:get(automatic_idempotency, Servers, false) andalso ets:insert(Table, {idempotency, auto}),
     {deadlift_transaction, Table}.
+
+%% @doc Sets an option of the transaction. The only option is
+%% `automatic_idempotency'. See "Idempotency" in the module
+%% documentation. The transaction keeps the option over `reset/1'.
+-spec set_option(transaction(), automatic_idempotency) -> ok.
+set_option(?IS_TX = Tx, automatic_idempotency) ->
+    {Table, _} = table(Tx),
+    true = ets:insert(Table, {idempotency, auto}),
+    ok.
 
 %% @doc Runs `Fun' in a transaction, and commits the transaction. After an
 %% error that `on_error/2' accepts, `transactional/2' runs `Fun' again. With
@@ -744,28 +803,112 @@ commit(?IS_TX = Tx) ->
         [] ->
             true = ets:insert(Table, [{state, committed}, {committed, -1, 0}]),
             ok;
-        Mutations ->
+        Mutations0 ->
+            %% A transaction with an idempotency id writes the record of
+            %% the id, and has the lock key of the id as a read conflict
+            %% key.
+            Id = idempotency_id(Table),
+            {Mutations, Locks} =
+                case Id of
+                    none -> {Mutations0, []};
+                    _ -> {Mutations0 ++ [{set_versionstamp, deadlift_idempotency:key(Id)}], [deadlift_idempotency:lock_key(Id)]}
+                end,
             Transaction = #{
                 read_version =>
                     case ets:lookup(Table, read_version) of
                         [{_, Version}] -> Version;
+                        %% A transaction without a read has no read
+                        %% version. With an idempotency id it has a read
+                        %% conflict key, so it needs one.
+                        [] when Id =/= none -> read_version(Table);
                         [] -> 0
                     end,
-                reads => ets:select(Table, [{{{r, '$1'}}, [], ['$1']}]),
+                reads => ets:select(Table, [{{{r, '$1'}}, [], ['$1']}]) ++ Locks,
                 read_ranges => ets:select(Table, [{{{rr, '_'}, '$1', '$2'}, [], [{{'$1', '$2'}}]}]),
-                mutations => Mutations
+                mutations => Mutations,
+                %% The Proxy removes old records of idempotency ids only
+                %% in an epoch with such a transaction.
+                idempotent => Id =/= none
             },
             case deadlift_epoch:commit_with_index(server(Table, proxy), Transaction, ?TIMEOUT_MS) of
                 {ok, LSN, Index} ->
-                    true = ets:insert(Table, [{state, committed}, {committed, LSN, Index}]),
-                    ok;
+                    committed(Table, Id, LSN, Index);
                 {error, not_committed} ->
                     error({erlfdb_error, ?NOT_COMMITTED});
                 {error, transaction_too_old} ->
                     error({erlfdb_error, ?TRANSACTION_TOO_OLD});
+                {error, commit_unknown_result} when Id =:= none ->
+                    error({erlfdb_error, ?COMMIT_UNKNOWN_RESULT});
                 {error, commit_unknown_result} ->
-                    error({erlfdb_error, ?COMMIT_UNKNOWN_RESULT})
+                    [{db, Servers}] = ets:lookup(Table, db),
+                    case determine(Servers, Id, maps:get(retry_delay_ms, Servers, ?BACKOFF_MS)) of
+                        {committed, LSN, Index} -> committed(Table, Id, LSN, Index);
+                        %% The transaction is not committed and cannot
+                        %% commit. FoundationDB raises the same error.
+                        not_committed -> error({erlfdb_error, ?TRANSACTION_TOO_OLD})
+                    end
             end
+    end.
+
+committed(Table, Id, LSN, Index) ->
+    true = ets:insert(Table, [{state, committed}, {committed, LSN, Index}]),
+    %% The record of the id is not needed. The message can be lost. The
+    %% Proxy then removes the record by its age.
+    _ =
+        Id =/= none andalso
+            try
+                deadlift_epoch:expire(server(Table, proxy), [deadlift_idempotency:key(Id)])
+            catch
+                error:_ -> ok
+            end,
+    ok.
+
+%% The idempotency id of the transaction, or `none'. A transaction with
+%% the option gets its id at the first commit.
+idempotency_id(Table) ->
+    case {ets:lookup(Table, idempotency), ets:lookup(Table, idempotency_id)} of
+        {[], _} ->
+            none;
+        {[{idempotency, auto}], [{idempotency_id, Id}]} ->
+            Id;
+        {[{idempotency, auto}], []} ->
+            Id = deadlift_idempotency:new(),
+            true = ets:insert(Table, {idempotency_id, Id}),
+            Id
+    end.
+
+%% Determines the result of a commit without an answer. See
+%% "Idempotency" in the module documentation. The function tries again
+%% after an error, with the backoff of the database, until it has an
+%% answer.
+determine(Servers, Id, Backoff) ->
+    Db = {deadlift_database, Servers#{automatic_idempotency => false}},
+    Lock = {deadlift_transaction, LockTable} = create_transaction(Db),
+    Read = {deadlift_transaction, ReadTable} = create_transaction(Db),
+    try
+        %% After this commit, the transaction with the id cannot commit.
+        ok = clear(Lock, deadlift_idempotency:lock_key(Id)),
+        ok = commit(Lock),
+        %% The read version of this read is at or above that commit.
+        Snapshot = snapshot(Read),
+        {get(Snapshot, deadlift_idempotency:expired_key()), get(Snapshot, deadlift_idempotency:key(Id))}
+    of
+        {_Expired, {LSN, Index}} ->
+            {committed, LSN, Index};
+        {Expired, not_found} when is_integer(Expired) ->
+            case deadlift_idempotency:time(Id) < Expired of
+                true -> error({erlfdb_error, ?COMMIT_UNKNOWN_RESULT_FATAL});
+                false -> not_committed
+            end;
+        {not_found, not_found} ->
+            not_committed
+    catch
+        error:{erlfdb_error, _Code} ->
+            timer:sleep(round(Backoff)),
+            determine(Servers, Id, min(maps:get(max_retry_delay_ms, Servers, ?MAX_BACKOFF_MS), Backoff * 2))
+    after
+        ets:delete(LockTable),
+        ets:delete(ReadTable)
     end.
 
 %% @doc Removes the reads and the writes of the transaction.
@@ -773,8 +916,17 @@ commit(?IS_TX = Tx) ->
 reset({deadlift_transaction, Table}) ->
     [{db, Servers}] = ets:lookup(Table, db),
     [{backoff, Backoff}] = ets:lookup(Table, backoff),
+    %% The transaction keeps the option for an idempotency id. It keeps
+    %% the id unless it is committed: the next commit is then the commit
+    %% of another transaction.
+    Kept =
+        ets:lookup(Table, idempotency) ++
+            case ets:lookup(Table, state) of
+                [{state, committed}] -> [];
+                _ -> ets:lookup(Table, idempotency_id)
+            end,
     true = ets:delete_all_objects(Table),
-    true = ets:insert(Table, [{db, Servers}, {state, open}, {seq, 0}, {backoff, Backoff}]),
+    true = ets:insert(Table, [{db, Servers}, {state, open}, {seq, 0}, {backoff, Backoff} | Kept]),
     ok.
 
 %% @doc Cancels the transaction. A later operation of the transaction

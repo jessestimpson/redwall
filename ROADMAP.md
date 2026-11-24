@@ -150,6 +150,10 @@ has the basic functions. The remaining parts, in the planned order:
       directory layer of erlfdb usable.
 - [ ] The fold functions, `get_range_startswith` and
       `clear_range_startswith`.
+- [x] Idempotency ids: a transaction whose commit has no answer is not
+      applied a second time (`automatic_idempotency`).
+- [ ] An idempotency id that the application supplies, and the functions
+      of FoundationDB for the result and the expiry of an id.
 - [ ] Transaction options, for example `timeout` and `retry_limit`, and
       the limits of a transaction for time and size.
 - [ ] `add_write_conflict_key`, `add_write_conflict_range` and

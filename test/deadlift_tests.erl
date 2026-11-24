@@ -22,7 +22,8 @@ client_test_() ->
         fun(Db) -> {timeout, 60, fun() -> select_random(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> mapped_range(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> mapped_range_conflicts(Db) end} end,
-        fun(Db) -> {timeout, 60, fun() -> mapped_range_random(Db) end} end
+        fun(Db) -> {timeout, 60, fun() -> mapped_range_random(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> idempotency(Db) end} end
     ]}.
 
 setup() ->
@@ -744,3 +745,148 @@ mapped_range_random(Db = {deadlift_database, Servers}) ->
     ),
     %% Most reads are inside the MVCC window.
     ?assert(length([ok || ok <- Checks]) > 1500, length([ok || ok <- Checks])).
+
+%% A process in the place of the Proxy for a test. It sends each request
+%% to the Proxy `Real'. `Plan' is a function of the number of the commit:
+%%
+%% <ul>
+%% <li>`forward': the client receives the answer of the Proxy.</li>
+%% <li>`commit_and_stop': the Proxy commits the transaction, and this
+%%   process stops without an answer. The client has an unknown
+%%   result for a committed transaction.</li>
+%% <li>`stop': this process stops before it sends the commit. The client
+%%   has an unknown result for a transaction that is not committed.</li>
+%% </ul>
+relay(Real, Counter, Plan) ->
+    receive
+        {'$gen_call', From, {commit, Transaction}} ->
+            case Plan(ets:update_counter(Counter, commits, 1, {commits, 0})) of
+                forward ->
+                    gen_server:reply(From, gen_server:call(Real, {commit, Transaction})),
+                    relay(Real, Counter, Plan);
+                commit_and_stop ->
+                    {ok, _LSN, _Index} = gen_server:call(Real, {commit, Transaction}),
+                    exit(stopped);
+                stop ->
+                    exit(stopped)
+            end;
+        {'$gen_call', From, Request} ->
+            gen_server:reply(From, gen_server:call(Real, Request)),
+            relay(Real, Counter, Plan);
+        {'$gen_cast', Message} ->
+            gen_server:cast(Real, Message),
+            relay(Real, Counter, Plan)
+    end.
+
+%% A database whose Proxy is a `relay/3' process. A new process takes the
+%% place of a stopped one.
+relayed({deadlift_database, Servers = #{proxy := Real}}, Counter, Plan, Options) ->
+    Proxy = fun() ->
+        case ets:lookup(Counter, relay) of
+            [{relay, Pid}] when is_pid(Pid) ->
+                case is_process_alive(Pid) of
+                    true ->
+                        Pid;
+                    false ->
+                        New = spawn(fun() -> relay(Real, Counter, Plan) end),
+                        true = ets:insert(Counter, {relay, New}),
+                        New
+                end;
+            [] ->
+                New = spawn(fun() -> relay(Real, Counter, Plan) end),
+                true = ets:insert(Counter, {relay, New}),
+                New
+        end
+    end,
+    deadlift:open(maps:merge(Servers#{proxy => Proxy, retry_delay_ms => 1, max_retry_delay_ms => 5}, Options)).
+
+%% A transaction with an idempotency id is applied once when its commit
+%% has no answer. Without the id, `transactional/2' applies a committed
+%% transaction a second time.
+idempotency(Db = {deadlift_database, #{proxy := Real}}) ->
+    Counter = ets:new(counter, [public]),
+    %% 2 commits in 7 are committed without an answer, and 1 commit in 7
+    %% is not sent. The commits that determine a result are counted too.
+    Plan = fun(N) ->
+        case N rem 7 of
+            1 -> commit_and_stop;
+            4 -> commit_and_stop;
+            5 -> stop;
+            _ -> forward
+        end
+    end,
+    Increment = fun(D, Key) ->
+        deadlift:transactional(D, fun(Tx) ->
+            Value =
+                case deadlift:get(Tx, Key) of
+                    not_found -> 0;
+                    Found -> Found
+                end,
+            ok = deadlift:set(Tx, Key, Value + 1),
+            Value + 1
+        end)
+    end,
+    Read = fun(Key) -> deadlift:transactional(Db, fun(Tx) -> deadlift:get(Tx, Key) end) end,
+    %% Without an id, a committed transaction runs again.
+    Plain = relayed(Db, Counter, Plan, #{}),
+    _ = [Increment(Plain, plain) || _ <- lists:seq(1, 100)],
+    ?assert(Read(plain) > 110, Read(plain)),
+    %% With an id for every transaction of the database.
+    Safe = relayed(Db, Counter, Plan, #{automatic_idempotency => true}),
+    Results = [Increment(Safe, safe) || _ <- lists:seq(1, 200)],
+    ?assertEqual(lists:seq(1, 200), Results),
+    ?assertEqual(200, Read(safe)),
+    %% With the option of a transaction.
+    lists:foreach(
+        fun(N) ->
+            Tx = deadlift:create_transaction(Plain),
+            ok = deadlift:set_option(Tx, automatic_idempotency),
+            Retry = fun Attempt() ->
+                try
+                    Value =
+                        case deadlift:get(Tx, option) of
+                            not_found -> 0;
+                            Found -> Found
+                        end,
+                    ok = deadlift:set(Tx, option, Value + 1),
+                    ok = deadlift:commit(Tx)
+                catch
+                    error:{erlfdb_error, Code} ->
+                        ok = deadlift:on_error(Tx, Code),
+                        Attempt()
+                end
+            end,
+            ok = Retry(),
+            %% The commit version of a transaction whose commit had no
+            %% answer is the commit version of its record.
+            ?assert(deadlift:get_committed_version(Tx) > 0),
+            ?assertEqual(N, Read(option))
+        end,
+        lists:seq(1, 50)
+    ),
+    %% A transaction without a read gets a read version at its commit.
+    %% The versions of the test are below the MVCC window of the Resolver,
+    %% so the test only checks the write.
+    ok = deadlift:transactional(Safe, fun(Tx) -> deadlift:set(Tx, blind, 1) end),
+    ?assertEqual(1, Read(blind)),
+    %% The Proxy clears the records of the ids with its batches.
+    ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, flush, 1) end),
+    Records = deadlift:transactional(Db, fun(Tx) ->
+        deadlift:get_range(Tx, deadlift_idempotency:key({0, 0}), deadlift_idempotency:key({1 bsl 62, 0}))
+    end),
+    ?assert(length(Records) < 5, Records),
+    %% The mutation `set_versionstamp' sets a key to the commit version
+    %% and the index of its transaction.
+    {ok, LSN, Index} = deadlift_epoch:commit_with_index(Real, #{mutations => [{set_versionstamp, stamp}, {set, other, 1}]}, 5000),
+    ?assertEqual({LSN, Index}, Read(stamp)),
+    %% The records below the time of the key `idmp_expired' can be
+    %% removed. A commit without an answer and without a record then has
+    %% a result that cannot be determined.
+    ok = deadlift:transactional(Db, fun(Tx) -> deadlift:set(Tx, deadlift_idempotency:expired_key(), 1 bsl 60) end),
+    Stop = relayed(Db, ets:new(counter, [public]), fun(1) -> stop; (_) -> forward end, #{automatic_idempotency => true}),
+    ?assertError({erlfdb_error, 1022}, Increment(Stop, fatal)),
+    ?assertEqual(not_found, Read(fatal)),
+    %% A commit without an answer and with a record is committed.
+    Committed = relayed(Db, ets:new(counter, [public]), fun(1) -> commit_and_stop; (_) -> forward end, #{automatic_idempotency => true}),
+    ?assertEqual(1, Increment(Committed, old_record)),
+    ?assertEqual(1, Read(old_record)).
