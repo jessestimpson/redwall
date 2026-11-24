@@ -1,5 +1,8 @@
 # redwall
 
+[![CI](https://github.com/jessestimpson/redwall/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jessestimpson/redwall/actions/workflows/ci.yml)
+[![Model check](https://github.com/jessestimpson/redwall/actions/workflows/model.yml/badge.svg?branch=main)](https://github.com/jessestimpson/redwall/actions/workflows/model.yml)
+
 redwall is an implementation of the transaction system of FoundationDB in
 Erlang. A [peace](https://github.com/jessestimpson/peace) cluster has the
 role of the Coordinators.
@@ -1728,6 +1731,22 @@ Limitations of the benchmark:
 - The clients run on the node of the benchmark, so the rows with many
   clients measure that node too.
 - A kill stops one process. The node of the process continues.
+
+## Continuous integration
+
+GitHub Actions runs two workflows, with Erlang/OTP 28.3 on
+`ubuntu-latest`.
+
+| Workflow | Job | Command | Runs on |
+|---|---|---|---|
+| [CI](.github/workflows/ci.yml) | Unit tests | `make compile`, `make test` | Each push to `main` and each pull request |
+| CI | Deterministic simulation | `dst/run.sh -j N`, with N the number of processors of the runner | Each push to `main` and each pull request |
+| [Model check](.github/workflows/model.yml) | TLC | `formal/check_all.sh quick` | Each push to `main` and each pull request that changes a file in `formal/` |
+| Model check | TLC | `formal/check_all.sh` with the set `resolver`, `recovery` or `long` | A manual start of the workflow with that set |
+
+- The workflows build with peace and eta from the branch `main` of their
+  repositories.
+- GitHub Actions does not run `make bench`.
 
 ## Commands
 
