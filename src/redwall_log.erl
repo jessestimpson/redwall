@@ -63,6 +63,48 @@
 %% The peek of FoundationDB waits for new records in the same way. This
 %% part is not in the paper.
 %%
+%% == Pop ==
+%%
+%% A LogServer discards the records that every StorageServer of the
+%% cluster has stored. The pop of FoundationDB has the same purpose
+%% (`tLogPop' of `fdbserver/TLogServer.actor.cpp'). This part is not in
+%% the paper.
+%%
+%% <ol>
+%% <li>The ClusterController sends the request `{pop, Version, kcv}'
+%%   (`pop/2'): every StorageServer of the cluster has stored the records
+%%   at or below `Version' (see "Pop" in
+%%   {@link redwall_cluster_controller}).</li>
+%% <li>The LogServer keeps the highest `Version' of the requests. It
+%%   discards the records at or below the lower one of that version and
+%%   of its Known Committed Version. The highest LSN that the LogServer
+%%   has discarded in this way is its popped version.</li>
+%% <li>A push can raise the Known Committed Version. The LogServer then
+%%   discards the records up to the new limit.</li>
+%% </ol>
+%%
+%% The limit of the Known Committed Version keeps the records that a
+%% recovery copies. A recovery copies the records above the previous
+%% epoch's end version, which is the maximum of the Known Committed
+%% Versions of the LogServers that answer the lock. The popped version of
+%% each of these LogServers is at or below that maximum.
+%%
+%% A LogServer has no record at or below its popped version:
+%%
+%% <ul>
+%% <li>The answer to `tail/2' with `After' below the popped version is
+%%   `{popped, Popped}'. The StorageServer that sent the request cannot
+%%   read the records between `After' and `Popped' from this LogServer.
+%%   It copies the data from another StorageServer.</li>
+%% <li>The answer to a push of a record at or below the popped version is
+%%   `{ok, DV}'. Every LogServer of the epoch has stored such a
+%%   record.</li>
+%% </ul>
+%%
+%% A LogServer that a Sequencer has locked discards records in the same
+%% way. Its Known Committed Version does not change, so it keeps the
+%% records above that version until its process stops.
+%%
 %% == Confirmation of the epoch ==
 %%
 %% A Proxy asks the LogServers of its epoch whether the epoch is live
@@ -91,12 +133,13 @@
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
--eta_observe({state, [epoch, dv, kcv, records, stopped_by]}).
+-eta_observe({state, [epoch, dv, kcv, records, stopped_by, popped]}).
 
 -export([start/1, start_link/1, stop/1, ref/1]).
 -export([lost/2, alive/1, durability/0]).
 -export([replicas/3]).
 -export([push/6, push/7, send_push/6, lock/2, lock/3, confirm/2, peek/3, peek/4, tail/2, tail/3, info/1]).
+-export([pop/2, pop/3]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
 -export_type([id/0, body/0, record/0, options/0, info/0]).
@@ -136,7 +179,11 @@
     dv := version(),
     kcv := version(),
     stopped_by := epoch() | undefined,
-    waiting := non_neg_integer()
+    waiting := non_neg_integer(),
+    %% The popped version, and the number of records that the LogServer
+    %% has.
+    popped := version(),
+    records := non_neg_integer()
 }.
 
 -record(state, {
@@ -154,7 +201,13 @@
     waiting = #{} :: #{version() => {version(), version(), body(), [gen_server:from()]}},
     %% Caller -> {From, After}: the tail requests that wait for a record.
     tails = #{} :: #{pid() => {gen_server:from(), version()}},
-    stopped_by :: epoch() | undefined
+    stopped_by :: epoch() | undefined,
+    %% The highest LSN that the LogServer has discarded after a pop
+    %% request, the highest version of the pop requests, and the limit of
+    %% the last pop request. See "Pop" in the module documentation.
+    popped = 0 :: version(),
+    pop_request = 0 :: version(),
+    pop_limit = kcv :: kcv | none
 }).
 
 -define(TIMEOUT_MS, 5000).
@@ -323,17 +376,36 @@ peek(Log, After, UpTo, Timeout) ->
     gen_server:call(Log, {peek, After, UpTo}, Timeout).
 
 %% @equiv tail(Log, After, 5000)
--spec tail(gen_server:server_ref(), version()) -> {ok, [record()], boolean(), version()}.
+-spec tail(gen_server:server_ref(), version()) -> {ok, [record()], boolean(), version()} | {popped, version()}.
 tail(Log, After) ->
     tail(Log, After, ?TIMEOUT_MS).
 
 %% @doc Returns the stored records above `After', whether the LogServer is
 %% stopped, and the Known Committed Version of the LogServer. The call
 %% waits while the LogServer has no record above `After' and is not
-%% stopped.
--spec tail(gen_server:server_ref(), version(), timeout()) -> {ok, [record()], boolean(), version()}.
+%% stopped. The result is `{popped, Popped}' if `After' is below the
+%% popped version `Popped' of the LogServer: the LogServer has discarded
+%% records above `After'.
+-spec tail(gen_server:server_ref(), version(), timeout()) -> {ok, [record()], boolean(), version()} | {popped, version()}.
 tail(Log, After, Timeout) ->
     gen_server:call(Log, {tail, After}, Timeout).
+
+%% @equiv pop(Log, Version, kcv)
+-spec pop(gen_server:server_ref(), version()) -> ok.
+pop(Log, Version) ->
+    pop(Log, Version, kcv).
+
+%% @doc Tells the LogServer that every StorageServer of the cluster has
+%% stored the records at or below `Version'. The LogServer discards these
+%% records up to its Known Committed Version. See "Pop" in the module
+%% documentation. The function does not wait for the LogServer.
+%%
+%% The limit `none' plants a defect for the simulation: the LogServer
+%% discards the records at or below `Version' without the limit of its
+%% Known Committed Version.
+-spec pop(gen_server:server_ref(), version(), kcv | none) -> ok.
+pop(Log, Version, Limit) when is_integer(Version), Limit =:= kcv orelse Limit =:= none ->
+    gen_server:cast(Log, {pop, Version, Limit}).
 
 -spec info(gen_server:server_ref()) -> info().
 info(Log) ->
@@ -381,7 +453,9 @@ handle_call({push, _Epoch, _Prev, _LSN, _KCV, _Body}, _From, State = #state{stop
 handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV}) when Prev =:= DV, LSN > DV ->
     State1 = store(Prev, LSN, KCV, Body, State),
     gen_server:reply(From, {ok, State1#state.dv}),
-    {noreply, answer_tails(false, release(State1))};
+    %% The push can have raised the Known Committed Version, which is the
+    %% limit of a pop.
+    {noreply, discard(answer_tails(false, release(State1)))};
 handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV, waiting = Waiting}) when Prev > DV, LSN > Prev ->
     %% The record with the previous LSN has not arrived.
     case Waiting of
@@ -392,6 +466,10 @@ handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV, 
         _ ->
             {noreply, State#state{waiting = Waiting#{Prev => {LSN, KCV, Body, [From]}}}}
     end;
+handle_call({push, _Epoch, _Prev, LSN, _KCV, _Body}, _From, State = #state{dv = DV, popped = Popped}) when LSN =< Popped ->
+    %% The LogServer has stored the record and has discarded it after a
+    %% pop.
+    {reply, {ok, DV}, State};
 handle_call({push, _Epoch, Prev, LSN, _KCV, Body}, _From, State = #state{dv = DV, records = Records}) ->
     %% The LSN is at or below the DV, or the previous LSN is below the DV.
     case ets:lookup(Records, LSN) of
@@ -419,6 +497,9 @@ handle_call({confirm, _Epoch}, _From, State = #state{stopped_by = undefined}) ->
     {reply, ok, State};
 handle_call({confirm, _Epoch}, _From, State) ->
     {reply, {error, stopped}, State};
+handle_call({tail, After}, {Caller, _Tag}, State = #state{popped = Popped, tails = Tails}) when After < Popped ->
+    %% The LogServer has discarded records above `After'.
+    {reply, {popped, Popped}, State#state{tails = maps:remove(Caller, Tails)}};
 handle_call({tail, After}, From = {Caller, _Tag}, State = #state{dv = DV, kcv = KCV, stopped_by = By, records = Records, tails = Tails}) ->
     case After < DV orelse By =/= undefined of
         true ->
@@ -432,13 +513,50 @@ handle_call({peek, After, UpTo}, _From, State = #state{records = Records}) ->
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 handle_call(info, _From, State) ->
-    #state{epoch = Epoch, dv = DV, kcv = KCV, stopped_by = By, waiting = Waiting} = State,
-    Info = #{epoch => Epoch, dv => DV, kcv => KCV, stopped_by => By, waiting => map_size(Waiting)},
+    #state{epoch = Epoch, dv = DV, kcv = KCV, stopped_by = By, waiting = Waiting, popped = Popped, records = Records} = State,
+    Info = #{
+        epoch => Epoch,
+        dv => DV,
+        kcv => KCV,
+        stopped_by => By,
+        waiting => map_size(Waiting),
+        popped => Popped,
+        records => ets:info(Records, size)
+    },
     {reply, Info, State}.
 
 %% @private
+handle_cast({pop, Version, Limit}, State = #state{pop_request = Request}) ->
+    {noreply, discard(State#state{pop_request = max(Request, Version), pop_limit = Limit})};
 handle_cast(_Message, State) ->
     {noreply, State}.
+
+%% Discards the records at or below the lower one of the highest version
+%% of the pop requests and of the Known Committed Version. See "Pop" in
+%% the module documentation. With the planted defect of the limit `none',
+%% the Known Committed Version is no limit.
+discard(State = #state{pop_request = Request, pop_limit = Limit, kcv = KCV, popped = Popped, records = Records}) ->
+    Target =
+        case Limit of
+            kcv -> min(Request, KCV);
+            none -> Request
+        end,
+    case Target > Popped of
+        true ->
+            ok = delete_up_to(Target, ets:first(Records), Records),
+            State#state{popped = Target};
+        false ->
+            State
+    end.
+
+%% Deletes the rows with an LSN at or below `Target', from the lowest LSN
+%% up. The function reads only these rows and the row after them.
+delete_up_to(Target, LSN, Records) when is_integer(LSN), LSN =< Target ->
+    Next = ets:next(Records, LSN),
+    true = ets:delete(Records, LSN),
+    delete_up_to(Target, Next, Records);
+delete_up_to(_Target, _LSNAboveTargetOrEndOfTable, _Records) ->
+    ok.
 
 %% Answers the tail requests that wait: after a push, the requests with
 %% `After' below the DV; after a lock, every request.

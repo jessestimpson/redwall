@@ -123,6 +123,44 @@ records_above_start_test() ->
     ),
     process_flag(trap_exit, false).
 
+%% A pop discards the records at or below the pop version, up to the
+%% Known Committed Version of the LogServer.
+pop_test() ->
+    Log = start(#{epoch => 1}),
+    {ok, 1} = redwall_log:push(Log, 1, 0, 1, 0, {body, a}),
+    {ok, 2} = redwall_log:push(Log, 1, 1, 2, 1, {body, b}),
+    {ok, 3} = redwall_log:push(Log, 1, 2, 3, 2, {body, c}),
+    {ok, 4} = redwall_log:push(Log, 1, 3, 4, 2, {body, d}),
+    ?assertMatch(#{kcv := 2, popped := 0, records := 4}, redwall_log:info(Log)),
+    %% The pop version 3 is above the Known Committed Version 2.
+    ok = redwall_log:pop(Log, 3),
+    ?assertMatch(#{popped := 2, records := 2}, redwall_log:info(Log)),
+    ?assertEqual({ok, [{3, 2, {body, c}}, {4, 3, {body, d}}]}, redwall_log:peek(Log, 0, infinity)),
+    %% A tail request below the popped version has no records.
+    ?assertEqual({popped, 2}, redwall_log:tail(Log, 1)),
+    ?assertEqual({ok, [{3, 2, {body, c}}, {4, 3, {body, d}}], false, 2}, redwall_log:tail(Log, 2)),
+    %% A push raises the Known Committed Version to 4. The LogServer
+    %% discards the records up to the pop version 3.
+    {ok, 5} = redwall_log:push(Log, 1, 4, 5, 4, {body, e}),
+    ?assertMatch(#{kcv := 4, popped := 3, records := 2}, redwall_log:info(Log)),
+    %% A lower pop version has no effect.
+    ok = redwall_log:pop(Log, 1),
+    ?assertMatch(#{popped := 3, records := 2}, redwall_log:info(Log)),
+    %% A discarded record that is sent a second time is stored.
+    ?assertEqual({ok, 5}, redwall_log:push(Log, 1, 0, 1, 0, {body, a})),
+    %% A stopped LogServer discards records, and answers a tail request
+    %% below the popped version in the same way.
+    {ok, #{dv := 5, kcv := 4}} = redwall_log:lock(Log, 2),
+    ok = redwall_log:pop(Log, 10),
+    ?assertMatch(#{popped := 4, records := 1}, redwall_log:info(Log)),
+    ?assertEqual({popped, 4}, redwall_log:tail(Log, 3)),
+    ?assertEqual({ok, [{5, 4, {body, e}}], true, 4}, redwall_log:tail(Log, 4)),
+    %% The planted defect of the limit `none': the Known Committed
+    %% Version is no limit. The highest pop version is 10.
+    ok = redwall_log:pop(Log, 5, none),
+    ?assertMatch(#{kcv := 4, popped := 10, records := 0}, redwall_log:info(Log)),
+    redwall_log:stop(Log).
+
 %% A tail request is answered when the LogServer has a record above
 %% `After', or when the LogServer is locked.
 tail_test() ->

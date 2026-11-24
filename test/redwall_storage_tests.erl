@@ -17,6 +17,7 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> many_versions(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> copy(Ids) end} end,
+        fun(Ids) -> {timeout, 60, fun() -> pop(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> reset(Ids) end} end
     ]}.
 
@@ -382,6 +383,60 @@ copy(Ids) ->
     timer:sleep(500),
     ?assertMatch(#{version := 0, copying := true}, redwall_storage:info(Alone)),
     [exit(Storage, kill) || Storage <- [First, FromLog, Second, Third, Alone]].
+
+%% The stored version of a StorageServer, and the StorageServers that
+%% start after the LogServers have discarded the records at or below that
+%% version.
+pop(Ids) ->
+    {Proxy, Logs} = epoch(Ids),
+    First = storage(Ids),
+    {ok, _} = redwall_epoch:commit(Proxy, #{mutations => [{set, a, 1}]}),
+    {ok, _} = redwall_epoch:commit(Proxy, #{mutations => [{set, b, 2}]}),
+    {ok, Last} = redwall_epoch:commit(Proxy, #{mutations => [{set, c, 3}]}),
+    ok = await_version(First, Last),
+    %% The stored version is at or below the Known Committed Version,
+    %% which is the last version or the version before it.
+    {ok, #{generation := 0, stored := Stored, version := Last}} = redwall_storage:stored(First, 1000),
+    ?assert(Stored =:= Last orelse Stored =:= Last - 1, Stored),
+    [ok = redwall_log:pop(Pid, Stored) || {_Id, Pid} <- Logs],
+    [?assertMatch(#{popped := Stored}, redwall_log:info(Pid)) || {_Id, Pid} <- Logs],
+    %% The StorageServer with the discarded records applies the later
+    %% records.
+    {ok, Later} = redwall_epoch:commit(Proxy, #{mutations => [{set, d, 4}]}),
+    ok = await_version(First, Later),
+    %% A StorageServer without data and without a peer reads the log from
+    %% the start. The LogServers do not have the first records, so it
+    %% applies no record.
+    Alone = storage(Ids),
+    timer:sleep(300),
+    ?assertMatch(#{version := 0, copies := 0}, redwall_storage:info(Alone)),
+    ?assertMatch({ok, #{stored := 0}}, redwall_storage:stored(Alone, 1000)),
+    %% A StorageServer whose only peer has no data reads the log from the
+    %% start, and applies no record either.
+    Peers = atomics:new(1, []),
+    PeersFun = fun() ->
+        case atomics:get(Peers, 1) of
+            0 -> [Alone];
+            1 -> [First]
+        end
+    end,
+    {ok, Second} = redwall_storage:start(#{coordinators => Ids, poll_ms => 5, peers => PeersFun}),
+    timer:sleep(300),
+    ?assertMatch(#{version := 0, copies := 0}, redwall_storage:info(Second)),
+    %% With a peer that has the data, it copies the data after the next
+    %% answer `popped' of a LogServer, and reads the log from the version
+    %% of the copy.
+    ok = atomics:put(Peers, 1, 1),
+    ok = await_copy(Second, 500),
+    ok = await_version(Second, Later),
+    ?assertEqual({ok, 1}, redwall_storage:read(Second, a, Later)),
+    ?assertEqual({ok, 4}, redwall_storage:read(Second, d, Later)),
+    {ok, Next} = redwall_epoch:commit(Proxy, #{mutations => [{set, e, 5}]}),
+    ok = await_version(Second, Next),
+    ok = await_version(First, Next),
+    ?assertEqual(redwall_storage:read_range(First, 0, <<"z">>, Next), redwall_storage:read_range(Second, 0, <<"z">>, Next)),
+    exit(Proxy, kill),
+    [exit(Storage, kill) || Storage <- [First, Alone, Second]].
 
 %% Waits until the StorageServer has finished a copy.
 await_copy(Storage, 0) ->

@@ -687,6 +687,63 @@ application_test_() ->
         ok = application:stop(redwall)
     end}.
 
+%% The leader sends a pop to the LogServers when every StorageServer of
+%% the list of the coordinated state has answered, and the list has at
+%% least `replication' StorageServers.
+pop_test_() ->
+    {timeout, 60, fun pop/0}.
+
+pop() ->
+    with_controller(#{}, fun(_Controller, CState) ->
+        Coordinators = {local, CState},
+        {ok, Worker} = redwall_worker:start(#{coordinators => Coordinators, poll_ms => 20}),
+        {ok, S1} = redwall_storage:start(#{coordinators => Coordinators, poll_ms => 5}),
+        {ok, S2} = redwall_storage:start(#{coordinators => Coordinators, poll_ms => 5}),
+        try
+            #{epoch := 1} = await_epoch(1),
+            Logs = log_pids(Coordinators),
+            Db = redwall:open(#{proxy => fun() -> hd(maps:get(proxies, redwall_worker:db_info())) end, storage => S1}),
+            Commit = fun(N) -> redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, {k, N}, N) end) end,
+            Popped = fun() -> [maps:get(popped, redwall_log:info(Log)) || Log <- Logs] end,
+            Records = fun() -> [maps:get(records, redwall_log:info(Log)) || Log <- Logs] end,
+            %% One StorageServer in the list: no pop.
+            ok = redwall_cstate:storage(Coordinators, node_a, S1, 1000),
+            lists:foreach(Commit, lists:seq(1, 5)),
+            timer:sleep(200),
+            ?assertEqual([0, 0, 0], Popped()),
+            %% Two StorageServers in the list: the LogServers discard the
+            %% records up to the Known Committed Version, which is the
+            %% version before the last one.
+            ok = redwall_cstate:storage(Coordinators, node_b, S2, 1000),
+            ok = await(fun() -> lists:all(fun(Count) -> Count =< 1 end, Records()) end, 300),
+            [First | _] = Popped(),
+            ?assert(First > 0, First),
+            ?assertEqual({k, 3}, redwall:transactional(Db, fun(Tx) -> {k, redwall:get(Tx, {k, 3})} end)),
+            %% A StorageServer of the list does not run: no pop.
+            exit(S2, kill),
+            lists:foreach(Commit, lists:seq(6, 10)),
+            timer:sleep(200),
+            ?assert(lists:all(fun(Count) -> Count >= 5 end, Records()), Records()),
+            %% Without that StorageServer, the list has one StorageServer:
+            %% no pop.
+            ok = redwall_cstate:forget_storage(Coordinators, node_b, 1000),
+            timer:sleep(200),
+            ?assert(lists:all(fun(Count) -> Count >= 5 end, Records()), Records()),
+            %% A new StorageServer of the node copies the data, and the
+            %% LogServers discard the records again.
+            {ok, S3} = redwall_storage:start(#{coordinators => Coordinators, poll_ms => 5, peers => [S1]}),
+            ok = redwall_cstate:storage(Coordinators, node_b, S3, 1000),
+            ok = await(fun() -> lists:all(fun(Count) -> Count =< 1 end, Records()) end, 300),
+            Db3 = redwall:open(#{proxy => fun() -> hd(maps:get(proxies, redwall_worker:db_info())) end, storage => S3}),
+            ?assertEqual([3, 8], redwall:transactional(Db3, fun(Tx) -> [redwall:get(Tx, {k, 3}), redwall:get(Tx, {k, 8})] end)),
+            exit(S3, kill)
+        after
+            exit(S1, kill),
+            exit(S2, kill),
+            redwall_worker:stop(Worker)
+        end
+    end).
+
 %% ---------------------------------------------------------------------------
 %% Helpers
 %% ---------------------------------------------------------------------------

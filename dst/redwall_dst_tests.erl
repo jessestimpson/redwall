@@ -239,6 +239,100 @@ controller_partitions_test_() ->
 controller_partitions(Seed, Mode) ->
     (opts(Seed, #{controller => true, last_op => 80, partitions => controllers, mode => Mode}))#{settle_steps => 20000}.
 
+%% Runs with ClusterControllers in which the LogServers discard the
+%% records that every StorageServer has stored (the pop). A run with 2 or
+%% 3 StorageServers has pops.
+%%
+%% Runs without kills. 30 seeds.
+pop_calm_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 30), fun(Seed) -> (opts(Seed, #{faults => false, controller => true, pop => true, last_op => 80}))#{net => true, settle_steps => 20000} end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("pop calm: ~p", [Stats]),
+        ok = write_stats({pop_calm, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 500, Stats),
+        %% LogServers have discarded records.
+        ?assert(maps:get(popped_logs, Stats, 0) > 100, Stats)
+    end}.
+
+%% Runs with kills of worker nodes and of StorageServers, partitions, and
+%% lost and delayed messages. 100 seeds.
+pop_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 100), fun(Seed) -> pop(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("pop faults: ~p", [Stats]),
+        ok = write_stats({pop_faults, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 50, Stats),
+        ?assert(maps:get(popped_logs, Stats, 0) > 50, Stats),
+        %% The harness killed StorageServers, and a new StorageServer
+        %% copied the data from another one.
+        ?assert(maps:get(kills_storage, Stats, 0) > 5, Stats),
+        ?assert(maps:get(storage_copies, Stats, 0) > 5, Stats)
+    end}.
+
+pop(Seed, Mode) ->
+    (opts(Seed, #{controller => true, pop => true, last_op => 80, mode => Mode}))#{settle_steps => 20000}.
+
+%% The same seed gives the same trace, the trace replays, and the audit
+%% of eta reports nothing, for the runs with the pop: with faults, and
+%% with kills of StorageServers only. 6 seeds each, 3 runs for each seed.
+pop_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Kinds = [
+            fun(Seed) -> pop(Seed, correct) end,
+            fun(Seed) -> (opts(Seed, #{faults => storage, controller => true, pop => true, last_op => 80}))#{net => true, settle_steps => 20000} end
+        ],
+        lists:foreach(
+            fun({Kind, Seed}) ->
+                Opts = Kind(Seed),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                Replayed = eta_run:replay(redwall_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [{Kind, Seed} || Kind <- Kinds, Seed <- lists:seq(1, 6)]
+        )
+    end}.
+
+%% Runs in which the only fault is the kill of a StorageServer. The
+%% LogServers of every epoch run, so a StorageServer that reads the log
+%% from the start receives the answer that a LogServer has discarded the
+%% records, and copies from another StorageServer. 60 seeds.
+pop_storage_kills_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 60), fun(Seed) -> (opts(Seed, #{faults => storage, controller => true, pop => true, last_op => 80}))#{net => true, settle_steps => 20000} end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("pop storage kills: ~p", [Stats]),
+        ok = write_stats({pop_storage_kills, 1}, Stats),
+        ?assert(maps:get(popped_logs, Stats, 0) > 100, Stats),
+        ?assert(maps:get(kills_storage, Stats, 0) > 50, Stats),
+        ?assert(maps:get(storage_copies, Stats, 0) > 20, Stats),
+        %% A StorageServer received the answer that a LogServer has
+        %% discarded records above its version.
+        ?assert(maps:get(storage_popped, Stats, 0) > 5, Stats)
+    end}.
+
+%% A planted defect: the pop version is the highest version of a
+%% StorageServer, and a LogServer discards the records without the limit
+%% of its Known Committed Version. A recovery then finds no LogServer
+%% with a record that it must copy. The recovery fails with
+%% `missing_body', and the run ends without an epoch (`epoch'). Other
+%% consequences are a new LogServer without an acknowledged record
+%% (`copied'), and a rollback that leaves every StorageServer below the
+%% popped version (`popped_stored').
+pop_no_limit_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 100), fun(Seed) -> pop(Seed, pop_no_limit) end),
+        ?debugFmt("pop_no_limit: seed ~p, ~p", [Seed, Violation]),
+        ?assert(lists:member(maps:get(property, Violation), [epoch, copied, popped_stored]), Violation),
+        ?assertEqual(ok, maps:get(outcome, run(pop(Seed, correct))), {seed, Seed})
+    end}.
+
 %% A planted defect: the coordinated state accepts the proposal of a
 %% candidate with any term. Two candidates are the leader of one term.
 no_elect_cas_is_found_test_() ->

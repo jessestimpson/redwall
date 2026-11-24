@@ -134,8 +134,11 @@ A LogServer stores the log records of one epoch (paper, section 2.4.3).
   stores no more records. The answer to the lock contains the DV and the
   KCV.
 - A locked LogServer does not answer the lock of a lower epoch.
+- A LogServer discards the records that every StorageServer of the
+  cluster has stored. See "Pop".
 
-These rules are the actions `Persist` and `LockLog` of the model.
+The first four rules are the actions `Persist` and `LockLog` of the
+model.
 
 ### The recovery
 
@@ -491,6 +494,79 @@ The coordinated state has the StorageServer of each node of the cluster.
   StorageServer that does not run. `redwall_cstate:forget_storage/3`
   removes a node that does not start again.
 
+### Pop
+
+The LogServers discard the records that every StorageServer of the
+cluster has stored. Without the pop, a LogServer keeps every record, and
+its memory grows with each commit. FoundationDB has the same step with
+the name pop.
+
+1. The ClusterController reads the coordinated state every `poll_ms`
+   (default 1,000 ms). After each read, it starts a process for one pop,
+   if the process of the pop before has ended.
+2. The process asks each StorageServer of the list of the coordinated
+   state for its stored version (`redwall_storage:stored/2`). The stored
+   version is the lowest one of the version of the StorageServer, of its
+   Known Committed Version, and of the version of each copy that another
+   StorageServer reads from it. No recovery discards a record at or
+   below that version.
+3. The pop version is the lowest stored version. The process sends it to
+   every LogServer of every log system of the coordinated state
+   (`redwall_log:pop/2`).
+4. A LogServer discards the records at or below the pop version, up to
+   its Known Committed Version. The highest discarded LSN is its popped
+   version.
+
+The ClusterController sends no pop in these cases:
+
+| Case | Reason |
+|---|---|
+| The list has fewer StorageServers than `pop_storages` (default: `replication`, which is 2 by default) | A discarded record is on the StorageServers only. With the default, it is on as many StorageServers as a record has LogServers with its body |
+| A StorageServer of the list does not answer | The StorageServer can need the records when it answers again. A StorageServer of a node that does not start again stays in the list until `redwall_cstate:forget_storage/3` removes the node |
+| A StorageServer of the list copies from another StorageServer | The StorageServer has no stored version before the end of the copy |
+| A StorageServer answers with another generation of the coordinated state than the ClusterController has read | The versions start again after a reset of the database |
+
+Rules that keep the other parts correct:
+
+- **Recovery.** A recovery copies the records above the previous epoch's
+  end version, which is the maximum of the Known Committed Versions of
+  the LogServers that answer the lock. The popped version of a LogServer
+  is at or below its Known Committed Version, so a LogServer has every
+  record that a recovery copies from it.
+- **StorageServer.** A LogServer answers `{popped, Popped}` to a request
+  of a StorageServer below its popped version. A StorageServer applies a
+  record only when the previous LSN of the record is its version, so it
+  never applies a record after a discarded one. If `Popped` is above its
+  version, it copies the data from a peer with a copy above its version.
+- **Repeated push.** A LogServer answers a push of a record at or below
+  its popped version as a push of a stored record.
+
+Departure from FoundationDB: each StorageServer of FoundationDB sends a
+pop for its tag to each LogServer. redwall has no tags, and every
+StorageServer reads every record, so one process collects the stored
+versions. This part is not in the paper.
+
+`redwall_log:info/1` has the popped version and the number of records
+of a LogServer in the keys `popped` and `records`.
+
+Limitations:
+
+- After a pop, the discarded records are on the StorageServers only, and
+  a StorageServer keeps its data in memory. If every StorageServer with
+  these records stops while LogServers run, the data is lost. A new
+  StorageServer then applies no record, and the database is not reset.
+  Before the pop, a new StorageServer read every record from the
+  LogServers in this case.
+- A cluster with one StorageServer has no pop with the default of
+  `pop_storages`. The memory of its LogServers grows with each record.
+- A StorageServer without peers that needs a discarded record does not
+  continue.
+- A LogServer of an ended epoch keeps the records above its Known
+  Committed Version, and the coordinated state keeps the log system of
+  each ended epoch.
+- `formal/Recovery.tla` has no pop.
+- `redwall_status:status/1` does not report the popped versions.
+
 ### Reset after the loss of LogServers
 
 A LogServer keeps its records in memory. When `replication` LogServers of
@@ -831,7 +907,8 @@ way (`fetchKeys` of `fdbserver/storageserver.actor.cpp`).
 - Without the copy, a new StorageServer reads every record from the
   LogServers of every epoch. A LogServer keeps its records in memory, so
   after the stops of several nodes a record of an earlier epoch can be on
-  no LogServer.
+  no LogServer. After a pop, the LogServers do not have the discarded
+  records either. See "Pop".
 - A StorageServer that reads an epoch that has ended and applies no
   record in 10 intervals asks its peers. If a peer has a copy above its
   version, it removes its data and copies.
@@ -842,9 +919,8 @@ way (`fetchKeys` of `fdbserver/storageserver.actor.cpp`).
 - In the simulation, a StorageServer that starts after a kill has the
   other StorageServers of the run as peers. In the suite of 2026-11-24,
   158 StorageServers finished a copy, without a violation.
-- Limitations: a copy has every key of the peer, the peer keeps the
-  versions above the version of the copy for the time of the copy, and a
-  LogServer still keeps every record.
+- Limitations: a copy has every key of the peer, and the peer keeps the
+  versions above the version of the copy for the time of the copy.
 
 - The StorageServer has a version: the LSN of the last record that it has
   applied. It applies a record only when the previous LSN of the record is
@@ -1221,6 +1297,26 @@ epoch:
   continues until the checks at the end of a run hold, for at most
   20,000 steps.
 
+In the runs with the pop (the tests with the name `pop_`), the
+LogServers discard records:
+
+- The runs have ClusterControllers. The harness records the
+  StorageServers of the places 1 and 2 in the list of the coordinated
+  state. A run with 1 StorageServer has no pop.
+- The StorageServer of the place 3 is not in the list, so the LogServers
+  can discard a record that it has not stored.
+- A StorageServer of the place 3 that starts after a kill finds no peer
+  at its first question, and reads the log from the start. A LogServer
+  answers that it has discarded the first records, and the StorageServer
+  then copies from a peer.
+- The harness kills a StorageServer only if another StorageServer runs
+  with a version above 0 that is at or above the version of the first
+  one. The discarded records are lost when every StorageServer with
+  them stops.
+- The planted defect `pop_no_limit`: the pop version is the highest
+  version of a StorageServer, and a LogServer discards the records
+  without the limit of its Known Committed Version.
+
 These runs have one more invariant after every step, `one_leader`: no
 two ClusterController processes are the leader of one term. The harness
 checks at the end of each of these runs:
@@ -1239,8 +1335,9 @@ The harness checks these invariants after every step:
 | `durable` | An acknowledged LSN of an ended epoch is at or below the Recovery Version that ended the epoch. `Durable` of the model |
 | `unique_versions` | No LSN is acknowledged in two epochs or to two clients. `UniqueVersions` of the model |
 | `no_loss` | No recovery ends with a missing body. `NoLoss` of the model |
-| `body_available` | The body of every acknowledged record is on a LogServer of its epoch that runs |
-| `copied` | Every LogServer of a new epoch has the body of every acknowledged record above the previous epoch's end version |
+| `body_available` | The body of every acknowledged record is on a LogServer of its epoch that runs, or the record is at or below the popped version of such a LogServer |
+| `copied` | Every LogServer of a new epoch has the body of every acknowledged record above the previous epoch's end version and above the popped version of the LogServer |
+| `popped_stored` | A StorageServer that runs has a version at or above the popped version of every LogServer that runs |
 | `no_conflict` | No acknowledged transaction read a key that another acknowledged transaction wrote between the read version and the commit version of the first one |
 | `read_version_order` | A read version is at or above the commit version of every transaction that was acknowledged before the client asked for it, in any epoch |
 | `read_value` | A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer |
@@ -1283,6 +1380,18 @@ Results of `make dst` on 2026-11-22:
 | Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 3, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 | Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
 | Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value` |
+
+Results of the 5 tests with the pop in a run of `make dst` on
+2026-11-24. The 46 tests of that run pass in 219 s. The test
+`pop_determinism_test_` was added after that run and passes in 18 s:
+
+| Test | Runs | Result |
+|---|---|---|
+| Pop, no kills, no partitions, no lost or delayed messages | 30 seeds in 1 test, 80 operations each | No violation. 795 acknowledged transactions. 267 LogServers that ran at the end of a run had discarded records |
+| Pop, kills of worker nodes and of StorageServers, partitions, lost and delayed messages | 100 seeds in 1 test | No violation, and each run ends with a leader and an epoch. 383 acknowledged transactions, 257 kills of a worker node, 23 kills of a StorageServer, 341 LogServers with discarded records |
+| Pop, kills of StorageServers only | 60 seeds in 1 test | No violation. 1,577 acknowledged transactions, 150 kills of a StorageServer, 594 LogServers with discarded records, 139 copies from another StorageServer. A StorageServer received the answer `popped` above its version 25 times |
+| The same seed gives the same trace, the trace replays, and the audit of eta reports nothing, for the runs with the pop | 12 seeds, 3 runs each | Pass |
+| Planted defect `pop_no_limit` | Seeds from 1 | Found at seed 2, `epoch`: a recovery finds no LogServer with a record that it must copy, and the run ends without an epoch. The same seed passes without the defect |
 
 A run of `make dst` on 2026-11-23, with the invariants
 `mapped_range_agrees` and `own_writes`: the 32 tests pass in 130 s
@@ -1853,9 +1962,10 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 - The direct read was not measured in redwall. The store benchmark
   measured about 1,000 ns for a read of one key from such a table.
 - The StorageServer keeps the data in memory, and loses the data when it
-  stops. A new StorageServer reads every record again
+  stops. A new StorageServer copies the data from another StorageServer.
+  Without another StorageServer with data, it reads every record again
   from the LogServers, which is possible only while the LogServers of
-  every epoch run.
+  every epoch run and have discarded no record.
 - A read at a version that is not a read version from a Proxy can return
   a write that a recovery discards.
 - After a LogServer is stopped, the StorageServer reads the coordinated
@@ -1926,8 +2036,10 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
   process during a step.
 - A LogServer keeps the records in memory. A LogServer that stops loses
   the records.
-- A LogServer does not discard records. The memory of a LogServer grows
-  with every record.
+- A LogServer discards a record only after every StorageServer of the
+  list of the coordinated state has stored it, and only if the list has
+  `pop_storages` StorageServers. Otherwise the memory of a LogServer
+  grows with every record. See "Limitations" under "Pop".
 - The number of records that wait in a LogServer has no limit.
 - The model of the recovery and the model of the Resolver are separate.
   No model has both.

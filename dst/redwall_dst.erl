@@ -93,6 +93,35 @@
 %%   20,000 steps.</li>
 %% </ul>
 %%
+%% == Runs with the pop ==
+%%
+%% With the config keys `controller' and `pop', the LogServers discard
+%% records (see "Pop" in `redwall_cluster_controller'):
+%%
+%% <ul>
+%% <li>The harness records each StorageServer in the list of the
+%%   coordinated state, under the name of its place. A new StorageServer
+%%   of a place replaces the killed one in the list, as the StorageServer
+%%   of a node that starts again does.</li>
+%% <li>The ClusterController sends a pop when the list has 2
+%%   StorageServers or more. A run with 1 StorageServer has no pop.</li>
+%% <li>The StorageServer of the place 3 is not in the list. The
+%%   LogServers can discard a record that it has not stored. It then
+%%   copies the data from another StorageServer.</li>
+%% <li>A StorageServer of the place 3 that starts after a kill finds no
+%%   peer at its first question, and reads the log from the start. A
+%%   LogServer answers that it has discarded the first records, and the
+%%   StorageServer then copies from a peer.</li>
+%% <li>The harness kills a StorageServer only if another StorageServer
+%%   runs with a version above 0 that is at or above the version of the
+%%   first one. A StorageServer keeps its data in memory, so the
+%%   discarded records are lost when every StorageServer with them
+%%   stops.</li>
+%% <li>The harness keeps the LSN of the record of each client from the
+%%   records of the LogServers at each check, because a LogServer does
+%%   not keep a discarded record.</li>
+%% </ul>
+%%
 %% The invariants of the other runs hold in these runs. These runs have
 %% one more invariant, `one_leader': no two ClusterController processes
 %% are the leader of one term. `check_final/2' checks at the end of a run:
@@ -177,10 +206,14 @@
 %% <li>`no_loss' - no recovery ends with `missing_body'. This is `NoLoss'
 %%   of the model.</li>
 %% <li>`body_available' - the body of every acknowledged record is on a
-%%   LogServer of its epoch that runs.</li>
+%%   LogServer of its epoch that runs, or the record is at or below the
+%%   popped version of such a LogServer.</li>
 %% <li>`copied' - when a recovery ends an epoch, every LogServer of the new
 %%   epoch that runs has the body of every acknowledged record of the
-%%   ended epoch above the previous epoch's end version.</li>
+%%   ended epoch above the previous epoch's end version and above the
+%%   popped version of the LogServer.</li>
+%% <li>`popped_stored' - a StorageServer that runs has a version at or
+%%   above the popped version of every LogServer that runs.</li>
 %% <li>`no_conflict' - no acknowledged transaction read a key, alone or in
 %%   a key range, that another
 %%   acknowledged transaction wrote at a commit version above the read
@@ -278,6 +311,10 @@
 %% <li>`no_clear' - the StorageServer does not apply a clear.</li>
 %% <li>`no_window_check' - the StorageServer answers a read below its
 %%   oldest version, after it has removed older versions.</li>
+%% <li>`pop_no_limit' - the pop version of the ClusterController is the
+%%   highest version of a StorageServer, and a LogServer discards the
+%%   records without the limit of its Known Committed Version. A recovery
+%%   then cannot copy a record that it must copy.</li>
 %% </ul>
 %%
 %% == Limitations ==
@@ -330,6 +367,8 @@ init(Seed, Config) ->
     %% `preload => [redwall]' does not load them.
     {module, _} = code:ensure_loaded(redwall_dst_client),
     Tab = ets:new(redwall_dst, [public, ordered_set]),
+    %% Whether the LogServers discard records. See "Runs with the pop".
+    _ = maps:get(pop, Config, false) andalso ets:insert(Tab, {pop, true}),
     Cas = #{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas},
     %% The topology is declared before any process creates a monitor.
     CState =
@@ -410,7 +449,22 @@ start_storage(Tab, CState, {Mode, Window}, {Slot, N}, Generation) ->
         %% The other StorageServers of the run that run. A StorageServer
         %% that starts after a kill copies the data from one of them, if
         %% one of them has data.
-        peers => fun() -> [Peer || Peer <- storages(Tab), Peer =/= self(), is_process_alive(Peer)] end,
+        peers => fun() ->
+            %% In a run with the pop, a StorageServer of the place 3 that
+            %% starts after a kill finds no peer at its first question. It
+            %% then reads the log from the start, and a LogServer answers
+            %% that it has discarded the first records. A StorageServer
+            %% whose peers with data do not answer at its start is in the
+            %% same state.
+            First = ets:update_counter(Tab, {peer_questions, self()}, 1, {{peer_questions, self()}, 0}) =:= 1,
+            case First andalso Slot =:= 3 andalso Generation > 0 andalso ets:member(Tab, pop) of
+                true ->
+                    bump(starts_from_log_after_pop),
+                    [];
+                false ->
+                    [Peer || Peer <- storages(Tab), Peer =/= self(), is_process_alive(Peer)]
+            end
+        end,
         poll_ms => 100,
         mvcc_window => Window,
         rollback => Mode =/= no_rollback,
@@ -420,6 +474,11 @@ start_storage(Tab, CState, {Mode, Window}, {Slot, N}, Generation) ->
     }),
     Node = redwall_dst_client:storage_node({Slot, N}),
     true = ets:insert(Tab, [{{storage_started, {Slot, N}}, Storage}, {{storage, Slot}, Storage, Generation, Node}]),
+    %% In a run with the pop, the StorageServer is in the list of the
+    %% coordinated state under the name of its place. The StorageServer
+    %% of the place 3 is not in the list, so the LogServers can discard a
+    %% record that it has not stored.
+    _ = ets:member(Tab, pop) andalso Slot =< 2 andalso redwall_dst_client:register_storage(CState, Slot, Storage, 10),
     Storage.
 
 %% The StorageServers that the table of the run has, in the order of
@@ -435,6 +494,11 @@ generate(#{faults := Faults, cstate := CState}, Rand0) ->
     {R, Rand2} = rand:uniform_s(1000, Rand1),
     Op =
         if
+            %% With `faults => storage', the only fault is the kill of a
+            %% StorageServer.
+            Faults =:= storage, Roll < 0.08 -> recover;
+            Faults =:= storage, Roll < 0.14 -> {kill_storage, R};
+            Faults =:= storage -> {transaction, R};
             not Faults, Roll < 0.08 -> recover;
             not Faults -> {transaction, R};
             %% Faults are rare. A LogServer that is lost or cut off stops the
@@ -660,13 +724,14 @@ execute({kill_resolver, R}, _N, S = #{tab := Tab}) ->
     end;
 execute({kill_storage, R}, N, S = #{tab := Tab, cstate := CState, mode := Mode, window := Window, storage_count := Count}) ->
     Slot = R rem Count + 1,
-    case [Row || Row = {_, Storage, _, _} <- ets:lookup(Tab, {storage, Slot}), is_process_alive(Storage)] of
+    case [Row || Row = {_, Storage, _, _} <- ets:lookup(Tab, {storage, Slot}), is_process_alive(Storage), expendable(Tab, Storage)] of
         [{_, Storage, Generation, Node}] ->
             %% The rollbacks of the StorageServer that the harness kills.
             case eta_observe:read(Storage) of
-                #{rollbacks := Rollbacks, copies := Copies} ->
+                Observed = #{rollbacks := Rollbacks, copies := Copies} ->
                     bump(rollbacks, Rollbacks),
-                    bump(storage_copies, Copies);
+                    bump(storage_copies, Copies),
+                    bump(storage_popped, maps:get(popped, Observed, 0));
                 _ ->
                     ok
             end,
@@ -715,12 +780,14 @@ check(#{tab := Tab, cstate := CState}) ->
     Storages = storages(Tab),
     Acks = [{C, Epoch, LSN} || [C, Epoch, LSN] <- ets:match(Tab, {{ack, '$1'}, '$2', '$3'})],
     Logs = logs(Tab),
+    _ = ets:member(Tab, pop) andalso remember_written(Tab, Logs),
     first_violation([
         fun() -> no_loss(Tab) end,
         fun() -> unique_versions(Tab, Acks) end,
         fun() -> durable(Acks, CState) end,
         fun() -> body_available(Acks, Logs) end,
         fun() -> copied(Tab, Acks, CState, Logs) end,
+        fun() -> popped_stored(Tab, Logs) end,
         fun() -> transactions(Tab, Acks, Logs) end,
         fun() -> storage_rollback(Tab, Storages, CState) end,
         fun() -> kcv_below_dv(Logs) end,
@@ -860,9 +927,12 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
     lists:foreach(
         fun(Storage) ->
             case eta_observe:read(Storage) of
-                #{rollbacks := Rollbacks, copies := Copies} ->
+                Observed = #{rollbacks := Rollbacks, copies := Copies} ->
                     bump(rollbacks, Rollbacks),
-                    bump(storage_copies, Copies);
+                    bump(storage_copies, Copies),
+                    %% The answers `popped' of a LogServer with a popped
+                    %% version above the version of the StorageServer.
+                    bump(storage_popped, maps:get(popped, Observed, 0));
                 _ ->
                     ok
             end
@@ -962,6 +1032,9 @@ record_stats(Tab) ->
     %% StorageServer, with direct reads.
     bump(reads_on_storage_node, length([x || [#{values := [_ | _], direct := true, local := true}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
     bump(storages, length(ets:match(Tab, {{storage, '_'}, '_', '_', '_'}))),
+    %% The LogServers that run at the end of the run and have discarded
+    %% records after a pop.
+    bump(popped_logs, length([x || {_Id, #{popped := Popped}} <- logs(Tab), Popped > 0])),
     %% The acknowledged transactions that cleared a key.
     bump(clears, length([x || [#{clears := [_ | _]}] <- ets:match(Tab, {{txn, '_'}, '$1'})])),
     bump(range_reads, length([x || [#{ranges := [_ | _]}] <- ets:match(Tab, {{read, '_'}, '$1'})])),
@@ -1027,8 +1100,8 @@ body_available(Acks, Logs) ->
      || {C, Epoch, LSN} <- Acks,
         not lists:any(
             fun
-                ({{E, _Index}, #{records := Records}}) when E =:= Epoch ->
-                    has_body(LSN, C, Records);
+                ({{E, _Index}, Log = #{records := Records}}) when E =:= Epoch ->
+                    LSN =< maps:get(popped, Log, 0) orelse has_body(LSN, C, Records);
                 (_) ->
                     false
             end,
@@ -1057,14 +1130,56 @@ copied(Tab, Acks, CState, Logs) ->
         {PEV, RV} <- [maps:get(New, Ranges)],
         LSN > PEV,
         LSN =< RV,
-        {Id = {E, _Index}, #{records := Records}} <- Logs,
+        {Id = {E, _Index}, Log = #{records := Records}} <- Logs,
         E =:= New,
+        LSN > maps:get(popped, Log, 0),
         not has_body(LSN, C, Records)
     ],
     case Missing of
         [] -> ok;
         [{C, Epoch, LSN, Id} | _] -> violation(copied, #{client => C, epoch => Epoch, lsn => LSN, log => Id})
     end.
+
+%% A StorageServer that runs has a version at or above the popped version
+%% of every LogServer that runs. A LogServer discards a record that every
+%% StorageServer of the cluster has stored, and a StorageServer keeps its
+%% data in memory. The harness keeps one StorageServer with the discarded
+%% records (`expendable/2').
+popped_stored(Tab, Logs) ->
+    case lists:max([0 | [maps:get(popped, Log, 0) || {_Id, Log} <- Logs]]) of
+        0 ->
+            ok;
+        Popped ->
+            Versions = [storage_version(Storage) || Storage <- storages(Tab), is_process_alive(Storage)],
+            case lists:max([0 | Versions]) >= Popped of
+                true -> ok;
+                false -> violation(popped_stored, #{popped => Popped, versions => Versions})
+            end
+    end.
+
+%% The version of a StorageServer from its published state, or 0.
+storage_version(Storage) ->
+    case eta_observe:read(Storage) of
+        #{version := Version} -> Version;
+        _ -> 0
+    end.
+
+%% Whether the harness can kill the StorageServer. In a run with the pop,
+%% another StorageServer must run with a version above 0 that is at or
+%% above the version of this one. A pop version is at or below the
+%% version of a StorageServer that answered for it, so a StorageServer
+%% with every discarded record then runs after the kill.
+expendable(Tab, Storage) ->
+    not ets:member(Tab, pop) orelse
+        begin
+            Mine = storage_version(Storage),
+            lists:any(
+                fun(Other) ->
+                    Other =/= Storage andalso is_process_alive(Other) andalso storage_version(Other) > 0 andalso storage_version(Other) >= Mine
+                end,
+                storages(Tab)
+            )
+        end.
 
 %% The record `LSN' has a body with an entry of the client `C'.
 has_body(LSN, C, Records) ->
@@ -1100,7 +1215,7 @@ transactions(Tab, Acks, Logs) ->
                 Txn#{client => C, epoch => Epoch, version => LSN}
              || {C, Epoch, LSN} <- Acks, [{_, Txn}] <- [ets:lookup(Tab, {txn, C})]
             ],
-            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns, open_clears(Tab, Acks, Rejected), written(Logs)) end]) of
+            case first_violation([fun() -> no_conflict(Txns) end, fun() -> read_version_order(Reads, Txns) end, fun() -> read_value(Reads, Txns, open_clears(Tab, Acks, Rejected), written(Tab, Logs)) end]) of
                 ok ->
                     true = ets:insert(Tab, {transactions_checked, Count}),
                     ok;
@@ -1160,6 +1275,44 @@ open_clears(Tab, Acks, Rejected) ->
 %% The LSN of the record of each client, from the records of the
 %% LogServers that run. A client commits one transaction, and every write
 %% of the transaction has the value `{client, C}'.
+written(Tab, Logs) ->
+    case ets:member(Tab, pop) of
+        true -> maps:from_list([{C, LSN} || [C, LSN] <- ets:match(Tab, {{written, '$1'}, '$2'})]);
+        false -> written(Logs)
+    end.
+
+%% Keeps the LSN of the record of each client in the table of the run. In
+%% a run with the pop, a LogServer discards records, and the harness
+%% needs the LSN of a discarded record for `read_value'. The harness
+%% calls this function at each check, so it reads each record before a
+%% LogServer discards it. For each LogServer it reads the records above
+%% the Durable Version of its last call.
+remember_written(Tab, Logs) ->
+    lists:foreach(
+        fun({Id, #{dv := DV, records := Records}}) ->
+            Seen =
+                case ets:lookup(Tab, {written_dv, Id}) of
+                    [{_, Version}] -> Version;
+                    [] -> -1
+                end,
+            case DV > Seen of
+                true ->
+                    true = ets:insert(Tab, [
+                        {{written, C}, LSN}
+                     || {LSN, {_Prev, {body, {batch, Entries}}}} <- gb_trees:to_list(Records),
+                        LSN > Seen,
+                        Entry <- Entries,
+                        is_list(Entry),
+                        {set, _Key, {client, C}} <- Entry
+                    ]),
+                    true = ets:insert(Tab, {{written_dv, Id}, DV});
+                false ->
+                    true
+            end
+        end,
+        Logs
+    ).
+
 written(Logs) ->
     maps:from_list([
         {C, LSN}

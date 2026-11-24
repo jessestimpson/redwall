@@ -198,8 +198,39 @@
 %% page for 30 seconds.
 %%
 %% Limitations: the copy has every key of the peer, and the peer keeps the
-%% versions above the version of the copy for the time of the copy. A
-%% LogServer still keeps every record.
+%% versions above the version of the copy for the time of the copy.
+%%
+%% == Pop ==
+%%
+%% The LogServers discard the records that every StorageServer of the
+%% cluster has stored (see "Pop" in {@link redwall_cluster_controller}
+%% and in {@link redwall_log}).
+%%
+%% <ul>
+%% <li>The ClusterController asks the StorageServer for its stored version
+%%   (`stored/2'). The stored version is the lowest one of the version of
+%%   the StorageServer, of its Known Committed Version, and of the version
+%%   of each copy that another StorageServer reads from this one. No
+%%   recovery discards a record at or below the stored version, and no
+%%   rollback removes one. A StorageServer that copies from a peer answers
+%%   `not_ready'.</li>
+%% <li>The answer has the generation of the coordinated state that the
+%%   StorageServer has read. After a reset of the database the versions
+%%   start again, so the ClusterController uses only the answers with the
+%%   generation that it has read itself.</li>
+%% <li>A LogServer answers `{popped, Popped}' to a request below its
+%%   popped version. If `Popped' is at or below the version of the
+%%   StorageServer, the StorageServer sends the request again from its
+%%   version. Otherwise the StorageServer cannot read the records that it
+%%   needs from this LogServer. It asks its peers, and copies from a peer
+%%   with a copy above its version. A StorageServer without peers does
+%%   not continue.</li>
+%% </ul>
+%%
+%% A StorageServer that starts without data and without a peer with data
+%% reads the log from the start. After a pop the LogServers do not have
+%% every record. See "Limitations" of the pop in
+%% {@link redwall_cluster_controller}.
 %%
 %% == Equal keys ==
 %%
@@ -332,18 +363,21 @@
 %% <li>The StorageServer reads the log systems from the coordinated state.
 %%   A StorageServer of FoundationDB receives them from the
 %%   ClusterController. This part is not in the paper.</li>
-%% <li>The StorageServer does not tell a LogServer which records it has
-%%   stored (the pop of FoundationDB).</li>
+%% <li>The StorageServer does not send a pop to a LogServer. A
+%%   StorageServer of FoundationDB pops its tag at each LogServer. In
+%%   redwall the ClusterController asks every StorageServer and sends one
+%%   pop to the LogServers, because redwall has no tags: every
+%%   StorageServer reads every record.</li>
 %% </ul>
 -module(redwall_storage).
 
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
--eta_observe({state, [version, oldest, data, history, rollbacks, copies, resets]}).
+-eta_observe({state, [version, oldest, data, history, rollbacks, copies, resets, popped]}).
 
 -export([start/1, start_link/1, stop/1]).
--export([read/3, read/4, read_with_version/4, info/1]).
+-export([read/3, read/4, read_with_version/4, info/1, stored/2]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([handle/1, read_direct/3, versions/1]).
 -export([select/7, select_rows/2, mapped_range/7]).
@@ -489,6 +523,9 @@
         | {probing, reference(), probe | reprobe}
         | #{peer := gen_server:server_ref(), ref := reference(), version := version(), next := term()},
     copies = 0 :: non_neg_integer(),
+    %% The number of answers `popped' of a LogServer with a popped version
+    %% above the version of the StorageServer.
+    popped = 0 :: non_neg_integer(),
     %% The generation of the coordinated state at the last read, and the
     %% number of times that the StorageServer has removed its data after
     %% a reset of the database.
@@ -688,6 +725,10 @@ read_direct(Handle = #{data := Data0, history := History, published := Published
         %% The number of times that the StorageServer has removed its
         %% data after a reset of the database.
         resets := non_neg_integer(),
+        %% The number of answers `popped' of a LogServer with a popped
+        %% version above the version of the StorageServer. See "Pop" in
+        %% the module documentation.
+        popped := non_neg_integer(),
         %% The ETS table of the data. See "Store" in the module
         %% documentation.
         data := ets:tid(),
@@ -695,6 +736,17 @@ read_direct(Handle = #{data := Data0, history := History, published := Published
     }.
 info(Storage) ->
     gen_server:call(Storage, info).
+
+%% @doc Returns the stored version of the StorageServer, with the
+%% generation of the coordinated state that the StorageServer has read and
+%% with its version. The LogServers can discard the records at or below
+%% the stored version of every StorageServer. See "Pop" in the module
+%% documentation. The result is `{error, not_ready}' if the StorageServer
+%% copies from a peer or has not read the coordinated state.
+-spec stored(gen_server:server_ref(), timeout()) ->
+    {ok, #{generation := non_neg_integer(), stored := version(), version := version()}} | {error, not_ready}.
+stored(Storage, Timeout) ->
+    gen_server:call(Storage, stored, Timeout).
 
 %% ---------------------------------------------------------------------------
 %% Server
@@ -920,6 +972,13 @@ handle_call({copy_page, Ref, Next, Limit}, From, State = #state{pins = Pins}) ->
         _ ->
             {reply, {error, expired}, State}
     end;
+handle_call(stored, _From, State = #state{copy = Copy, generation = Generation}) when is_map(Copy); Generation =:= undefined ->
+    {reply, {error, not_ready}, State};
+handle_call(stored, _From, State = #state{version = Version, kcv = KCV, pins = Pins, generation = Generation}) ->
+    %% A StorageServer that copies from this one reads the log from the
+    %% version of its copy.
+    Stored = lists:min([Version, KCV | [Pinned || {Pinned, _Timer} <- maps:values(Pins)]]),
+    {reply, {ok, #{generation => Generation, stored => Stored, version => Version}}, State};
 handle_call(info, _From, State = #state{version = Version, system = System, rollbacks = Rollbacks}) ->
     Epoch =
         case System of
@@ -934,6 +993,7 @@ handle_call(info, _From, State = #state{version = Version, system = System, roll
         copies => State#state.copies,
         copying => State#state.copy =/= undefined,
         resets => State#state.resets,
+        popped => State#state.popped,
         data => State#state.data,
         history => State#state.history
     },
@@ -1006,6 +1066,8 @@ handle_info(Message, State = #state{requests = Requests}) ->
         {{reply, {ok, Records, Stopped, KCV}}, Label, Requests1} ->
             State1 = State#state{requests = Requests1, kcv = max(KCV, State#state.kcv)},
             {noreply, watch(advance_oldest(received(Label, Records, Stopped, State1)))};
+        {{reply, {popped, Popped}}, Label, Requests1} ->
+            popped(Label, Popped, State#state{requests = Requests1});
         {{error, _Reason}, {Epoch, _Log, _Number}, Requests1} when Epoch =:= map_get(epoch, State#state.system) ->
             %% A LogServer of the epoch does not run, or the connection to
             %% its node has ended. The epoch can have ended, so the
@@ -1196,10 +1258,33 @@ tail(Log, State = #state{system = #{epoch := Epoch}, version = Version, requests
             State;
         Pid ->
             Number = maps:get(Log, Sent, 0) + 1,
-            After = maps:get(Log, Cursors, Version),
+            %% The request is from the version at the least. The LogServer
+            %% can have discarded the records below the version.
+            After = max(maps:get(Log, Cursors, Version), Version),
             Requests1 = gen_server:send_request(Pid, {tail, After}, {Epoch, Log, Number}, Requests),
             State#state{requests = Requests1, sent = Sent#{Log => Number}}
     end.
+
+%% The answer `{popped, Popped}' of the LogServer `Log' of `Epoch' to the
+%% request `Number': the LogServer has discarded the records at or below
+%% `Popped'. See "Pop" in the module documentation.
+popped({Epoch, Log, Number}, Popped, State = #state{system = #{epoch := Epoch}, version = Version, sent = Sent}) when Popped =< Version ->
+    %% The StorageServer has the discarded records. The next request is
+    %% from its version, if this answer is the answer to the last
+    %% request.
+    case Sent of
+        #{Log := Number} -> {noreply, tail(Log, State)};
+        _ -> {noreply, State}
+    end;
+popped({Epoch, _Log, _Number}, _Popped, State = #state{system = #{epoch := Epoch}, copy = undefined, peers = Peers, popped = Count}) when Peers =/= [] ->
+    %% The LogServer does not have the records that the StorageServer
+    %% needs. A peer with a copy above the version has them.
+    {noreply, State#state{copy = reprobe, popped = Count + 1}, {continue, copy}};
+popped({Epoch, _Log, _Number}, _Popped, State = #state{system = #{epoch := Epoch}, copy = undefined, popped = Count}) ->
+    %% The StorageServer has no peer, and does not continue.
+    {noreply, State#state{popped = Count + 1}};
+popped(_Label, _Popped, State) ->
+    {noreply, State}.
 
 %% The answer of the LogServer `Log' of `Epoch' to the request `Number'.
 received({Epoch, Log, Number}, Records, Stopped, State = #state{system = System = #{epoch := Epoch}}) ->

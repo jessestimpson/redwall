@@ -9,7 +9,7 @@
 -include("redwall_eta.hrl").
 
 -export([recover/4, transaction/5, join/2, start_log/3]).
--export([worker/5, force_recovery/1, worker_node/1]).
+-export([worker/5, force_recovery/1, worker_node/1, register_storage/4]).
 -export([sequencer_node/1, log_node/1, storage_node/1, keys/0]).
 -export([coordinators/1, coordinator_ids/0, coordinator_node/1, coordinator/3, form_cluster/2]).
 
@@ -93,7 +93,8 @@ worker(Tab, CState, Mode, Class, Candidate) ->
                         notify => fun(Event) -> event(Tab, Node, Event) end,
                         %% The planted defects of the ClusterController.
                         monitor_roles => Mode =/= no_monitor_roles,
-                        step_down => Mode =/= no_step_down
+                        step_down => Mode =/= no_step_down,
+                        pop_limit => Mode =/= pop_no_limit
                     }
                 };
             false ->
@@ -104,6 +105,22 @@ worker(Tab, CState, Mode, Class, Candidate) ->
     case redwall_worker:info() of
         #{candidate := Controller} when is_pid(Controller) -> true = ets:insert(Tab, {{controller, Node}, Controller});
         _ -> true
+    end.
+
+%% Records the StorageServer `Storage' of the place `Slot' in the list of
+%% the coordinated state, under the name of the place. A run with the pop
+%% uses this function. A ClusterController sends a pop when every
+%% StorageServer of that list has answered. The function tries `Tries'
+%% times, because the coordinated state can give no answer.
+register_storage(_CState, _Slot, _Storage, 0) ->
+    ok;
+register_storage(CState, Slot, Storage, Tries) ->
+    Name = list_to_atom(lists:concat(["storage_", Slot])),
+    try redwall_cstate:storage(coordinators(CState), Name, Storage, 500) of
+        ok -> ok;
+        _ -> register_storage(CState, Slot, Storage, Tries - 1)
+    catch
+        _:_ -> register_storage(CState, Slot, Storage, Tries - 1)
     end.
 
 %% Starts a role on the node `Node', for the worker of that node.

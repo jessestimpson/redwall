@@ -11,13 +11,13 @@ State on 2026-11-24.
 |---|---|
 | TLA+ models of the logging protocol, the recovery and the Resolver | Done, checked with TLC |
 | Coordinated state on peace | Done. A coordinator keeps its data on a disk (`redwall_coordinator`) |
-| LogServer | Done in memory. A LogServer keeps every record |
+| LogServer | Done in memory. A LogServer discards the records that every StorageServer of the cluster has stored |
 | Process of an epoch: Sequencer, Resolver and Proxy | Done, as one process |
 | StorageServer | Done in memory, in ETS tables, with a copy from another StorageServer |
 | ClusterController and workers | Done: election, recruitment, one LogServer for each worker |
 | Client with the function names of erlfdb | The basic functions, `select`, `get_mapped_range`, the tuple layer, idempotency ids, list keys and binary keys |
 | Status | Done: the health of a cluster and its fault tolerance in Erlang nodes (`redwall_status`) |
-| Simulation with eta | 42 tests: kills, partitions, lost and delayed messages, a peace cluster with coordinators on the simulated disk |
+| Simulation with eta | 47 tests: kills, partitions, lost and delayed messages, a peace cluster with coordinators on the simulated disk |
 | Benchmark | Done for one computer with 7 nodes |
 | etx | A separate application with the interface of `ets` on redwall, with its own unit tests and simulation |
 
@@ -282,8 +282,16 @@ has the basic functions. The remaining parts, in the planned order:
       LogServers of every epoch.
 - [ ] Copy a part of the keys, and limit the time for which a peer keeps
       old versions for a copy.
-- [ ] Discard the records of a LogServer that every StorageServer has
-      stored (the pop of FoundationDB).
+- [x] Discard the records of a LogServer that every StorageServer has
+      stored (the pop of FoundationDB). The ClusterController asks every
+      StorageServer of the list of the coordinated state for its stored
+      version, and sends the lowest one to the LogServers. A LogServer
+      discards up to its Known Committed Version.
+- [ ] Decide what a cluster does when every StorageServer with the
+      discarded records has stopped and LogServers run. Today a new
+      StorageServer applies no record, and the database is not reset.
+- [ ] Report the popped versions and the number of records of the
+      LogServers in `redwall_status:status/1`.
 - [ ] Remove the LogServers of an ended epoch when no StorageServer needs
       them, and remove the epoch from the coordinated state.
 - [ ] Add a DataDistributor and a Ratekeeper.
@@ -324,6 +332,10 @@ node of the cluster. See "Use cases" in [README.md](README.md).
 - [x] Model the Resolver, in the separate model `formal/Resolver.tla`.
 - [ ] Add keys and values to the model of the StorageServer, so that the
       model has the value that a client reads.
+- [ ] Add the pop to `formal/Recovery.tla`: an action that discards the
+      records of a LogServer at or below its Known Committed Version and
+      at or below the version of the StorageServer. The model has no
+      pop.
 - [ ] Model the copy of records to a subset of the new LogServers. The
       model copies each record to every new LogServer.
 - [ ] Reduce the time of the Recovery configs with 3 epochs, which is

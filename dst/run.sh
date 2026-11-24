@@ -105,7 +105,8 @@ erl -noshell -eval '
             Maps =:= [] orelse io:format("~s, ~b shards: ~0p~n", [Kind, length(Maps), Atoms])
         end,
         [calm, faults, controller_calm, controller_faults, controller_partitions,
-         peace_calm, peace_faults, peace_controller_faults, peace_controller_partitions]),
+         peace_calm, peace_faults, peace_controller_faults, peace_controller_partitions,
+         pop_calm, pop_faults, pop_storage_kills]),
     halt().' -- "$logs"
 
 if [ "$result" -eq 0 ]; then

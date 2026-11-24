@@ -89,6 +89,65 @@
 %% recruits again. In FoundationDB, the roles of an ended epoch stop, and
 %% the ClusterController learns it from their failure.
 %%
+%% == Pop ==
+%%
+%% The leader lets the LogServers discard the records that every
+%% StorageServer of the cluster has stored. Without the pop, a LogServer
+%% keeps every record, and its memory grows with each commit.
+%%
+%% <ol>
+%% <li>After each read of the coordinated state (every `poll_ms'), the
+%%   leader starts a process for one pop, if the process of the pop
+%%   before has ended.</li>
+%% <li>The process asks each StorageServer of the list of the coordinated
+%%   state for its stored version (`redwall_storage:stored/2'), with a
+%%   limit of `cstate_timeout_ms' for each answer.</li>
+%% <li>If every StorageServer of the list answers with the generation of
+%%   the coordinated state that the leader has read, the pop version is
+%%   the lowest stored version.</li>
+%% <li>The process sends the pop version to every LogServer of every log
+%%   system of the coordinated state (`redwall_log:pop/2'). A LogServer
+%%   discards the records at or below that version, up to its Known
+%%   Committed Version.</li>
+%% </ol>
+%%
+%% The leader sends no pop in these cases:
+%%
+%% <ul>
+%% <li>The list has fewer than `pop_storages' StorageServers. The default
+%%   is the replication degree of the LogServers. A discarded record is
+%%   then on as many StorageServers as a record has LogServers with its
+%%   body. With `infinity', the leader sends no pop.</li>
+%% <li>A StorageServer of the list does not answer, copies from a peer, or
+%%   has read another generation of the coordinated state. A StorageServer
+%%   of a node that does not start again stays in the list until
+%%   `redwall_cstate:forget_storage/3' removes the node. The LogServers
+%%   keep every record in that time.</li>
+%% </ul>
+%%
+%% In FoundationDB, each StorageServer sends a pop for its tag to each
+%% LogServer, and a LogServer discards a record when every tag of the
+%% record is popped. redwall has no tags: every StorageServer reads every
+%% record. One process therefore collects the stored versions. This part
+%% is not in the paper.
+%%
+%% Limitations of the pop:
+%%
+%% <ul>
+%% <li>A StorageServer keeps its data in memory. After a pop, the
+%%   discarded records are on the StorageServers only. If every
+%%   StorageServer with these records stops, the data is lost: a new
+%%   StorageServer does not continue, and the database is not reset.
+%%   Without a pop, a new StorageServer reads every record from the
+%%   LogServers.</li>
+%% <li>A StorageServer that is not in the list can need a discarded
+%%   record. It then copies from a peer (see "Pop" in
+%%   {@link redwall_storage}).</li>
+%% <li>A LogServer of an ended epoch keeps the records above its Known
+%%   Committed Version, and the coordinated state keeps the log system of
+%%   each ended epoch.</li>
+%% </ul>
+%%
 %% == Departures from FoundationDB ==
 %%
 %% <ul>
@@ -137,7 +196,7 @@
 
 -export([start/1, start_link/1, stop/1, info/1, force_recovery/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
--export([recruit/4]).
+-export([recruit/4, pop/2]).
 
 -export_type([options/0, event/0]).
 
@@ -155,6 +214,15 @@
     recovery_timeout_ms => pos_integer(),
     cstate_timeout_ms => pos_integer(),
     notify => fun((event()) -> term()),
+    %% The lowest number of StorageServers in the list of the coordinated
+    %% state with which the leader sends a pop. The default is
+    %% `replication'. See "Pop".
+    pop_storages => pos_integer() | infinity,
+    %% `pop_limit => false' plants a defect for the simulation: the pop
+    %% version is the highest version of a StorageServer, and a LogServer
+    %% discards the records without the limit of its Known Committed
+    %% Version.
+    pop_limit => boolean(),
     %% `monitor_roles => false' and `step_down => false' plant defects
     %% for the simulation. With the first, the leader does not recruit
     %% after the failure of a role. With the second, a leader stays the
@@ -207,6 +275,8 @@
     %% The monitor of the process that reads the coordinated state or
     %% proposes this process.
     job :: reference() | undefined,
+    %% The monitor of the process of a pop.
+    pop_job :: reference() | undefined,
     %% The timer of the next poll, and the time until the next poll of a
     %% candidate after the coordinated state did not answer.
     timer :: reference() | undefined,
@@ -354,6 +424,8 @@ handle_info({'DOWN', Job, process, _Pid, Reason}, State0 = #state{job = Job}) ->
         {elected, Result} -> {noreply, elected(Result, State)};
         _ -> {noreply, State}
     end;
+handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{pop_job = Monitor}) ->
+    {noreply, State#state{pop_job = undefined}};
 handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{monitor = Monitor}) ->
     %% The ClusterController that this candidate watches.
     {noreply, elect(State#state{monitor = undefined, down = true})};
@@ -407,8 +479,8 @@ read(Result, State0 = #state{options = Options, role = Role, term = Term, known 
             _ -> State0
         end,
     case Result of
-        {ok, #{controller := {Term, Self}, count := Count}} when Role =:= leader ->
-            superseded(Count, State);
+        {ok, CState1 = #{controller := {Term, Self}, count := Count}} when Role =:= leader ->
+            superseded(Count, maybe_pop(CState1, State));
         {ok, #{controller := _Controller}} when Role =:= leader, map_get(step_down, Options) =:= false ->
             State;
         {ok, #{controller := Controller}} when Role =:= leader ->
@@ -654,6 +726,75 @@ known_storages(#{storages := Storages}, State) ->
     State#state{storages = Storages};
 known_storages(_CState, State) ->
     State.
+
+%% ---------------------------------------------------------------------------
+%% Pop
+%% ---------------------------------------------------------------------------
+
+%% Starts the process of one pop, if the process of the pop before has
+%% ended, the coordinated state has a log system, and its list has at
+%% least `pop_storages' StorageServers. See "Pop" in the module
+%% documentation.
+maybe_pop(CState = #{storages := Storages, current := Current}, State = #state{pop_job = undefined, options = Options}) when
+    map_size(Storages) > 0, Current =/= undefined
+->
+    case map_size(Storages) >= maps:get(pop_storages, Options, maps:get(replication, Options, 2)) of
+        true ->
+            PopOptions = #{
+                timeout => maps:get(cstate_timeout_ms, Options, 1000),
+                limit => maps:get(pop_limit, Options, true)
+            },
+            {_Pid, Monitor} = spawn_monitor(?MODULE, pop, [CState, PopOptions]),
+            State#state{pop_job = Monitor};
+        false ->
+            State
+    end;
+maybe_pop(_CState, State) ->
+    State.
+
+%% @private
+%% The process of one pop. It asks each StorageServer of the coordinated
+%% state `CState' for its stored version, and sends the lowest one to
+%% every LogServer of `CState'. It sends nothing if a StorageServer does
+%% not answer, is not ready, or has read another generation of the
+%% coordinated state: the versions start again after a reset of the
+%% database, so a stored version of another generation is no version of
+%% these LogServers.
+-spec pop(redwall_cstate:state(), #{timeout := timeout(), limit := boolean()}) -> ok.
+pop(#{generation := Generation, storages := Storages, current := Current, old := Old}, #{timeout := Timeout, limit := Limit}) ->
+    Pids = [Pid || {_Node, Pid} <- lists:sort(maps:to_list(Storages))],
+    case stored(Pids, Generation, Timeout, []) of
+        {ok, Answers} ->
+            {Version, LogLimit} =
+                case Limit of
+                    true -> {lists:min([Stored || #{stored := Stored} <- Answers]), kcv};
+                    %% The planted defect `pop_limit => false'.
+                    false -> {lists:max([Highest || #{version := Highest} <- Answers]), none}
+                end,
+            lists:foreach(
+                fun(Log) ->
+                    case redwall_log:ref(Log) of
+                        undefined -> ok;
+                        Pid -> redwall_log:pop(Pid, Version, LogLimit)
+                    end
+                end,
+                [Log || Version > 0, #{logs := Logs} <- [Current | Old], Log <- Logs]
+            );
+        error ->
+            ok
+    end.
+
+%% The answers of the StorageServers, if each of them answers with the
+%% generation `Generation'.
+stored([], _Generation, _Timeout, Answers) ->
+    {ok, Answers};
+stored([Pid | Pids], Generation, Timeout, Answers) ->
+    try redwall_storage:stored(Pid, Timeout) of
+        {ok, Answer = #{generation := Generation}} -> stored(Pids, Generation, Timeout, [Answer | Answers]);
+        _NotReadyOrOtherGeneration -> error
+    catch
+        exit:_ -> error
+    end.
 
 %% Sends the information about the database to every registered worker.
 broadcast(State = #state{workers = Workers, db_info = Info}) ->
