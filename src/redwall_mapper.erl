@@ -132,7 +132,7 @@ key({_Mode, Parts}, Key, Value) ->
 %% the mapped key (`prefixRange' of FoundationDB).
 -spec range(mode(), binary()) -> {binary(), binary()}.
 range(point, Mapped) -> {Mapped, <<Mapped/binary, 0>>};
-range(range, Mapped) -> {Mapped, strinc(Mapped)}.
+range(range, Mapped) -> redwall_key:range(Mapped).
 
 %% @doc Returns the error code of FoundationDB for a reason
 %% (`flow/include/flow/error_definitions.h').
@@ -316,18 +316,3 @@ string(<<_Code, Rest/binary>>) ->
 %% A packed byte string.
 bytes(String) ->
     <<?BYTES, (binary:replace(String, <<0>>, <<0, ?ESCAPE>>, [global]))/binary, 0>>.
-
-%% The first key that does not start with `Prefix' (`strinc' of
-%% FoundationDB). A packed tuple with an element starts with a type code
-%% below 0xFF, so the prefix has a byte that is not 0xFF.
-strinc(Prefix) ->
-    Stripped = strip(Prefix, byte_size(Prefix)),
-    Size = byte_size(Stripped) - 1,
-    <<Head:Size/binary, Last>> = Stripped,
-    <<Head/binary, (Last + 1)>>.
-
-strip(Prefix, Size) ->
-    case binary:at(Prefix, Size - 1) of
-        ?ESCAPE -> strip(Prefix, Size - 1);
-        _ -> binary:part(Prefix, 0, Size)
-    end.

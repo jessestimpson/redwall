@@ -347,6 +347,65 @@ end).
   | `ets` | The StorageServer of redwall, with the data in ETS tables in memory | 1 | 100 | `true` |
   `transactional/2` then runs the function again.
 
+### Keys
+
+A key of redwall is an Erlang term, and the keys are in the order of the
+Erlang terms. A key of FoundationDB is a byte string, and its tuple layer
+encodes a tuple so that the keys with a common prefix of elements are one
+key range. An Erlang tuple does not have this property, because Erlang
+compares two tuples by their sizes first:
+
+```erlang
+lists:sort([{b}, {a, 1}, {a}, {a, 1, x}, {a, 2}]).
+%% [{a},{b},{a,1},{a,2},{a,1,x}]
+lists:sort([[b], [a, 1], [a], [a, 1, x], [a, 2]]).
+%% [[a],[a,1],[a,1,x],[a,2],[b]]
+```
+
+redwall supports two kinds of key with the property
+([redwall_key](src/redwall_key.erl)):
+
+| Kind of key | Example | Key range of the prefix `P` | Encoding |
+|---|---|---|---|
+| List | `[users, 42, name]` | From `P` up to the improper list with the elements of `P` and the tail `<<>>`. A binary is above every list | None |
+| Binary | `redwall_tuple:pack({<<"users">>, 42})` | From `P` up to `strinc(P)`, as in FoundationDB | The tuple layer, as in erlfdb |
+
+```erlang
+Db = redwall:open(#{keys => list}),
+redwall:transactional(Db, fun(Tx) ->
+    ok = redwall:set(Tx, [users, 42, name], <<"Ada">>),
+    ok = redwall:set(Tx, [users, 42, city], <<"Oslo">>),
+    redwall:get_range_startswith(Tx, [users, 42])
+end).
+%% [{[users,42,city],<<"Oslo">>},{[users,42,name],<<"Ada">>}]
+```
+
+- `get_range_startswith/2` and `clear_range_startswith/2` take a prefix
+  that is a list or a binary. `redwall_key:range/1` returns the key range
+  of a prefix for the other functions.
+- The option `keys` of `open/1` is `list`, `binary` or `any`. With `list`
+  or `binary`, a function with a key of another kind raises `badarg`. A
+  database with keys of two kinds has key ranges without the keys that
+  the application expects.
+- The default is `any`. A key is then any term, and the application has
+  to know the order of the Erlang terms for its key ranges.
+- Recommendation: list keys for an application in Erlang, and binary
+  keys of the tuple layer for an application that comes from erlfdb.
+  `get_mapped_range/5` needs binary keys of the tuple layer.
+- A tuple key of the form `{'$redwall', _, _}` is a key of redwall
+  itself. A tuple is below every list and every binary, so no key range
+  of a database with the kind `list` or `binary` has such a key.
+- The elements of a list key of different types are in the order of the
+  Erlang terms: numbers, atoms, tuples, maps, lists, binaries. The tuple
+  layer has another order of the types. The two agree for two integers
+  and for two binaries.
+- An integer and a float with the same value are the same key in the
+  StorageServer with ETS tables, for example `[1]` and `[1.0]`. The tuple
+  layer has two keys for them.
+- A storage engine with keys in the order of their bytes would need an
+  encoding that keeps the order of the Erlang terms. redwall has no such
+  engine and no such encoding.
+
 ### Idempotency ids
 
 A client that receives no answer to a commit does not know whether the
@@ -387,6 +446,7 @@ end).
   version at its commit.
 - A key of the form `{'$redwall', _, _}` is reserved. The records of the
   ids have such keys ([redwall_idempotency](src/redwall_idempotency.erl)).
+  See "Keys".
 - Differences from FoundationDB: the key of a record has the id, so the
   client reads one key and not the keys of every possible commit version.
   The time of an id is the time of the client. An application cannot
@@ -1621,6 +1681,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/redwall_storage.erl](src/redwall_storage.erl) | The StorageServer |
 | [src/redwall.erl](src/redwall.erl) | The client, with the function names of erlfdb |
 | [src/redwall_status.erl](src/redwall_status.erl) | The health of a cluster and its fault tolerance in Erlang nodes |
+| [src/redwall_key.erl](src/redwall_key.erl) | The kinds of key, and the key range of a prefix |
 | [src/redwall_idempotency.erl](src/redwall_idempotency.erl) | The keys of the idempotency ids |
 | [src/redwall_mapper.erl](src/redwall_mapper.erl) | The mapper of a mapped range read |
 | [src/redwall_tuple.erl](src/redwall_tuple.erl), [src/redwall_float.erl](src/redwall_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |

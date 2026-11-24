@@ -23,7 +23,8 @@ client_test_() ->
         fun(Db) -> {timeout, 30, fun() -> mapped_range(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> mapped_range_conflicts(Db) end} end,
         fun(Db) -> {timeout, 60, fun() -> mapped_range_random(Db) end} end,
-        fun(Db) -> {timeout, 60, fun() -> idempotency(Db) end} end
+        fun(Db) -> {timeout, 60, fun() -> idempotency(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> keys(Db) end} end
     ]}.
 
 setup() ->
@@ -890,3 +891,92 @@ idempotency(Db = {redwall_database, #{proxy := Real}}) ->
     Committed = relayed(Db, ets:new(counter, [public]), fun(1) -> commit_and_stop; (_) -> forward end, #{automatic_idempotency => true}),
     ?assertEqual(1, Increment(Committed, old_record)),
     ?assertEqual(1, Read(old_record)).
+
+%% The key range of a prefix, for a list and for a binary.
+key_range_test() ->
+    ?assertEqual({[a], [a | <<>>]}, redwall_key:range([a])),
+    ?assertEqual({[a, 1], [a, 1 | <<>>]}, redwall_key:range([a, 1])),
+    ?assertEqual({[], <<>>}, redwall_key:range([])),
+    ?assertEqual({<<"ab">>, <<"ac">>}, redwall_key:range(<<"ab">>)),
+    ?assertEqual({<<1, 255, 255>>, <<2>>}, redwall_key:range(<<1, 255, 255>>)),
+    ?assertError(badarg, redwall_key:range(<<255, 255>>)),
+    ?assertError(badarg, redwall_key:range(<<>>)),
+    ?assertError(badarg, redwall_key:range({a})),
+    ?assertError(badarg, redwall_key:range([a | b])),
+    %% The lists with a prefix are the lists of its range, for elements
+    %% of every type.
+    Elements = [-1, 0, 2.5, a, zz, {t, 1}, #{m => 1}, [], [n], "s", <<>>, <<"b">>, <<255, 255>>],
+    Keys = [[P] || P <- Elements] ++ [[P, E] || P <- Elements, E <- Elements] ++ [[P, E, x] || P <- [a, {t, 1}], E <- Elements],
+    lists:foreach(
+        fun(Prefix) ->
+            {Begin, End} = redwall_key:range(Prefix),
+            ?assertEqual(
+                lists:sort([Key || Key <- Keys, lists:prefix(Prefix, Key)]),
+                lists:sort([Key || Key <- Keys, Key >= Begin, Key < End]),
+                Prefix
+            )
+        end,
+        [[]] ++ [[P] || P <- Elements] ++ [[a, E] || E <- Elements]
+    ),
+    %% A tuple, which is the form of a key of redwall itself, is below
+    %% every list and every binary.
+    ?assert(redwall_idempotency:key({1 bsl 62, 0}) < []),
+    ?assert(redwall_idempotency:key({1 bsl 62, 0}) < <<>>).
+
+%% The keys of a database with the option `keys', and the functions for a
+%% prefix.
+keys(Db = {redwall_database, Servers}) ->
+    Lists = redwall:open(Servers#{keys => list, automatic_idempotency => true}),
+    Binaries = redwall:open(Servers#{keys => binary}),
+    ?assertError(badarg, redwall:open(Servers#{keys => tuple})),
+    ok = redwall:transactional(Lists, fun(Tx) ->
+        [ok = redwall:set(Tx, Key, Key) || Key <- [[users], [users, 1], [users, 1, name], [users, 2], [users, 10], [userz], [orders, 7], []]],
+        ok
+    end),
+    ok = redwall:transactional(Binaries, fun(Tx) ->
+        [ok = redwall:set(Tx, Key, Key) || Key <- [<<"a">>, <<"ab">>, <<"ab", 0>>, <<"ab", 255>>, <<"ac">>, <<"b">>]],
+        ok
+    end),
+    %% A key of the test database without the option is any term.
+    ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, {tuple, key}, 1) end),
+    Keys = fun(D, Prefix) -> [Key || {Key, _Value} <- redwall:transactional(D, fun(Tx) -> redwall:get_range_startswith(Tx, Prefix) end)] end,
+    ?assertEqual([[users], [users, 1], [users, 1, name], [users, 2], [users, 10]], Keys(Lists, [users])),
+    ?assertEqual([[users, 1], [users, 1, name]], Keys(Lists, [users, 1])),
+    ?assertEqual([[orders, 7]], Keys(Lists, [orders])),
+    ?assertEqual([], Keys(Lists, [none])),
+    %% Every list. The keys of the idempotency ids are tuples, which are
+    %% not in the range.
+    ?assertEqual([[], [orders, 7], [users], [users, 1], [users, 1, name], [users, 2], [users, 10], [userz]], Keys(Lists, [])),
+    ?assertEqual([<<"ab">>, <<"ab", 0>>, <<"ab", 255>>], Keys(Binaries, <<"ab">>)),
+    ?assertEqual([<<"a">>, <<"ab">>, <<"ab", 0>>, <<"ab", 255>>, <<"ac">>], Keys(Binaries, <<"a">>)),
+    %% A clear of a prefix, and a read of the writes of the transaction.
+    ?assertEqual(
+        [[users], [users, 2], [users, 3], [users, 10]],
+        redwall:transactional(Lists, fun(Tx) ->
+            ok = redwall:clear_range_startswith(Tx, [users, 1]),
+            ok = redwall:set(Tx, [users, 3], new),
+            [Key || {Key, _} <- redwall:get_range_startswith(Tx, [users])]
+        end)
+    ),
+    ?assertEqual([[users], [users, 2], [users, 3], [users, 10]], Keys(Lists, [users])),
+    ok = redwall:transactional(Binaries, fun(Tx) -> redwall:clear_range_startswith(Tx, <<"ab">>) end),
+    ?assertEqual([<<"a">>, <<"ac">>], Keys(Binaries, <<"a">>)),
+    %% A function with a key of another kind raises `badarg'.
+    Tx1 = redwall:create_transaction(Lists),
+    Tx2 = redwall:create_transaction(Binaries),
+    [
+        begin
+            ?assertError(badarg, redwall:set(Tx, Bad, 1)),
+            ?assertError(badarg, redwall:get(Tx, Bad)),
+            ?assertError(badarg, redwall:clear(Tx, Bad)),
+            ?assertError(badarg, redwall:get_range(Tx, Bad, Good)),
+            ?assertError(badarg, redwall:get_range(Tx, Good, Bad)),
+            ?assertError(badarg, redwall:clear_range(Tx, Bad, Good)),
+            ?assertError(badarg, redwall:select(Tx, Bad, Good, [{'_', [], ['$_']}])),
+            ?assertError(badarg, redwall:add_read_conflict_key(Tx, Bad)),
+            ?assertError(badarg, redwall:add_read_conflict_range(Tx, Good, Bad))
+        end
+     || {Tx, Good, Bads} <- [{Tx1, [a], [{a}, a, 1, <<"a">>, #{}]}, {Tx2, <<"a">>, [{a}, a, 1, [a], #{}]}], Bad <- Bads
+    ],
+    ?assertError(badarg, redwall:set(Tx1, [improper | list], 1)),
+    ?assertEqual(true, redwall:is_read_only(Tx1)).

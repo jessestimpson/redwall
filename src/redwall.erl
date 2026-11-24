@@ -213,7 +213,10 @@
 %%   names. redwall has no process that tells a client which Proxy and
 %%   which StorageServers run.</li>
 %% <li>A key and a value are Erlang terms. A key and a value of erlfdb are
-%%   binaries.</li>
+%%   binaries. The option `keys' of `open/1' gives a database keys of one
+%%   kind: `list' or `binary'. A list key and a binary key have the
+%%   property of a key of the tuple layer that the keys with a common
+%%   prefix are one key range. See {@link redwall_key}.</li>
 %% <li>A transaction that `create_transaction/1' returns keeps its table
 %%   until its process ends. erlfdb frees a transaction when no process
 %%   has a reference to it.</li>
@@ -230,6 +233,7 @@
 -export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, select/4, select/5, set/3, clear/2, clear_range/3]).
 -export([get_mapped_range/4, get_mapped_range/5]).
+-export([get_range_startswith/2, clear_range_startswith/2]).
 -export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2, set_option/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
 -export([add_read_conflict_key/2, add_read_conflict_range/3, is_read_only/1]).
@@ -265,6 +269,7 @@
     retry_delay_ms => number(),
     max_retry_delay_ms => number(),
     automatic_idempotency => boolean(),
+    keys => redwall_key:kind(),
     profile => profile()
 }.
 
@@ -325,7 +330,8 @@
 open(Servers) when not is_map_key(proxy, Servers); not is_map_key(storage, Servers) ->
     open(maps:merge(local(), Servers));
 open(Servers = #{proxy := _, storage := _}) ->
-    Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms, automatic_idempotency], Servers),
+    Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms, automatic_idempotency, keys], Servers),
+    _ = lists:member(maps:get(keys, Options, any), [any, list, binary]) orelse error(badarg),
     {redwall_database, maps:merge(profile(maps:get(profile, Servers, default)), Options)}.
 
 %% @equiv open(#{})
@@ -431,6 +437,7 @@ wait(Result, _Options) -> Result.
 -spec get(transaction() | snapshot(), key()) -> value() | not_found.
 get(TxOrSnapshot, Key) ->
     {Table, Conflict} = table(TxOrSnapshot),
+    ok = check_key(Table, Key),
     case ets:lookup(Table, {w, Key}) of
         [{_, {set, Value}}] ->
             Value;
@@ -456,6 +463,7 @@ get(TxOrSnapshot, Key) ->
 -spec get_range(transaction() | snapshot(), key(), key()) -> [{key(), value()}].
 get_range(TxOrSnapshot, Begin, End) ->
     {Table, Conflict} = table(TxOrSnapshot),
+    ok = check_bounds(Table, Begin, End),
     {ok, Rows} = read(Table, {range, Begin, End}),
     %% The stored keys that the transaction has not written and not
     %% cleared, and the keys that the transaction has set.
@@ -467,6 +475,24 @@ get_range(TxOrSnapshot, Begin, End) ->
     Written = ets:select(Table, [{{{w, '$1'}, {set, '$2'}}, Guards, [{{'$1', '$2'}}]}]),
     _ = Conflict andalso ets:insert(Table, {{rr, next(Table)}, Begin, End}),
     lists:ukeymerge(1, Written, Stored).
+
+%% @doc Reads the keys with the prefix `Prefix', which is a list or a
+%% binary. The result is the list of `{Key, Value}' in the order of the
+%% keys. With a list, the keys are the lists that start with the elements
+%% of `Prefix'. With a binary, the keys are the binaries that start with
+%% the bytes of `Prefix', as in `erlfdb:get_range_startswith/2'. See
+%% {@link redwall_key}.
+-spec get_range_startswith(transaction() | snapshot(), list() | binary()) -> [{key(), value()}].
+get_range_startswith(TxOrSnapshot, Prefix) ->
+    {Begin, End} = redwall_key:range(Prefix),
+    get_range(TxOrSnapshot, Begin, End).
+
+%% @doc Clears the keys with the prefix `Prefix', which is a list or a
+%% binary.
+-spec clear_range_startswith(transaction(), list() | binary()) -> ok.
+clear_range_startswith(Tx, Prefix) ->
+    {Begin, End} = redwall_key:range(Prefix),
+    clear_range(Tx, Begin, End).
 
 %% @equiv select(TxOrSnapshot, Begin, End, MatchSpec, [])
 -spec select(transaction() | snapshot(), key(), key(), ets:match_spec()) -> [term()].
@@ -499,6 +525,7 @@ select(TxOrSnapshot, Begin, End, MatchSpec) ->
 -spec select(transaction() | snapshot(), key(), key(), ets:match_spec(), [{limit, pos_integer()}]) -> [term()].
 select(TxOrSnapshot, Begin, End, MatchSpec, Options) when is_list(Options) ->
     {Table, Conflict} = table(TxOrSnapshot),
+    ok = check_bounds(Table, Begin, End),
     Limit = proplists:get_value(limit, Options, infinity),
     %% The writes of this transaction in the range.
     Guards = [{'>=', '$1', {const, Begin}}, {'<', '$1', {const, End}}],
@@ -603,6 +630,7 @@ get_mapped_range(?IS_SS, _Begin, _End, _Mapper, _Options) ->
     error({erlfdb_error, ?UNSUPPORTED_OPERATION});
 get_mapped_range(?IS_TX = Tx, Begin, End, Mapper, Options) when is_list(Options) ->
     {Table, _Conflict} = table(Tx),
+    ok = check_bounds(Table, Begin, End),
     Limit =
         case proplists:get_value(limit, Options, 0) of
             0 -> infinity;
@@ -769,12 +797,14 @@ read_by_message([Storage | Storages], Query, Version, Timeout, Code) ->
 -spec set(transaction(), key(), value()) -> ok.
 set(?IS_TX = Tx, Key, Value) ->
     {Table, _} = table(Tx),
+    ok = check_key(Table, Key),
     true = ets:insert(Table, [{{w, Key}, {set, Value}}, {{m, next(Table)}, {set, Key, Value}}]),
     ok.
 
 -spec clear(transaction(), key()) -> ok.
 clear(?IS_TX = Tx, Key) ->
     {Table, _} = table(Tx),
+    ok = check_key(Table, Key),
     true = ets:insert(Table, [{{w, Key}, clear}, {{m, next(Table)}, {clear, Key}}]),
     ok.
 
@@ -782,6 +812,7 @@ clear(?IS_TX = Tx, Key) ->
 -spec clear_range(transaction(), key(), key()) -> ok.
 clear_range(?IS_TX = Tx, Begin, End) ->
     {Table, _} = table(Tx),
+    ok = check_bounds(Table, Begin, End),
     %% The earlier writes of the keys of the range are replaced by the
     %% cleared range.
     Guards = [{'>=', '$1', {const, Begin}}, {'<', '$1', {const, End}}],
@@ -882,7 +913,9 @@ idempotency_id(Table) ->
 %% after an error, with the backoff of the database, until it has an
 %% answer.
 determine(Servers, Id, Backoff) ->
-    Db = {redwall_database, Servers#{automatic_idempotency => false}},
+    %% The keys of an idempotency id are keys of redwall itself, which
+    %% are tuples.
+    Db = {redwall_database, Servers#{automatic_idempotency => false, keys => any}},
     Lock = {redwall_transaction, LockTable} = create_transaction(Db),
     Read = {redwall_transaction, ReadTable} = create_transaction(Db),
     try
@@ -989,12 +1022,14 @@ get_versionstamp({redwall_transaction, Table}) ->
 -spec add_read_conflict_key(transaction(), key()) -> ok.
 add_read_conflict_key(?IS_TX = Tx, Key) ->
     {Table, _} = table(Tx),
+    ok = check_key(Table, Key),
     true = ets:insert(Table, {{r, Key}}),
     ok.
 
 -spec add_read_conflict_range(transaction(), key(), key()) -> ok.
 add_read_conflict_range(?IS_TX = Tx, Begin, End) ->
     {Table, _} = table(Tx),
+    ok = check_bounds(Table, Begin, End),
     true = ets:insert(Table, {{rr, next(Table)}, Begin, End}),
     ok.
 
@@ -1006,6 +1041,20 @@ is_read_only({redwall_transaction, Table}) ->
 %% ---------------------------------------------------------------------------
 %% Internal
 %% ---------------------------------------------------------------------------
+
+%% Raises `badarg' if the key is not a key of the kind of the database.
+%% See `redwall_key'.
+check_key(Table, Key) ->
+    redwall_key:check(kind(Table), Key).
+
+check_bounds(Table, Begin, End) ->
+    Kind = kind(Table),
+    ok = redwall_key:check_bound(Kind, Begin),
+    redwall_key:check_bound(Kind, End).
+
+kind(Table) ->
+    [{db, Servers}] = ets:lookup(Table, db),
+    maps:get(keys, Servers, any).
 
 %% The table of the transaction, and whether a read adds a conflict key.
 table({redwall_transaction, Table}) ->

@@ -148,8 +148,15 @@ has the basic functions. The remaining parts, in the planned order:
 - [ ] `get_range` with `limit` and `reverse`, key selectors and
       `get_key`. This step makes subspaces and the
       directory layer of erlfdb usable.
-- [ ] The fold functions, `get_range_startswith` and
-      `clear_range_startswith`.
+- [x] Keys with the prefix property of the tuple layer: list keys and
+      binary keys, the option `keys` of `open/1`, `redwall_key:range/1`,
+      `get_range_startswith/2` and `clear_range_startswith/2`. Tuple
+      keys of the form `{'$redwall', _, _}` are reserved.
+- [ ] Decide whether `keys` has another default than `any`, and whether
+      a database rejects the tuple keys of an application.
+- [ ] An encoding of a term that keeps the order of the Erlang terms,
+      for a storage engine with keys in the order of their bytes.
+- [ ] The fold functions.
 - [x] Idempotency ids: a transaction whose commit has no answer is not
       applied a second time (`automatic_idempotency`).
 - [ ] An idempotency id that the application supplies, and the functions
