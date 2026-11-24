@@ -76,8 +76,7 @@
 %%
 %% A benchmark on 2026-11-23 compared this structure with a `gb_trees'
 %% tree that was rebuilt at an interval. At 100,000 writes per second, the
-%% longest batch took 0.3 ms with the tables and 89 ms with the tree. The
-%% README has the results.
+%% longest batch took 0.3 ms with the tables and 89 ms with the tree.
 %%
 %% The functions `check/3' and `check_batch/3' change the tables of the
 %% history. A caller uses the history that the last call returned.

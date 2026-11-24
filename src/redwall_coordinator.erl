@@ -35,7 +35,7 @@
 %%
 %% <ol>
 %% <li>Start each coordinator: `start_link/1', or the key `coordinator' of
-%%   the application environment (see README.md, "Start").</li>
+%%   the application environment (see "Start" in `docs/cluster.md').</li>
 %% <li>Call `form/1' once with every coordinator. peace stores the
 %%   configuration of the cluster on the disk of each coordinator.</li>
 %% </ol>

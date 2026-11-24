@@ -1,7 +1,8 @@
 # Roadmap
 
 redwall follows the design of FoundationDB as the paper describes it. See
-[README.md](README.md) for the sources.
+[README.md](README.md) for the sources and [docs](docs/README.md) for
+the design.
 
 ## Current status
 
@@ -89,10 +90,12 @@ commits and recoveries, and no run violates an invariant.
       of old entries in the Resolver. The LogServer keeps its records in
       an ETS table now.
 - [x] Keep the history of the Resolver in two ETS tables, chosen from a
-      benchmark of three structures in the README.
+      benchmark of three structures. See
+      [docs/transactions.md](docs/transactions.md).
 - [x] Keep the newest version of a key in the row of the key, and the
       older versions in a second table of the StorageServer, chosen from
-      a benchmark of three layouts in the README.
+      a benchmark of three layouts. See
+      [docs/storage-server.md](docs/storage-server.md).
 - [x] Add the client profile `ets` for the StorageServer with ETS
       tables, with a first backoff of 1 ms and a highest backoff of
       100 ms. The profile `default` has the values of FoundationDB.
@@ -300,7 +303,7 @@ has the basic functions. The remaining parts, in the planned order:
 
 The goal is a storage backend in memory with low latency and high
 throughput, which an application uses as it uses an ETS table, on every
-node of the cluster. See "Use cases" in [README.md](README.md).
+node of the cluster. See [etx](https://github.com/jessestimpson/etx).
 
 - [x] Keep the keys of the StorageServer in their order, in an ETS table
       of type `ordered_set`.

@@ -137,7 +137,7 @@
 %% <li>A benchmark on 2026-11-23 compared this walk with `ets:select/2'.
 %%   A select with guards on the key for the range reads every row of the
 %%   table: 20 ms for a table of 1,000,000 rows and a range of 100 keys,
-%%   against 6 us for the walk. See "Select" in README.md.</li>
+%%   against 6 us for the walk. See "Select" in `docs/storage-server.md'.</li>
 %% <li>For a read by message, a temporary process performs the select as
 %%   a direct read and answers the client. The StorageServer applies
 %%   records in that time.</li>
@@ -309,8 +309,8 @@
 %% </ul>
 %%
 %% Two benchmarks compared layouts of the store. The benchmarks are not
-%% part of this repository. See "The store of the StorageServer" and "The
-%% versions of a hot key" in README.md.
+%% part of this repository. See "The store of the StorageServer" in
+%% `docs/storage-server.md'.
 %%
 %% == Replicas ==
 %%

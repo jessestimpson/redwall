@@ -192,8 +192,7 @@
 %% <li>`ets': for the StorageServer of redwall, which keeps the data in
 %%   ETS tables in memory. A commit takes about 0.2 ms with this
 %%   StorageServer, so the first backoff is 1 ms and the highest backoff
-%%   is 100 ms. The values are from the benchmark of 2026-11-23 in
-%%   README.md.</li>
+%%   is 100 ms. The values are from the benchmark of 2026-11-23.</li>
 %% </ul>
 %%
 %% A StorageServer with another store can need other values, and gets a
@@ -306,7 +305,7 @@
 
 %% @doc Returns a database. Without the options `proxy' and `storage', the
 %% database uses the worker and the StorageServer that the redwall
-%% application started on this node (see README.md, "Start"): the Proxy is
+%% application started on this node (see "Start" in `docs/cluster.md'): the Proxy is
 %% the process of the current epoch, and the StorageServers are the
 %% StorageServers of the cluster, from the information of the
 %% ClusterController that the worker of this node has. A node without a

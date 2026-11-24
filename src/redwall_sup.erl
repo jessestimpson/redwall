@@ -2,7 +2,7 @@
 %% The supervisor of the redwall application. Its children are the
 %% coordinator, the worker and the StorageServer of this node, if the
 %% application environment has the options `coordinator', `worker' and
-%% `storage'. See README.md, "Start".
+%% `storage'. See "Start" in `docs/cluster.md'.
 -module(redwall_sup).
 
 -behaviour(supervisor).
