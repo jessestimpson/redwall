@@ -399,9 +399,14 @@ end).
   Erlang terms: numbers, atoms, tuples, maps, lists, binaries. The tuple
   layer has another order of the types. The two agree for two integers
   and for two binaries.
-- An integer and a float with the same value are the same key in the
-  StorageServer with ETS tables, for example `[1]` and `[1.0]`. The tuple
-  layer has two keys for them.
+- Two keys that are equal and not identical are one key, as in an ETS
+  table of the type `ordered_set`: an integer and a float with the same
+  value, also as a part of a key, for example `[1]` and `[1.0]`. A write
+  of one replaces the other, a read or a clear of one finds the other,
+  and a read of one conflicts with a write of the other. The tuple layer
+  has two keys for them. Before 2026-11-24, a write of such a key stopped
+  the process of the epoch, because the Resolver compared the stored key
+  with `=:=`, and the StorageServer did not apply a clear of such a key.
 - A storage engine with keys in the order of their bytes would need an
   encoding that keeps the order of the Erlang terms. redwall has no such
   engine and no such encoding.

@@ -24,7 +24,8 @@ client_test_() ->
         fun(Db) -> {timeout, 30, fun() -> mapped_range_conflicts(Db) end} end,
         fun(Db) -> {timeout, 60, fun() -> mapped_range_random(Db) end} end,
         fun(Db) -> {timeout, 60, fun() -> idempotency(Db) end} end,
-        fun(Db) -> {timeout, 30, fun() -> keys(Db) end} end
+        fun(Db) -> {timeout, 30, fun() -> keys(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> equal_keys(Db) end} end
     ]}.
 
 setup() ->
@@ -980,3 +981,58 @@ keys(Db = {redwall_database, Servers}) ->
     ],
     ?assertError(badarg, redwall:set(Tx1, [improper | list], 1)),
     ?assertEqual(true, redwall:is_read_only(Tx1)).
+
+%% Two keys that are equal and not identical are one key, as in an ETS
+%% table of the type `ordered_set': an integer and a float with the same
+%% value, also as a part of a key.
+equal_keys(Db) ->
+    Run = fun(Fun) -> redwall:transactional(Db, Fun) end,
+    lists:foreach(
+        fun({Int, Float}) ->
+            ok = Run(fun(Tx) -> redwall:set(Tx, Int, int) end),
+            ?assertEqual(int, Run(fun(Tx) -> redwall:get(Tx, Float) end)),
+            %% A write of the one replaces the other, and a read returns
+            %% the key of the last write.
+            ok = Run(fun(Tx) -> redwall:set(Tx, Float, float) end),
+            ?assertEqual(float, Run(fun(Tx) -> redwall:get(Tx, Int) end)),
+            ?assertEqual([{Float, float}], Run(fun(Tx) -> redwall:get_range(Tx, Int, [Int, after_it]) end)),
+            ?assert(element(1, hd(Run(fun(Tx) -> redwall:get_range(Tx, Int, [Int, after_it]) end))) =:= Float),
+            %% In one transaction.
+            ?assertEqual(
+                {int, [{Int, int}]},
+                Run(fun(Tx) ->
+                    ok = redwall:set(Tx, Int, int),
+                    {redwall:get(Tx, Float), redwall:get_range(Tx, Float, [Float, after_it])}
+                end)
+            ),
+            %% A read of the one conflicts with a write of the other.
+            Tx1 = redwall:create_transaction(Db),
+            ?assertEqual(int, redwall:get(Tx1, Int)),
+            ok = redwall:set(Tx1, other, 1),
+            ok = Run(fun(Tx) -> redwall:set(Tx, Float, float) end),
+            ?assertError({erlfdb_error, 1020}, redwall:commit(Tx1)),
+            %% A read of the one conflicts with a clear of the other, and
+            %% a clear of the one clears the other.
+            Tx2 = redwall:create_transaction(Db),
+            ?assertEqual(float, redwall:get(Tx2, Float)),
+            ok = redwall:set(Tx2, other, 2),
+            ok = Run(fun(Tx) -> redwall:clear(Tx, Int) end),
+            ?assertError({erlfdb_error, 1020}, redwall:commit(Tx2)),
+            ?assertEqual(not_found, Run(fun(Tx) -> redwall:get(Tx, Float) end)),
+            %% Several versions of the key in the MVCC window, with both
+            %% terms.
+            lists:foreach(
+                fun(N) ->
+                    Key = lists:nth(N rem 2 + 1, [Int, Float]),
+                    ok = Run(fun(Tx) -> redwall:set(Tx, Key, N) end),
+                    ?assertEqual(N, Run(fun(Tx) -> redwall:get(Tx, Int) end))
+                end,
+                lists:seq(1, 40)
+            ),
+            ok = Run(fun(Tx) -> redwall:clear_range(Tx, Float, [Float, after_it]) end),
+            ?assertEqual(not_found, Run(fun(Tx) -> redwall:get(Tx, Int) end))
+        end,
+        [{[n, 1], [n, 1.0]}, {[n, {t, 2}], [n, {t, 2.0}]}, {[n, [3, x]], [n, [3.0, x]]}]
+    ),
+    %% The process of the epoch has not stopped.
+    ?assertEqual(not_found, Run(fun(Tx) -> redwall:get(Tx, [n, 1]) end)).

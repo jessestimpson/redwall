@@ -254,8 +254,11 @@ intervals(Keys, Ranges, Transaction) ->
 %% The commit version at the bound `Bound': the version of the last bound
 %% at or below `Bound', or 0.
 version_at(Bound, LastCommit) ->
+    %% The table compares two bounds with `==', so the bound of the row
+    %% can be another term than `Bound': an integer and a float with the
+    %% same value are one key.
     case ets:lookup(LastCommit, Bound) of
-        [{Bound, Version}] ->
+        [{_Stored, Version}] ->
             Version;
         [] ->
             case ets:prev(LastCommit, Bound) of
@@ -300,7 +303,7 @@ put_bound(Bound, Version, LastCommit, Versions) ->
 
 unindex(Bound, LastCommit, Versions) ->
     case ets:lookup(LastCommit, Bound) of
-        [{Bound, Old}] when Old > 0 ->
+        [{_Stored, Old}] when Old > 0 ->
             true = ets:delete(Versions, {Old, Bound}),
             ok;
         _ ->

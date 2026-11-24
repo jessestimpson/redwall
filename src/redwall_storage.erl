@@ -201,6 +201,16 @@
 %% versions above the version of the copy for the time of the copy. A
 %% LogServer still keeps every record.
 %%
+%% == Equal keys ==
+%%
+%% The tables of the store are of the type `ordered_set', which compares
+%% two keys with `=='. Two keys that are equal and not identical are one
+%% key, as in an ETS table of that type: an integer and a float with the
+%% same value, also as a part of a key, for example `[users, 1]' and
+%% `[users, 1.0]'. A write of one of them replaces the other, and a read
+%% or a clear of one of them finds the other. A read returns the key of
+%% the last write. The Resolver compares keys in the same way.
+%%
 %% == Mapped range ==
 %%
 %% `mapped_range/7' and the query `{mapped, Begin, End, Mapper, Limit}' of
@@ -1024,9 +1034,9 @@ remove_above(End, {Version, Key} = Row, State = #state{data = Data, history = Hi
     Previous = ets:prev(Changes, Row),
     true = ets:delete(Changes, Row),
     case ets:lookup(Data, Key) of
-        [{Key, Version, _Change}] ->
+        [{_Stored, Version, _Change}] ->
             case ets:next_lookup(History, {Key, -Version}) of
-                {{Key, Negative} = Older, [{Older, Change}]} ->
+                {{Same, Negative} = Older, [{Older, Change}]} when Same == Key ->
                     %% The row of the key changes before the older version
                     %% leaves its table, so a direct read finds the
                     %% version in one of the two.
@@ -1169,7 +1179,7 @@ write_entry(_NoTransaction, _LSN, _State) ->
 %% version in one of the two tables.
 put_version(Key, LSN, Change, Row, #state{data = Data, history = History, changes = Changes}) ->
     case Row of
-        [{Key, Version, Earlier}] when Version < LSN -> true = ets:insert(History, {{Key, -Version}, Earlier});
+        [{_Stored, Version, Earlier}] when Version < LSN -> true = ets:insert(History, {{Key, -Version}, Earlier});
         _SameRecordOrNoRow -> true
     end,
     true = ets:insert(Data, {Key, LSN, Change}),
@@ -1177,7 +1187,7 @@ put_version(Key, LSN, Change, Row, #state{data = Data, history = History, change
     ok.
 
 %% A clear of a key without a value adds no version.
-clear_key(Key, LSN, Row = [{Key, _Version, {set, _Value}}], State) ->
+clear_key(Key, LSN, Row = [{_Stored, _Version, {set, _Value}}], State) ->
     put_version(Key, LSN, clear, Row, State);
 clear_key(_Key, _LSN, _NoRowOrNoValue, _State) ->
     ok.
@@ -1237,9 +1247,9 @@ remove_old(Oldest, {Version, Key} = Row, State = #state{data = Data, history = H
     %% later row of this pass removes it. If it is a clear, the key has no
     %% value at `Version', and the row is not needed.
     case ets:lookup(Data, Key) of
-        [{Key, Version, clear}] ->
+        [{_Stored, Version, clear}] ->
             true = ets:delete(Data, Key);
-        [{Key, Newest, _Change}] when Newest > Version ->
+        [{_Stored, Newest, _Change}] when Newest > Version ->
             case ets:lookup(History, {Key, -Version}) of
                 [{Older, clear}] -> true = ets:delete(History, Older);
                 _ -> true
@@ -1251,7 +1261,7 @@ remove_old(Oldest, {Version, Key} = Row, State = #state{data = Data, history = H
 remove_old(_Oldest, _RowAboveOldestOrNoRow, _State) ->
     ok.
 
-delete_older({Key, _Negative} = Older, Key, History) ->
+delete_older({Same, _Negative} = Older, Key, History) when Same == Key ->
     Next = ets:next(History, Older),
     true = ets:delete(History, Older),
     delete_older(Next, Key, History);
@@ -1472,7 +1482,7 @@ visible(Row = {Key, _Newest, _Change}, Version, Data, History) ->
                 value(Version, Change);
             [] ->
                 case ets:next_lookup(History, {Key, -Version}) of
-                    {{Key, Negative}, [{_, Change}]} -> value(-Negative, Change);
+                    {{Same, Negative}, [{_, Change}]} when Same == Key -> value(-Negative, Change);
                     _NoVersionAtOrBelow -> not_found
                 end
         end,
