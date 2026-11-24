@@ -87,6 +87,7 @@
 
 -export([start/1, start_link/1, stop/0, stop/1]).
 -export([start_role/3, db_info/0, db_info/1, info/0, info/1]).
+-export([register_storage/2, storages/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, role/0, class/0, db_info/0]).
@@ -121,7 +122,11 @@
 -type db_info() :: #{
     term := non_neg_integer(),
     epoch := redwall_cstate:epoch() | undefined,
-    proxies := [pid()]
+    proxies := [pid()],
+    %% The StorageServers of the cluster: each StorageServer that has
+    %% registered with the worker of its node (`register_storage/2'),
+    %% for the workers that have registered with the ClusterController.
+    storages := [pid()]
 }.
 
 -define(ROLE_TIMEOUT_MS, 5000).
@@ -149,7 +154,10 @@
     timer :: reference() | undefined,
     fast_ms = ?FAST_MS :: pos_integer(),
     %% A copy of the information in the ETS table.
-    db_info :: db_info() | undefined
+    db_info :: db_info() | undefined,
+    %% The StorageServer of this node and its monitor.
+    storage :: pid() | undefined,
+    storage_monitor :: reference() | undefined
 }).
 
 %% @doc Starts the worker of this node without a link to the caller.
@@ -197,6 +205,27 @@ db_info(Name) ->
         [] -> undefined
     catch
         error:badarg -> undefined
+    end.
+
+%% @doc Tells the worker with the name `Name' of this node that `Storage'
+%% is the StorageServer of the node. The worker reports it to the
+%% ClusterController, which gives the StorageServers of the cluster to
+%% every worker in the information about the database. The call sends one
+%% message, and does nothing if the node has no such worker. A
+%% StorageServer calls it at its start and at every tenth interval,
+%% because a worker can start after the StorageServer.
+-spec register_storage(atom(), pid()) -> ok.
+register_storage(Name, Storage) when is_atom(Name), is_pid(Storage) ->
+    gen_server:cast(Name, {storage, Storage}).
+
+%% @doc Returns the StorageServers of the cluster that the worker with the
+%% name `Name' of this node knows, or `undefined' if the ClusterController
+%% has not answered the worker. The function sends no message.
+-spec storages(atom()) -> [pid()] | undefined.
+storages(Name) ->
+    case db_info(Name) of
+        #{storages := Storages} -> Storages;
+        _ -> undefined
     end.
 
 %% @doc Returns the term and the process of the ClusterController that the
@@ -254,6 +283,13 @@ handle_call(info, _From, State = #state{controller = Controller, registered = Re
 %% @private
 %% The information about the database, from the ClusterController of
 %% `Term'. It is also the answer to a registration.
+handle_cast({storage, Storage}, State = #state{storage = Storage}) ->
+    {noreply, State};
+handle_cast({storage, Storage}, State = #state{storage_monitor = Old}) ->
+    _ = is_reference(Old) andalso erlang:demonitor(Old, [flush]),
+    %% The worker reports the StorageServer to the ClusterController at
+    %% once.
+    {noreply, register(State#state{storage = Storage, storage_monitor = erlang:monitor(process, Storage)})};
 handle_cast({db_info, Info = #{term := Term}}, State = #state{controller = {Term, _Pid}}) ->
     true = ets:insert(maps:get(name, State#state.options, ?MODULE), {db_info, Info}),
     {noreply, State#state{registered = true, db_info = Info}};
@@ -273,6 +309,9 @@ handle_info({'DOWN', Reader, process, _Pid, Reason}, State = #state{reader = Rea
         {cstate, Result} -> {noreply, found(Result, Again, State1)};
         _ -> {noreply, State1}
     end;
+handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{storage_monitor = Monitor}) ->
+    %% The StorageServer of this node stopped.
+    {noreply, register(State#state{storage = undefined, storage_monitor = undefined})};
 handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{monitor = Monitor}) ->
     %% The ClusterController stopped, or the connection to its node ended.
     %% The worker registers again when the coordinated state has another
@@ -343,7 +382,8 @@ register(State = #state{controller = {Term, Pid}, monitor = Monitor0, options = 
             undefined -> erlang:monitor(process, Pid);
             _ -> Monitor0
         end,
-    ok = gen_server:cast(Pid, {register, self(), #{node => node(), class => maps:get(class, Options, unset)}, Term}),
+    Registration = #{node => node(), class => maps:get(class, Options, unset), storage => State#state.storage},
+    ok = gen_server:cast(Pid, {register, self(), Registration, Term}),
     State#state{monitor = Monitor}.
 
 start_default(log, Options) -> redwall_log:start(Options);

@@ -340,7 +340,7 @@
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
--eta_observe({state, [version, oldest, data, history, rollbacks, copies]}).
+-eta_observe({state, [version, oldest, data, history, rollbacks, copies, resets]}).
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1]).
@@ -376,9 +376,16 @@
     %% A registered name for the StorageServer, so that a StorageServer of
     %% another node can name it as a peer: `{Name, Node}'.
     name => atom(),
+    %% The registered name of the worker of this node. The StorageServer
+    %% registers with the worker, so that the ClusterController has it in
+    %% the list of the StorageServers of the cluster
+    %% (`redwall_worker:register_storage/2').
+    worker => atom(),
     %% The other StorageServers of the cluster, or a function that returns
-    %% them. See "Copy from another StorageServer".
-    peers => [gen_server:server_ref()] | fun(() -> [gen_server:server_ref()])
+    %% them. See "Copy from another StorageServer". With the option
+    %% `worker' and without this option, the peers are the other
+    %% StorageServers of that list.
+    peers => [gen_server:server_ref()] | fun(() -> [gen_server:server_ref()] | undefined)
 }.
 
 %% The table of the data and the published versions of a StorageServer.
@@ -469,11 +476,24 @@
     %% The peers, and the copy in progress: `probe' before a peer has
     %% answered, or the peer, the reference and the version of the copy
     %% and the key after which the next page starts.
-    peers = [] :: [gen_server:server_ref()] | fun(() -> [gen_server:server_ref()]),
+    peers = [] :: [gen_server:server_ref()] | fun(() -> [gen_server:server_ref()] | undefined),
+    worker :: atom(),
     %% `reprobe' is `probe' for a StorageServer that has made no progress
     %% in an ended epoch.
-    copy :: undefined | probe | reprobe | #{peer := gen_server:server_ref(), ref := reference(), version := version(), next := term()},
+    %% `{probing, Monitor, Probe}' is the state while a temporary process
+    %% asks the peers.
+    copy ::
+        undefined
+        | probe
+        | reprobe
+        | {probing, reference(), probe | reprobe}
+        | #{peer := gen_server:server_ref(), ref := reference(), version := version(), next := term()},
     copies = 0 :: non_neg_integer(),
+    %% The generation of the coordinated state at the last read, and the
+    %% number of times that the StorageServer has removed its data after
+    %% a reset of the database.
+    generation :: non_neg_integer() | undefined,
+    resets = 0 :: non_neg_integer(),
     %% Whether the timer of `poll' runs, and the version at the last tenth
     %% interval.
     polling = false :: boolean(),
@@ -635,15 +655,20 @@ handle(Storage) ->
 -spec read_direct(handle(), query(), version()) -> {ok, term()} | behind | too_old | gone.
 read_direct(Handle = #{data := Data0, history := History, published := Published}, Query, Version) ->
     Data = {Data0, History},
+    %% Element 3 changes when the StorageServer removes its data after a
+    %% reset of the database. A read that started before that is not
+    %% answered from the tables.
+    Resets = atomics:get(Published, 3),
     case atomics:get(Published, 1) >= Version orelse not maps:get(wait, Handle, true) of
         false ->
             behind;
         true ->
             try lookup(Query, Version, Data) of
                 Result ->
-                    case Version < atomics:get(Published, 2) of
-                        true -> too_old;
-                        false -> {ok, Result}
+                    case {Version < atomics:get(Published, 2), atomics:get(Published, 3)} of
+                        {_, Other} when Other =/= Resets -> behind;
+                        {true, _} -> too_old;
+                        {false, _} -> {ok, Result}
                     end
             catch
                 error:badarg -> gone
@@ -660,6 +685,9 @@ read_direct(Handle = #{data := Data0, history := History, published := Published
         %% has finished, and whether a copy is in progress.
         copies := non_neg_integer(),
         copying := boolean(),
+        %% The number of times that the StorageServer has removed its
+        %% data after a reset of the database.
+        resets := non_neg_integer(),
         %% The ETS table of the data. See "Store" in the module
         %% documentation.
         data := ets:tid(),
@@ -687,10 +715,29 @@ init(Options = #{coordinators := Coordinators}) ->
         history = ets:new(redwall_storage_history, [ordered_set, protected, {read_concurrency, true}]),
         changes = ets:new(redwall_storage_changes, [ordered_set, private]),
         buffer = gb_trees:empty(),
-        published = atomics:new(2, [{signed, true}]),
+        published = atomics:new(3, [{signed, true}]),
         requests = gen_server:reqids_new(),
-        peers = maps:get(peers, Options, [])
+        worker = maps:get(worker, Options, undefined),
+        peers =
+            case Options of
+                #{peers := Peers} ->
+                    Peers;
+                #{worker := Worker} ->
+                    %% The other StorageServers that the ClusterController
+                    %% has given to the worker of this node, or
+                    %% `undefined' before its first answer.
+                    Self = self(),
+                    fun() ->
+                        case redwall_worker:storages(Worker) of
+                            undefined -> undefined;
+                            Storages -> Storages -- [Self]
+                        end
+                    end;
+                _ ->
+                    []
+            end
     },
+    _ = is_atom(State#state.worker) andalso State#state.worker =/= undefined andalso redwall_worker:register_storage(State#state.worker, self()),
     case State#state.peers of
         [] ->
             {ok, start_polling(State)};
@@ -708,12 +755,27 @@ handle_continue(copy, State = #state{copy = Probe, peers = Peers0}) when Probe =
             true -> Peers0();
             false -> Peers0
         end,
-    %% Without a peer, the StorageServer has nothing to copy.
-    Answer =
-        case Peers of
-            [] -> empty;
-            _ -> probe(Peers, State#state.version, none)
-        end,
+    %% A temporary process asks the peers, so that this StorageServer
+    %% answers the same question of a peer in that time. Two StorageServers
+    %% that ask each other with a call at the same time would both wait
+    %% for the time limit of the call.
+    Mine = State#state.version,
+    {_Pid, Monitor} = spawn_monitor(fun() ->
+        %% Without a peer, the StorageServer has nothing to copy.
+        %% `undefined' is the answer of a worker that does not know the
+        %% StorageServers of the cluster yet, and the StorageServer asks
+        %% again later.
+        exit(
+            {probe,
+                case Peers of
+                    [] -> empty;
+                    undefined -> none;
+                    _ -> probe(Peers, Mine, none)
+                end}
+        )
+    end),
+    {noreply, State#state{copy = {probing, Monitor, Probe}}};
+handle_continue({probed, Answer, Probe}, State) ->
     case {Answer, Probe} of
         {{ok, Peer, Ref, Version}, _} ->
             %% The StorageServer removes its own data before the copy. It
@@ -743,7 +805,7 @@ handle_continue(copy, State = #state{copy = Probe, peers = Peers0}) when Probe =
             {noreply, start_polling(State#state{copy = undefined, oldest = 0})};
         {none, probe} ->
             _ = erlang:send_after(?COPY_RETRY_MS, self(), copy),
-            {noreply, State};
+            {noreply, State#state{copy = probe}};
         {_NoPeerIsAhead, reprobe} ->
             {noreply, State#state{copy = undefined}}
     end;
@@ -871,6 +933,7 @@ handle_call(info, _From, State = #state{version = Version, system = System, roll
         rollbacks => Rollbacks,
         copies => State#state.copies,
         copying => State#state.copy =/= undefined,
+        resets => State#state.resets,
         data => State#state.data,
         history => State#state.history
     },
@@ -887,6 +950,13 @@ handle_cast(_Message, State) ->
 %% @private
 handle_info(copy, State = #state{copy = probe}) ->
     {noreply, State, {continue, copy}};
+handle_info({'DOWN', Monitor, process, _Pid, Reason}, State = #state{copy = {probing, Monitor, Probe}}) ->
+    Answer =
+        case Reason of
+            {probe, Found} -> Found;
+            _Failed -> none
+        end,
+    {noreply, State, {continue, {probed, Answer, Probe}}};
 handle_info(poll, State = #state{poll_ms = PollMs, copy = Copy}) when Copy =/= undefined ->
     %% The StorageServer reads no log during a copy.
     _ = erlang:send_after(PollMs, self(), poll),
@@ -909,6 +979,9 @@ handle_info(poll, State = #state{poll_ms = PollMs, system = System, stopped = St
     Ticks = State1#state.ticks + 1,
     case Ticks rem ?RESEND_TICKS of
         0 ->
+            %% The worker of the node can have started after this
+            %% StorageServer.
+            _ = State1#state.worker =/= undefined andalso redwall_worker:register_storage(State1#state.worker, self()),
             case stalled(State1) of
                 true ->
                     %% The epoch of the StorageServer has ended, and the
@@ -974,16 +1047,60 @@ watch(State) ->
 
 %% Reads the log systems from the coordinated state, and updates the log
 %% system that the StorageServer reads.
-refresh(State = #state{coordinators = Coordinators, cstate_timeout_ms = Timeout}) ->
+refresh(State0 = #state{coordinators = Coordinators, cstate_timeout_ms = Timeout}) ->
     try redwall_cstate:read(Coordinators, Timeout) of
-        {ok, #{current := Current, old := Old}} when Current =/= undefined ->
-            Systems = lists:sort(fun(#{epoch := A}, #{epoch := B}) -> A =< B end, [Current | Old]),
-            follow(State#state{systems = Systems});
-        _NoLogSystemOrError ->
-            State
+        {ok, CState = #{current := Current, old := Old}} ->
+            State = generation(CState, State0),
+            case Current of
+                undefined ->
+                    State;
+                _ ->
+                    Systems = lists:sort(fun(#{epoch := A}, #{epoch := B}) -> A =< B end, [Current | Old]),
+                    follow(State#state{systems = Systems})
+            end;
+        _Error ->
+            State0
     catch
-        exit:_ -> State
+        exit:_ -> State0
     end.
+
+%% Compares the generation of the coordinated state with the generation
+%% of the StorageServer. After a reset of the database the generation is
+%% higher, and the StorageServer removes its data: the log systems of its
+%% data are not in the coordinated state, and the versions start again.
+%% See "Reset" in `redwall_recovery'. A StorageServer that copies from a
+%% peer ends the copy first.
+generation(#{generation := Generation}, State = #state{generation = undefined}) ->
+    State#state{generation = Generation};
+generation(#{generation := Generation}, State = #state{generation = Mine, copy = undefined}) when Generation =/= Mine ->
+    %% A direct read with a read version of the time before the reset
+    %% finds a version of 0, and a read in progress finds another number
+    %% of resets.
+    ok = atomics:put(State#state.published, 1, 0),
+    ok = atomics:add(State#state.published, 3, 1),
+    true = ets:delete_all_objects(State#state.data),
+    true = ets:delete_all_objects(State#state.history),
+    true = ets:delete_all_objects(State#state.changes),
+    ok = atomics:put(State#state.published, 2, 0),
+    lists:foreach(fun({From, _Query, _Version}) -> gen_server:reply(From, {error, transaction_too_old}) end, State#state.waiting),
+    State#state{
+        generation = Generation,
+        resets = State#state.resets + 1,
+        version = 0,
+        oldest = 0,
+        kcv = 0,
+        checked = -1,
+        system = undefined,
+        systems = [],
+        buffer = gb_trees:empty(),
+        requests = gen_server:reqids_new(),
+        sent = #{},
+        cursors = #{},
+        stopped = [],
+        waiting = []
+    };
+generation(_CState, State) ->
+    State.
 
 %% Updates the log system that the StorageServer reads from the known log
 %% systems and the version.

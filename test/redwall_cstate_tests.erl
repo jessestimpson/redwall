@@ -18,10 +18,10 @@ apply_all(Values) ->
 %% system of epoch 1.
 first_epoch_test() ->
     S0 = redwall_cstate:init([]),
-    ?assertEqual(#{count => 0, owner => undefined, current => undefined, old => [], controller => {0, undefined}}, S0),
+    ?assertEqual(#{count => 0, owner => undefined, current => undefined, old => [], controller => {0, undefined}, storages => #{}, generation => 0}, S0),
     {S1, {ok, 1, S1}} = redwall_cstate:apply(?META, {lock, 0, a}, S0),
     {S2, ok} = redwall_cstate:apply(?META, {write, 1, a, logs(1), undefined}, S1),
-    ?assertEqual(#{count => 1, owner => a, current => logs(1), old => [], controller => {0, undefined}}, S2).
+    ?assertEqual(#{count => 1, owner => a, current => logs(1), old => [], controller => {0, undefined}, storages => #{}, generation => 0}, S2).
 
 %% A recovery ends the previous epoch at the Recovery Version.
 recovery_test() ->
@@ -32,7 +32,7 @@ recovery_test() ->
         {write, 2, b, logs(2), 7}
     ]),
     ?assertEqual(
-        #{count => 2, owner => b, current => logs(2), old => [(logs(1))#{end_version => 7}], controller => {0, undefined}},
+        #{count => 2, owner => b, current => logs(2), old => [(logs(1))#{end_version => 7}], controller => {0, undefined}, storages => #{}, generation => 0},
         S
     ).
 
@@ -106,7 +106,7 @@ cluster_test_() ->
                 ?assertEqual({error, {count, 3}}, redwall_cstate:write(Ids, 2, b, logs(2), 7)),
                 ok = redwall_cstate:write(Ids, 3, c, logs(3), 5),
                 ?assertEqual(
-                    {ok, #{count => 3, owner => c, current => logs(3), old => [(logs(1))#{end_version => 5}], controller => {0, undefined}}},
+                    {ok, #{count => 3, owner => c, current => logs(3), old => [(logs(1))#{end_version => 5}], controller => {0, undefined}, storages => #{}, generation => 0}},
                     redwall_cstate:read(Ids)
                 )
             end}

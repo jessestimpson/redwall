@@ -208,7 +208,10 @@
     %% candidate after the coordinated state did not answer.
     timer :: reference() | undefined,
     retry_ms = ?RETRY_MS :: pos_integer(),
-    workers = #{} :: #{pid() => {node(), redwall_worker:class(), reference()}},
+    workers = #{} :: #{pid() => {node(), redwall_worker:class(), reference(), pid() | undefined}},
+    %% The StorageServer of each node, from the last read of the
+    %% coordinated state.
+    storages = #{} :: #{node() => pid()},
     attempt = 0 :: non_neg_integer(),
     %% Whether the leader waits for `retry_ms' after a failure.
     waiting = false :: boolean(),
@@ -236,6 +239,8 @@ stop(Controller) ->
         role := candidate | leader,
         term := non_neg_integer(),
         workers := [node()],
+        %% The StorageServers of the cluster, from the coordinated state.
+        storages := [pid()],
         db_info := redwall_worker:db_info() | undefined
     }.
 info(Controller) ->
@@ -266,19 +271,39 @@ handle_call(info, _From, State = #state{role = Role, term = Term, known = {Known
                 leader -> Term;
                 candidate -> Known
             end,
-        workers => lists:sort([Node || {Node, _Class, _Monitor} <- maps:values(Workers)]),
+        workers => lists:sort([Node || {Node, _Class, _Monitor, _Storage} <- maps:values(Workers)]),
+        storages => storages(State),
         db_info => Info
     },
     {reply, Reply, State}.
 
 %% @private
 %% The registration of a worker for the term of this leader.
-handle_cast({register, Worker, #{node := Node, class := Class}, Term}, State = #state{role = leader, term = Term, workers = Workers, db_info = Info}) ->
+handle_cast({register, Worker, Registration = #{node := Node, class := Class}, Term}, State = #state{role = leader, term = Term, workers = Workers, db_info = Info}) ->
+    %% The StorageServer of the node of the worker, or `undefined'.
+    Storage = maps:get(storage, Registration, undefined),
     Workers1 =
         case Workers of
-            #{Worker := _} -> Workers;
-            _ -> Workers#{Worker => {Node, Class, erlang:monitor(process, Worker)}}
+            #{Worker := {_Node, _Class, Monitor, _Storage}} -> Workers#{Worker := {Node, Class, Monitor, Storage}};
+            _ -> Workers#{Worker => {Node, Class, erlang:monitor(process, Worker), Storage}}
         end,
+    %% The information about the database has the StorageServers. Every
+    %% worker receives it when the StorageServers change.
+    %% The leader records a StorageServer that the coordinated state does
+    %% not have for the node. A temporary process writes it, and the
+    %% leader then reads the coordinated state, which has the list of the
+    %% StorageServers of the cluster.
+    _ =
+        is_pid(Storage) andalso maps:get(Node, State#state.storages, undefined) =/= Storage andalso
+            begin
+                Self = self(),
+                #{coordinators := Coordinators} = State#state.options,
+                Timeout = maps:get(cstate_timeout_ms, State#state.options, 1000),
+                spawn(fun() ->
+                    _ = redwall_cstate:storage(Coordinators, Node, Storage, Timeout),
+                    Self ! poll
+                end)
+            end,
     ok = gen_server:cast(Worker, {db_info, Info}),
     {noreply, maybe_recruit(State#state{workers = Workers1})};
 handle_cast(force_recovery, State = #state{role = leader}) ->
@@ -310,7 +335,7 @@ handle_info({recovered, Attempt, Result, Proxy}, State = #state{role = leader, g
     #generation{recruiter = {_Pid, Monitor}} = Generation,
     true = erlang:demonitor(Monitor, [flush]),
     Generation1 = Generation#generation{recruiter = undefined, proxy = Proxy, recovered = true},
-    Info = #{term => Term, epoch => maps:get(epoch, Result), proxies => [Proxy]},
+    Info = #{term => Term, epoch => maps:get(epoch, Result), proxies => [Proxy], storages => storages(State)},
     ok = notify({recovered, Result#{proxy => Proxy}}, State),
     {noreply, broadcast(State#state{generation = Generation1, db_info = Info})};
 handle_info({recruit_failed, Attempt, Reason}, State = #state{role = leader, generation = #generation{attempt = Attempt}}) ->
@@ -328,7 +353,10 @@ handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{monitor = 
     {noreply, elect(State#state{monitor = undefined, down = true})};
 handle_info({'DOWN', Monitor, process, Pid, Reason}, State = #state{workers = Workers, generation = Generation}) ->
     case {Workers, Generation} of
-        {#{Pid := {_Node, _Class, Monitor}}, _} ->
+        {#{Pid := {_Node, _Class, Monitor, _Storage}}, _} ->
+            %% The StorageServer of the worker stays in the coordinated
+            %% state, so the status of the cluster names a StorageServer
+            %% that does not run.
             {noreply, State#state{workers = maps:remove(Pid, Workers)}};
         {_, #generation{recruiter = {Pid, Monitor}}} ->
             ok = notify({recovery_failed, {recruiter, Reason}}, State),
@@ -365,8 +393,13 @@ poll(State) ->
     State.
 
 %% Handles the coordinated state that a read returned.
-read(Result, State = #state{options = Options, role = Role, term = Term, known = Known}) ->
+read(Result, State0 = #state{options = Options, role = Role, term = Term, known = Known}) ->
     Self = self(),
+    State =
+        case Result of
+            {ok, CState} -> known_storages(CState, State0);
+            _ -> State0
+        end,
     case Result of
         {ok, #{controller := {Term, Self}, count := Count}} when Role =:= leader ->
             superseded(Count, State);
@@ -459,13 +492,13 @@ lead(Term, State = #state{monitor = Old}) ->
         known = {Term, self()},
         monitor = undefined,
         down = false,
-        db_info = #{term => Term, epoch => undefined, proxies => []}
+        db_info = #{term => Term, epoch => undefined, proxies => [], storages => storages(State)}
     },
     ok = notify({leader, Term}, State1),
     State1.
 
 forget_workers(State = #state{workers = Workers}) ->
-    lists:foreach(fun({_Node, _Class, Monitor}) -> erlang:demonitor(Monitor, [flush]) end, maps:values(Workers)),
+    lists:foreach(fun({_Node, _Class, Monitor, _Storage}) -> erlang:demonitor(Monitor, [flush]) end, maps:values(Workers)),
     State#state{workers = #{}}.
 
 %% ---------------------------------------------------------------------------
@@ -503,7 +536,7 @@ maybe_recruit(State) ->
 %% The workers of the roles of one attempt. The workers are in the order
 %% of their nodes, and the attempt selects the first worker.
 plan(Workers, Logs, Attempt) ->
-    Sorted = lists:sort([{Node, Class, Worker} || {Worker, {Node, Class, _Monitor}} <- maps:to_list(Workers)]),
+    Sorted = lists:sort([{Node, Class, Worker} || {Worker, {Node, Class, _Monitor, _Storage}} <- maps:to_list(Workers)]),
     Count = length(Sorted),
     %% The workers of one rank in the order of their nodes, with a first
     %% worker that the attempt selects. Two attempts in sequence then have
@@ -597,6 +630,24 @@ retry(State = #state{waiting = true}) ->
 retry(State = #state{options = Options}) ->
     _ = erlang:send_after(maps:get(retry_ms, Options, 500), self(), recruit),
     State#state{waiting = true}.
+
+%% The StorageServers of the cluster from the coordinated state, in the
+%% order of their nodes.
+storages(#state{storages = Storages}) ->
+    [Storage || {_Node, Storage} <- lists:sort(maps:to_list(Storages))].
+
+%% Takes the StorageServers from a read of the coordinated state. If they
+%% have changed, every worker receives the information about the
+%% database.
+known_storages(#{storages := Storages}, State = #state{role = leader, storages = Known, db_info = Info}) when Storages =/= Known, is_map(Info) ->
+    State1 = State#state{storages = Storages},
+    broadcast(State1#state{db_info = Info#{storages => storages(State1)}});
+known_storages(#{storages := Storages}, State) ->
+    %% A candidate keeps the list, so that it has the list when it
+    %% becomes the leader.
+    State#state{storages = Storages};
+known_storages(_CState, State) ->
+    State.
 
 %% Sends the information about the database to every registered worker.
 broadcast(State = #state{workers = Workers, db_info = Info}) ->

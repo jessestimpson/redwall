@@ -464,6 +464,61 @@ increments return 1 to 200 and give 200. In the benchmark of etx with
 three nodes on one computer, the p50 of `update_counter/3` is 135 us to
 139 us with ids, against 130 us to 135 us without.
 
+### The StorageServers of a cluster
+
+The coordinated state has the StorageServer of each node of the cluster.
+
+1. A StorageServer with the option `worker` registers with the worker of
+   its node. The application sets the option for its StorageServer.
+2. The worker reports the StorageServer to the ClusterController with its
+   registration.
+3. The ClusterController records it in the coordinated state
+   (`redwall_cstate:storage/4`), and gives the StorageServers of the
+   coordinated state to every worker in the information about the
+   database.
+
+- `redwall:open/0` reads from the StorageServers of that list, with the
+  StorageServers of the node of the client first. A node without a
+  StorageServer reads from the other nodes by message.
+- A StorageServer with the option `worker` copies from the other
+  StorageServers of that list.
+- `redwall_status:status/1` reports on the StorageServers of that list.
+- A StorageServer that has stopped stays in the list until a
+  StorageServer of its node registers, so the status names it as a
+  StorageServer that does not run. `redwall_cstate:forget_storage/3`
+  removes a node that does not start again.
+
+### Reset after the loss of LogServers
+
+A LogServer keeps its records in memory. When `replication` LogServers of
+an epoch do not run, a record of that epoch can be on no LogServer, and
+no recovery can end the epoch. This is the state of a cluster after the
+stop of every node, and after the stop of a second node before the
+cluster has recovered from the stop of the first.
+
+With the option `reset_after_log_loss => true` of the process of an
+epoch, the recovery then resets the database
+([redwall_recovery](src/redwall_recovery.erl), "Reset"):
+
+1. The recovery asks the node of each LogServer of the previous epoch
+   whether the process runs. A LogServer counts as lost only if its node
+   answers that it does not run. A node that does not answer can be cut
+   off.
+2. If at least `replication` LogServers are lost, the recovery removes
+   every log system from the coordinated state and raises its
+   generation.
+3. The recovery continues as the first recovery of a database, and the
+   versions start again.
+4. A StorageServer that reads the higher generation removes its data.
+
+- The data of the database is lost by a reset. The option is for a
+  database whose data is in memory, such as the tables of etx.
+- The default is `false`: the recovery fails, and the cluster has no
+  epoch. FoundationDB has no reset, because its LogServers write to disk.
+- The Resolver rejects a transaction with a read version at or above its
+  commit version, so a transaction of the time before a reset does not
+  commit after it.
+
 ### Status
 
 `redwall_status:status/1` returns the health of a cluster and its fault
@@ -474,7 +529,6 @@ FoundationDB reports the same two numbers for zones in the
 ```erlang
 redwall_status:status(#{
     coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}],
-    storages => [{storage, 'a@host'}, {storage, 'b@host'}, {storage, 'c@host'}],
     min_workers => 2
 }).
 ```
@@ -495,9 +549,10 @@ redwall_status:status(#{
 - An operator who restarts the nodes one after another stops a node only
   if it is in `safe_to_stop`, and waits for `healthy` before the next
   node.
-- Limitations: the function knows only the StorageServers of the option
-  `storages`, asks the processes one after another, and does not examine
-  partitions.
+- Without the option `storages`, the StorageServers are the
+  StorageServers of the coordinated state.
+- Limitations: the function asks the processes one after another, and
+  does not examine partitions.
 
 The simulation of etx uses the function for the kills of its runs with
 restarts of different nodes. See the README of etx.

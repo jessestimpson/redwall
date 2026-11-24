@@ -94,6 +94,7 @@
 -eta_observe({state, [epoch, dv, kcv, records, stopped_by]}).
 
 -export([start/1, start_link/1, stop/1, ref/1]).
+-export([lost/2, alive/1]).
 -export([replicas/3]).
 -export([push/6, push/7, send_push/6, lock/2, lock/3, confirm/2, peek/3, peek/4, tail/2, tail/3, info/1]).
 -export([init/1, handle_call/3, handle_cast/2]).
@@ -180,6 +181,38 @@ start(Options) ->
 %% as a call to a process that has stopped. For a process on another
 %% node the result is the process, and a call to a process that has
 %% stopped fails.
+%% @doc Whether the LogServer does not run, and whether this is known.
+%% The result is `true' if the node of the LogServer answers that the
+%% process does not run. A LogServer keeps its records in memory, so its
+%% records are then lost. The result is `false' if the process runs, or
+%% if its node does not answer within `Timeout': the LogServer can then
+%% run on a node that is cut off.
+-spec lost({id(), pid()}, timeout()) -> boolean().
+lost({_Id, Pid}, Timeout) when is_pid(Pid) ->
+    case node(Pid) =:= node() of
+        true ->
+            not alive(Pid);
+        false ->
+            try erpc:call(node(Pid), ?MODULE, alive, [Pid], Timeout) of
+                Alive -> Alive =:= false
+            catch
+                _:_ -> false
+            end
+    end;
+lost(_NoProcess, _Timeout) ->
+    false.
+
+%% @private
+%% The process runs on this node. A pid of an earlier start of this node
+%% is not a pid of this node, and `is_process_alive/1' raises an error for
+%% it.
+alive(Pid) ->
+    try
+        is_process_alive(Pid)
+    catch
+        error:badarg -> false
+    end.
+
 -spec ref({id(), pid()}) -> pid() | undefined.
 ref({_Id, Pid}) when is_pid(Pid) ->
     %% `is_process_alive/1' raises an error for a process of another node.

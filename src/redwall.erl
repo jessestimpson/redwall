@@ -307,9 +307,11 @@
 %% @doc Returns a database. Without the options `proxy' and `storage', the
 %% database uses the worker and the StorageServer that the redwall
 %% application started on this node (see README.md, "Start"): the Proxy is
-%% the process of the current epoch, and the StorageServer is the
-%% StorageServer of this node. The call raises `no_storage_server' if the
-%% application has no StorageServer.
+%% the process of the current epoch, and the StorageServers are the
+%% StorageServers of the cluster, from the information of the
+%% ClusterController that the worker of this node has. A node without a
+%% StorageServer reads from the StorageServers of other nodes by message.
+%% The call raises `no_worker' if the node has no worker.
 %%
 %% With the options, the function returns a database for a Proxy and for
 %% one StorageServer or several. The Proxy is a process, or a function that returns the process
@@ -339,23 +341,27 @@ open(Servers = #{proxy := _, storage := _}) ->
 open() ->
     open(#{}).
 
-%% The Proxy and the StorageServer of a node that runs the redwall
-%% application with a worker and a StorageServer. The Proxy is the process
-%% of the current epoch, from the information of the ClusterController
-%% that the worker of this node has. The StorageServer is the child of the
-%% supervisor at the time of this call.
+%% The Proxy and the StorageServers for a node that runs the redwall
+%% application with a worker. The worker of this node has the information
+%% of the ClusterController about the database: the process of the
+%% current epoch, and the StorageServers of the cluster. The
+%% StorageServers of this node are the first ones, so a read uses the ETS
+%% tables of this node if the node has a StorageServer.
 local() ->
-    Storage =
-        try [Pid || {redwall_storage, Pid, _Type, _Modules} <- supervisor:which_children(redwall_sup), is_pid(Pid)] of
-            [Pid] -> Pid;
-            [] -> error(no_storage_server)
-        catch
-            exit:_ -> error(no_storage_server)
-        end,
+    _ = whereis(redwall_worker) =:= undefined andalso error(no_worker),
     Proxy = fun() ->
         case redwall_worker:db_info() of
             #{proxies := [Process | _]} -> Process;
             _ -> undefined
+        end
+    end,
+    Storage = fun() ->
+        case redwall_worker:storages(redwall_worker) of
+            undefined ->
+                undefined;
+            Storages ->
+                {Here, Others} = lists:partition(fun(Pid) -> node(Pid) =:= node() end, Storages),
+                Here ++ Others
         end
     end,
     #{proxy => Proxy, storage => Storage}.

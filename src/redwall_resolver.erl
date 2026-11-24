@@ -219,7 +219,11 @@ check(Transaction = #{read_version := ReadVersion}, Version, History, Record) ->
             false -> ok
         end,
     Result =
-        case ReadVersion < NewOldest andalso Reads =/= [] of
+        %% A read version at or above the commit version is not a read
+        %% version of this epoch. After a reset of the database, the
+        %% versions start again, and a transaction of the time before the
+        %% reset has such a read version.
+        case (ReadVersion < NewOldest orelse ReadVersion >= Version) andalso Reads =/= [] of
             true ->
                 too_old;
             false ->

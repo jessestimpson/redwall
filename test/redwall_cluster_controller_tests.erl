@@ -170,7 +170,7 @@ placement_test_() ->
             ),
             %% Each fake worker has received the information about the
             %% epoch.
-            ok = await(fun() -> db_info(L1) =:= #{term => 1, epoch => 1, proxies => [Proxy]} end, 100),
+            ok = await(fun() -> db_info(L1) =:= #{term => 1, epoch => 1, proxies => [Proxy], storages => []} end, 100),
             %% The second attempt starts at another worker. The classes
             %% decide in the same way.
             ok = redwall_cluster_controller:force_recovery(Controller),
@@ -373,7 +373,7 @@ lost_election_test_() ->
         try
             ok = proposed({elect, 0, Controller}),
             ok = await(
-                fun() -> redwall_cluster_controller:info(Controller) =:= #{role => candidate, term => 1, workers => [], db_info => undefined} end,
+                fun() -> redwall_cluster_controller:info(Controller) =:= #{role => candidate, term => 1, workers => [], storages => [], db_info => undefined} end,
                 100
             ),
             %% The coordinated state has the term 1 from now on, and
@@ -432,7 +432,7 @@ lost_answer_test_() ->
             ok = proposed({elect, 0, Controller}),
             ?assertMatch(#{role := candidate}, redwall_cluster_controller:info(Controller)),
             Stub ! {set, #{read => {1, Controller}}},
-            ok = await(fun() -> redwall_cluster_controller:info(Controller) =:= #{role => leader, term => 1, workers => [], db_info => #{term => 1, epoch => undefined, proxies => []}} end, 100)
+            ok = await(fun() -> redwall_cluster_controller:info(Controller) =:= #{role => leader, term => 1, workers => [], storages => [], db_info => #{term => 1, epoch => undefined, proxies => [], storages => []}} end, 100)
         after
             exit(Controller, kill),
             exit(Stub, kill),
@@ -629,6 +629,13 @@ application_test_() ->
         try
             {ok, _} = application:ensure_all_started(redwall),
             #{epoch := 1} = await_epoch(1),
+            %% The StorageServer of the application registers with the
+            %% worker, and the ClusterController gives the StorageServers
+            %% of the cluster to the worker.
+            [{redwall_storage, StoragePid, _, _}] = [Child || Child = {redwall_storage, _, _, _} <- supervisor:which_children(redwall_sup)],
+            ok = await(fun() -> redwall_worker:storages(redwall_worker) =:= [StoragePid] end, 100),
+            #{candidate := Leader} = redwall_worker:info(),
+            ?assertMatch(#{storages := [StoragePid]}, redwall_cluster_controller:info(Leader)),
             Db = redwall:open(),
             ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, a, 1) end),
             ?assertEqual(1, redwall:transactional(Db, fun(Tx) -> redwall:get(Tx, a) end)),
@@ -650,10 +657,9 @@ application_test_() ->
             ok = application:unset_env(redwall, storage),
             exit(CState, kill)
         end,
-        %% Without a StorageServer of the application, `open/0' raises an
-        %% error.
+        %% Without a worker of the application, `open/0' raises an error.
         {ok, _} = application:ensure_all_started(redwall),
-        ?assertError(no_storage_server, redwall:open()),
+        ?assertError(no_worker, redwall:open()),
         ok = application:stop(redwall)
     end}.
 

@@ -107,7 +107,7 @@ controller() ->
         ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, a, 1) end),
         %% A candidate on the second node watches the leader.
         {ok, B} = peer:call(Peer, redwall_cluster_controller, start, [Options]),
-        ok = await(fun() -> peer:call(Peer, redwall_cluster_controller, info, [B]) =:= #{role => candidate, term => 1, workers => [], db_info => undefined} end, 100),
+        ok = await(fun() -> peer:call(Peer, redwall_cluster_controller, info, [B]) =:= #{role => candidate, term => 1, workers => [], storages => [], db_info => undefined} end, 100),
         %% The leader stops. The candidate of the second node wins the
         %% election of term 2. Both workers register with it, and it
         %% recruits the epoch 2.
@@ -131,7 +131,7 @@ controller() ->
         ok = await(fun() -> maps:get(role, redwall_cluster_controller:info(C)) =:= leader end, 300),
         ok = await(fun() -> maps:get(workers, redwall_cluster_controller:info(C)) =:= [node()] end, 300),
         ?assertMatch(#{term := 3, db_info := #{epoch := undefined}}, redwall_cluster_controller:info(C)),
-        ok = await(fun() -> redwall_worker:db_info() =:= #{term => 3, epoch => undefined, proxies => []} end, 100),
+        ok = await(fun() -> redwall_worker:db_info() =:= #{term => 3, epoch => undefined, proxies => [], storages => []} end, 100),
         exit(C, kill),
         ok = redwall_storage:stop(Storage)
     after

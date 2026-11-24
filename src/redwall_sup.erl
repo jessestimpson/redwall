@@ -24,8 +24,21 @@ init([]) ->
         #{id => redwall_worker, start => {redwall_worker, start_link, [Options]}}
      || {ok, Options} <- [application:get_env(redwall, worker)]
     ],
+    %% The StorageServer registers with the worker of the node, so that
+    %% the ClusterController has it in the list of the StorageServers of
+    %% the cluster.
+    WorkerName = [maps:get(name, Options, redwall_worker) || {ok, Options} <- [application:get_env(redwall, worker)]],
     Storage = [
-        #{id => redwall_storage, start => {redwall_storage, start_link, [Options]}}
+        #{
+            id => redwall_storage,
+            start =>
+                {redwall_storage, start_link, [
+                    case {WorkerName, Options} of
+                        {[Name], _} when not is_map_key(worker, Options) -> Options#{worker => Name};
+                        _ -> Options
+                    end
+                ]}
+        }
      || {ok, Options} <- [application:get_env(redwall, storage)]
     ],
     {ok, {#{strategy => one_for_one}, Coordinator ++ Worker ++ Storage}}.

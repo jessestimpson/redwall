@@ -72,9 +72,11 @@
 %% == Limitations ==
 %%
 %% <ul>
-%% <li>The function knows only the StorageServers of the option
-%%   `storages'. redwall has no list of the StorageServers of a
-%%   cluster.</li>
+%% <li>The StorageServers are the StorageServers of the coordinated
+%%   state: each StorageServer that has registered with the worker of its
+%%   node. A StorageServer of a node that does not start again stays in
+%%   the result as a StorageServer that does not run, until
+%%   `redwall_cstate:forget_storage/3' removes the node.</li>
 %% <li>The function assumes that every node with a registered worker has a
 %%   candidate for the ClusterController.</li>
 %% <li>The rules are for the stop of nodes. A partition is not a part of
@@ -152,7 +154,14 @@ status(Options = #{coordinators := Coordinators}) ->
             _ ->
                 {undefined, [], undefined}
         end,
-    Storages0 = [{node_of(Storage), storage(Storage)} || Storage <- maps:get(storages, Options, [])],
+    Reported =
+        case CState of
+            #{storages := Recorded} -> [Storage || {_Node, Storage} <- lists:sort(maps:to_list(Recorded))];
+            _ -> []
+        end,
+    %% Without the option `storages', the StorageServers are the
+    %% StorageServers of the coordinated state.
+    Storages0 = [{node_of(Storage), storage(Storage)} || Storage <- maps:get(storages, Options, Reported)],
     Highest = lists:max([0 | [Version || {_Node, #{version := Version}} <- Storages0]]),
     Storages = [
         {Node,

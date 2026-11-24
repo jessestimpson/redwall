@@ -16,7 +16,8 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> rollback(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> starts_late(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> many_versions(Ids) end} end,
-        fun(Ids) -> {timeout, 60, fun() -> copy(Ids) end} end
+        fun(Ids) -> {timeout, 60, fun() -> copy(Ids) end} end,
+        fun(Ids) -> {timeout, 60, fun() -> reset(Ids) end} end
     ]}.
 
 setup() ->
@@ -393,3 +394,57 @@ await_copy(Storage, N) ->
             timer:sleep(10),
             await_copy(Storage, N - 1)
     end.
+
+%% After the loss of the LogServers of an epoch, a recovery with the
+%% option `reset_after_log_loss' resets the database, and the
+%% StorageServer removes its data.
+reset(Ids) ->
+    Options = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0},
+    {Proxy1, Logs1} = epoch(Ids),
+    Storage = storage(Ids),
+    {ok, _} = redwall_epoch:commit(Proxy1, #{mutations => [{set, a, 1}, {set, b, 1}]}),
+    {ok, V1} = redwall_epoch:commit(Proxy1, #{mutations => [{set, a, 2}]}),
+    ok = await_version(Storage, V1),
+    ?assertEqual({ok, 2}, redwall_storage:read(Storage, a, V1)),
+    %% One LogServer of 3 stops. The recovery ends the epoch without a
+    %% reset.
+    exit(element(2, hd(Logs1)), kill),
+    exit(Proxy1, kill),
+    {ok, Proxy2} = redwall_epoch:start(Options#{reset_after_log_loss => true}),
+    {ok, #{reset := false, epoch := 2, log_system := #{logs := Logs2}}} = redwall_epoch:recovered(Proxy2),
+    ?assertMatch({ok, #{generation := 0, old := [_]}}, redwall_cstate:read(Ids)),
+    {ok, V2} = redwall_epoch:commit(Proxy2, #{mutations => [{set, a, 3}]}),
+    ok = await_version(Storage, V2),
+    ?assertEqual({ok, 3}, redwall_storage:read(Storage, a, V2)),
+    %% Every LogServer of the epoch 2 stops, as after the stop of every
+    %% node. Without the option, the recovery fails.
+    exit(Proxy2, kill),
+    [exit(Pid, kill) || {_Id, Pid} <- Logs2],
+    {ok, Proxy3} = redwall_epoch:start(Options),
+    ?assertExit({{shutdown, {recovery, {too_few_replies, 0, 2}}}, _}, redwall_epoch:recovered(Proxy3)),
+    ?assertMatch({ok, #{generation := 0, current := #{epoch := 2}}}, redwall_cstate:read(Ids)),
+    %% With the option, the recovery resets the database: the coordinated
+    %% state has the new log system only, and the next generation.
+    {ok, Proxy4} = redwall_epoch:start(Options#{reset_after_log_loss => true}),
+    {ok, #{reset := true, epoch := 4, recovery_version := 0}} = redwall_epoch:recovered(Proxy4),
+    ?assertMatch({ok, #{generation := 1, old := [], current := #{epoch := 4}}}, redwall_cstate:read(Ids)),
+    %% The StorageServer removes its data, and applies the records of the
+    %% new epoch. The versions start again.
+    {ok, V4} = redwall_epoch:commit(Proxy4, #{mutations => [{set, c, 4}]}),
+    ok = await_version(Storage, V4),
+    ?assertMatch(#{resets := 1, rollbacks := 0}, redwall_storage:info(Storage)),
+    ?assertEqual({ok, 4}, redwall_storage:read(Storage, c, V4)),
+    ?assertEqual(not_found, redwall_storage:read(Storage, a, V4)),
+    ?assertEqual({ok, [{c, 4}]}, redwall_storage:read_range(Storage, 0, <<"z">>, V4)),
+    %% A transaction of the time before the reset has a read version above
+    %% the commit versions of the new epoch. The Resolver rejects it.
+    ?assert(V2 > V4, {V2, V4}),
+    ?assertEqual({error, transaction_too_old}, redwall_epoch:commit(Proxy4, #{read_version => V2, reads => [a], mutations => [{set, a, old}]})),
+    {ok, V5} = redwall_epoch:commit(Proxy4, #{read_version => V4, reads => [a], mutations => [{set, a, new}]}),
+    ok = await_version(Storage, V5),
+    ?assertEqual({ok, new}, redwall_storage:read(Storage, a, V5)),
+    %% A new StorageServer reads the log of the new epoch only.
+    Second = storage(Ids),
+    ok = await_version(Second, V5),
+    ?assertEqual({ok, [{a, new}, {c, 4}]}, redwall_storage:read_range(Second, 0, <<"z">>, V5)),
+    [exit(Pid, kill) || Pid <- [Storage, Second, Proxy3, Proxy4]].

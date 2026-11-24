@@ -93,7 +93,7 @@ second_recovery(Ids) ->
     [?assertMatch(#{stopped_by := 2}, redwall_log:info(redwall_log:ref(L))) || L <- [L1, L2, L3]],
     ?assertEqual({error, stopped}, redwall_log:push(redwall_log:ref(L3), 1, 3, 4, 1, empty)),
     ?assertEqual(
-        {ok, #{count => 2, owner => maps:get(owner, element(2, redwall_cstate:read(Ids))), current => New, old => [Old#{end_version => 3}], controller => {0, undefined}}},
+        {ok, #{count => 2, owner => maps:get(owner, element(2, redwall_cstate:read(Ids))), current => New, old => [Old#{end_version => 3}], controller => {0, undefined}, storages => #{}, generation => 0}},
         redwall_cstate:read(Ids)
     ),
     %% The new epoch accepts the LSN after the Recovery Version.

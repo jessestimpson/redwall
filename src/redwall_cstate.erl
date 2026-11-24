@@ -70,6 +70,7 @@
 
 -export([machine/0]).
 -export([read/1, read/2, lock/3, lock/4, write/5, write/6, elect/3, elect/4]).
+-export([storage/4, forget_storage/3, reset/4]).
 -export([init/1, apply/3]).
 
 -export_type([state/0, log_system/0, old_log_system/0, epoch/0, version/0, owner/0]).
@@ -104,7 +105,16 @@
     old := [old_log_system()],
     %% The term and the process of the ClusterController. The term is the
     %% number of elections.
-    controller := {non_neg_integer(), pid() | undefined}
+    controller := {non_neg_integer(), pid() | undefined},
+    %% The StorageServer of each node of the cluster with one. The
+    %% ClusterController records a StorageServer that a worker reports.
+    %% A StorageServer that has stopped stays, until a StorageServer of
+    %% its node takes its place or `forget_storage/3' removes the node.
+    storages := #{node() => pid()},
+    %% The number of resets of the database. A reset removes every log
+    %% system, after the loss of the LogServers of an epoch. A
+    %% StorageServer removes its data when this number changes.
+    generation := non_neg_integer()
 }.
 
 %% The servers of a peace cluster, or `{local, Server}' for a
@@ -183,6 +193,25 @@ elect(Servers, Term, Pid) ->
 elect(Servers, Term, Pid, Timeout) ->
     propose(Servers, {elect, Term, Pid}, Timeout).
 
+%% @doc Removes every log system from the coordinated state, and raises
+%% the generation. The caller is the Sequencer with the lock of the epoch
+%% `Epoch'. See "Reset" in {@link redwall_recovery}.
+-spec reset(servers(), epoch(), owner(), timeout()) -> ok | {error, term()}.
+reset(Servers, Epoch, Owner, Timeout) ->
+    propose(Servers, {reset, Epoch, Owner}, Timeout).
+
+%% @doc Records `Pid' as the StorageServer of the node `Node'. A second
+%% call for the node replaces the first.
+-spec storage(servers(), node(), pid(), timeout()) -> ok | {error, term()}.
+storage(Servers, Node, Pid, Timeout) ->
+    propose(Servers, {storage, Node, Pid}, Timeout).
+
+%% @doc Removes the StorageServer of the node `Node' from the list of the
+%% StorageServers of the cluster, for a node that does not start again.
+-spec forget_storage(servers(), node(), timeout()) -> ok | {error, term()}.
+forget_storage(Servers, Node, Timeout) ->
+    propose(Servers, {forget_storage, Node}, Timeout).
+
 propose({local, Server}, Value, Timeout) ->
     redwall_cstate_local:propose(Server, Value, Timeout);
 propose(Servers, Value, Timeout) ->
@@ -199,7 +228,7 @@ propose(Servers, Value, Timeout) ->
 %% @private
 -spec init(term()) -> state().
 init(_Args) ->
-    #{count => 0, owner => undefined, current => undefined, old => [], controller => {0, undefined}}.
+    #{count => 0, owner => undefined, current => undefined, old => [], controller => {0, undefined}, storages => #{}, generation => 0}.
 
 %% @private
 -spec apply(peace_machine:meta(), term(), state()) -> {state(), term()}.
@@ -235,5 +264,15 @@ apply(_Meta, {elect, Term, Pid}, State = #{controller := {Actual, Pid}}) when Ac
     {State, {ok, Actual}};
 apply(_Meta, {elect, _Term, _Pid}, State = #{controller := {Actual, Current}}) ->
     {State, {error, {term, Actual, Current}}};
+apply(_Meta, {reset, Epoch, Owner}, State = #{count := Epoch, owner := Owner, generation := Generation}) ->
+    %% The Sequencer of the epoch `Epoch' has the lock. The database
+    %% starts again without a log system and without data.
+    {State#{current := undefined, old := [], generation := Generation + 1}, ok};
+apply(_Meta, {reset, _Epoch, _Owner}, State = #{count := Actual}) ->
+    {State, {error, {count, Actual}}};
+apply(_Meta, {storage, Node, Pid}, State = #{storages := Storages}) when is_atom(Node), is_pid(Pid) ->
+    {State#{storages := Storages#{Node => Pid}}, ok};
+apply(_Meta, {forget_storage, Node}, State = #{storages := Storages}) ->
+    {State#{storages := maps:remove(Node, Storages)}, ok};
 apply(_Meta, _Other, State) ->
     {State, {error, badarg}}.
