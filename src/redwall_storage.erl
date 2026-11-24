@@ -1073,6 +1073,9 @@ refresh(State0 = #state{coordinators = Coordinators, cstate_timeout_ms = Timeout
 generation(#{generation := Generation}, State = #state{generation = undefined}) ->
     State#state{generation = Generation};
 generation(#{generation := Generation}, State = #state{generation = Mine, copy = undefined}) when Generation =/= Mine ->
+    logger:warning("redwall: the StorageServer ~p removes its data at the version ~b, after the reset ~b of the database.", [
+        self(), State#state.version, Generation
+    ]),
     %% A direct read with a read version of the time before the reset
     %% finds a version of 0, and a read in progress finds another number
     %% of resets.

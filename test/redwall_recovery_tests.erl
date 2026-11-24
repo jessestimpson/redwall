@@ -111,15 +111,20 @@ one_log_down(Ids) ->
     #{epoch := 2, log_system := #{logs := [N1 | _]}, recovery_version := 2, previous_epoch_end_version := 1} = Result,
     ?assertEqual({ok, [{2, 0, {body, {1, 2}}}]}, redwall_log:peek(redwall_log:ref(N1), 0, infinity)).
 
-%% One answer is not enough. The failed recovery has raised the recovery
-%% count and has stopped the LogServer that answered.
+%% One answer is not enough. With the option
+%% `reset_after_log_loss => false', the recovery fails. The failed
+%% recovery has raised the recovery count and has stopped the LogServer
+%% that answered. Without the option, the recovery resets the database,
+%% because the LogServers keep their records in memory.
 two_logs_down(Ids) ->
-    {ok, #{log_system := Old = #{logs := [L1, L2, L3]}}} = redwall_recovery:recover(options(Ids)),
+    {ok, #{log_system := Old = #{logs := [L1, L2, L3], durability := memory}}} = redwall_recovery:recover(options(Ids)),
     ok = redwall_log:stop(redwall_log:ref(L1)),
     ok = redwall_log:stop(redwall_log:ref(L2)),
-    ?assertEqual({error, {too_few_replies, 1, 2}}, redwall_recovery:recover(options(Ids))),
+    ?assertEqual({error, {too_few_replies, 1, 2}}, redwall_recovery:recover((options(Ids))#{reset_after_log_loss => false})),
     ?assertMatch(#{stopped_by := 2}, redwall_log:info(redwall_log:ref(L3))),
-    ?assertMatch({ok, #{count := 2, current := Old, old := []}}, redwall_cstate:read(Ids)).
+    ?assertMatch({ok, #{count := 2, generation := 0, current := Old, old := []}}, redwall_cstate:read(Ids)),
+    ?assertMatch({ok, #{reset := true, epoch := 3, recovery_version := 0}}, redwall_recovery:recover(options(Ids))),
+    ?assertMatch({ok, #{generation := 1, current := #{epoch := 3}, old := []}}, redwall_cstate:read(Ids)).
 
 %% Sequencer A locks the coordinated state and the old LogServers. Before
 %% A writes the coordinated state, Sequencer B performs a whole recovery.

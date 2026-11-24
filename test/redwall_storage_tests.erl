@@ -395,9 +395,9 @@ await_copy(Storage, N) ->
             await_copy(Storage, N - 1)
     end.
 
-%% After the loss of the LogServers of an epoch, a recovery with the
-%% option `reset_after_log_loss' resets the database, and the
-%% StorageServer removes its data.
+%% After the loss of the LogServers of an epoch, a recovery resets the
+%% database, and the StorageServer removes its data. The LogServers keep
+%% their records in memory, so the reset is the default.
 reset(Ids) ->
     Options = #{coordinators => Ids, logs => 3, replication => 2, lock_timeout_ms => 200, versions_per_second => 0},
     {Proxy1, Logs1} = epoch(Ids),
@@ -410,22 +410,24 @@ reset(Ids) ->
     %% reset.
     exit(element(2, hd(Logs1)), kill),
     exit(Proxy1, kill),
-    {ok, Proxy2} = redwall_epoch:start(Options#{reset_after_log_loss => true}),
-    {ok, #{reset := false, epoch := 2, log_system := #{logs := Logs2}}} = redwall_epoch:recovered(Proxy2),
+    {ok, Proxy2} = redwall_epoch:start(Options),
+    {ok, #{reset := false, epoch := 2, log_system := #{logs := Logs2, durability := memory}}} = redwall_epoch:recovered(Proxy2),
     ?assertMatch({ok, #{generation := 0, old := [_]}}, redwall_cstate:read(Ids)),
     {ok, V2} = redwall_epoch:commit(Proxy2, #{mutations => [{set, a, 3}]}),
     ok = await_version(Storage, V2),
     ?assertEqual({ok, 3}, redwall_storage:read(Storage, a, V2)),
     %% Every LogServer of the epoch 2 stops, as after the stop of every
-    %% node. Without the option, the recovery fails.
+    %% node. With the option `reset_after_log_loss => false', the recovery
+    %% fails.
     exit(Proxy2, kill),
     [exit(Pid, kill) || {_Id, Pid} <- Logs2],
-    {ok, Proxy3} = redwall_epoch:start(Options),
+    {ok, Proxy3} = redwall_epoch:start(Options#{reset_after_log_loss => false}),
     ?assertExit({{shutdown, {recovery, {too_few_replies, 0, 2}}}, _}, redwall_epoch:recovered(Proxy3)),
     ?assertMatch({ok, #{generation := 0, current := #{epoch := 2}}}, redwall_cstate:read(Ids)),
-    %% With the option, the recovery resets the database: the coordinated
-    %% state has the new log system only, and the next generation.
-    {ok, Proxy4} = redwall_epoch:start(Options#{reset_after_log_loss => true}),
+    %% Without the option, the recovery resets the database: the
+    %% coordinated state has the new log system only, and the next
+    %% generation.
+    {ok, Proxy4} = redwall_epoch:start(Options),
     {ok, #{reset := true, epoch := 4, recovery_version := 0}} = redwall_epoch:recovered(Proxy4),
     ?assertMatch({ok, #{generation := 1, old := [], current := #{epoch := 4}}}, redwall_cstate:read(Ids)),
     %% The StorageServer removes its data, and applies the records of the

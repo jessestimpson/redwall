@@ -496,9 +496,18 @@ no recovery can end the epoch. This is the state of a cluster after the
 stop of every node, and after the stop of a second node before the
 cluster has recovered from the stop of the first.
 
-With the option `reset_after_log_loss => true` of the process of an
-epoch, the recovery then resets the database
-([redwall_recovery](src/redwall_recovery.erl), "Reset"):
+The recovery then resets the database
+([redwall_recovery](src/redwall_recovery.erl), "Reset"). The reset
+depends on the kind of LogServer of the previous epoch. The log system of
+the coordinated state has the kind in the key `durability`, from
+`redwall_log:durability/0`.
+
+| `durability` | Records of a LogServer after its process stops | Recovery after the loss of `replication` LogServers |
+|---|---|---|
+| `memory` | Lost | Resets the database |
+| `disk` (no such LogServer exists yet) | Kept | Waits for the LogServers |
+
+The steps of a reset are:
 
 1. The recovery asks the node of each LogServer of the previous epoch
    whether the process runs. A LogServer counts as lost only if its node
@@ -511,8 +520,20 @@ epoch, the recovery then resets the database
    versions start again.
 4. A StorageServer that reads the higher generation removes its data.
 
-- The data of the database is lost by a reset. The option is for a
-  database whose data is in memory, such as the tables of etx.
+A reset is reported in three places:
+
+- The recovery writes a warning to the log with `logger`, and a
+  StorageServer writes a warning when it removes its data.
+- The ClusterController sends the event `{reset, Epoch}` to its `notify`
+  function, after the event `recovered`.
+- `redwall_status:status/1` has the number of resets of the database in
+  the key `generation`.
+
+The option `reset_after_log_loss => false` of the process of an epoch
+turns the reset off. The recovery then fails with `too_few_replies`, and
+the cluster has no epoch.
+
+- The data of the database is lost by a reset.
 - The default is `false`: the recovery fails, and the cluster has no
   epoch. FoundationDB has no reset, because its LogServers write to disk.
 - The Resolver rejects a transaction with a read version at or above its
@@ -535,6 +556,7 @@ redwall_status:status(#{
 
 | Key of the result | Meaning |
 |---|---|
+| `generation` | The number of resets of the database after the loss of LogServers |
 | `healthy` | The cluster has an epoch that the ClusterController has given to the workers, and every coordinator, every LogServer of the epoch and every StorageServer runs and is current |
 | `fault_tolerance` | `max_node_failures_without_losing_data` and `max_node_failures_without_losing_availability`: the numbers of nodes that can stop at the same time. `safe_to_stop`: the nodes whose stop alone leaves the cluster available |
 | `nodes` | The coordinator, the worker, the LogServers of the epoch and the StorageServer of each node |

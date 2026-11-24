@@ -94,7 +94,7 @@
 -eta_observe({state, [epoch, dv, kcv, records, stopped_by]}).
 
 -export([start/1, start_link/1, stop/1, ref/1]).
--export([lost/2, alive/1]).
+-export([lost/2, alive/1, durability/0]).
 -export([replicas/3]).
 -export([push/6, push/7, send_push/6, lock/2, lock/3, confirm/2, peek/3, peek/4, tail/2, tail/3, info/1]).
 -export([init/1, handle_call/3, handle_cast/2]).
@@ -181,6 +181,17 @@ start(Options) ->
 %% as a call to a process that has stopped. For a process on another
 %% node the result is the process, and a call to a process that has
 %% stopped fails.
+%% @doc Returns where a LogServer of this module keeps its records:
+%% `memory'. The records of a LogServer are lost when its process stops.
+%% The recovery records the value in the log system of the coordinated
+%% state, and resets the database after the loss of such LogServers (see
+%% "Reset" in {@link redwall_recovery}). A LogServer that keeps its
+%% records on a disk would have the value `disk': its records are not lost
+%% when its process stops, and the recovery waits for it.
+-spec durability() -> memory | disk.
+durability() ->
+    memory.
+
 %% @doc Whether the LogServer does not run, and whether this is known.
 %% The result is `true' if the node of the LogServer answers that the
 %% process does not run. A LogServer keeps its records in memory, so its

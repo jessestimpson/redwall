@@ -168,11 +168,14 @@
     | {candidate, Term :: non_neg_integer()}
     | {recruiting, Attempt :: pos_integer(), #{atom() => term()}}
     | {recovered, map()}
+    | {reset, Epoch :: pos_integer()}
     | {recovery_failed, term()}
     | {role_failed, redwall_worker:role(), pid()}
     | {superseded, Epoch :: pos_integer(), Count :: pos_integer()}.
 %% `{recovered, Result}' has the result of the recovery
-%% (`redwall_recovery:result()') with the key `proxy'.
+%% (`redwall_recovery:result()') with the key `proxy'. `{reset, Epoch}'
+%% follows it when the recovery of the epoch has reset the database
+%% (`redwall_recovery', "Reset").
 
 %% The first time until the next poll of a candidate after the coordinated
 %% state did not answer. The time doubles with each such poll, up to
@@ -337,6 +340,9 @@ handle_info({recovered, Attempt, Result, Proxy}, State = #state{role = leader, g
     Generation1 = Generation#generation{recruiter = undefined, proxy = Proxy, recovered = true},
     Info = #{term => Term, epoch => maps:get(epoch, Result), proxies => [Proxy], storages => storages(State)},
     ok = notify({recovered, Result#{proxy => Proxy}}, State),
+    %% The recovery has reset the database. See "Reset" in
+    %% `redwall_recovery'.
+    _ = maps:get(reset, Result, false) andalso notify({reset, maps:get(epoch, Result)}, State),
     {noreply, broadcast(State#state{generation = Generation1, db_info = Info})};
 handle_info({recruit_failed, Attempt, Reason}, State = #state{role = leader, generation = #generation{attempt = Attempt}}) ->
     ok = notify({recovery_failed, Reason}, State),

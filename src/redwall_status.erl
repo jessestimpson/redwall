@@ -104,6 +104,10 @@
 -type status() :: #{
     healthy := boolean(),
     epoch := redwall_cstate:epoch() | undefined,
+    %% The number of resets of the database after the loss of LogServers,
+    %% or `undefined' if the coordinated state does not answer. See
+    %% "Reset" in `redwall_recovery'.
+    generation := non_neg_integer() | undefined,
     controller := node() | undefined,
     coordinators := #{total := non_neg_integer(), up := non_neg_integer(), majority := pos_integer()},
     logs := #{total := non_neg_integer(), up := non_neg_integer(), replication := non_neg_integer()},
@@ -189,6 +193,12 @@ status(Options = #{coordinators := Coordinators}) ->
     #{
         healthy => Problems =:= [],
         epoch => Epoch,
+        %% The number of resets of the database.
+        generation =>
+            case CState of
+                #{generation := Generation} -> Generation;
+                _ -> undefined
+            end,
         controller => Controller,
         coordinators => #{total => length(Coordinators), up => length([up || {_, true} <- CoordinatorsUp]), majority => Majority},
         logs => #{total => length(Logs), up => length([up || {_, true} <- Logs]), replication => Replication},

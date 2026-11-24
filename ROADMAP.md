@@ -244,10 +244,18 @@ has the basic functions. The remaining parts, in the planned order:
 - [ ] Decide the time after which a commit, a read or the determination
       of a commit result gives up. Today a client waits without a limit
       while the cluster has no epoch.
-- [x] Start a cluster again after the stop of every node: with the
-      option `reset_after_log_loss`, a recovery that finds `replication`
-      LogServers of the previous epoch lost resets the database. The
-      cluster starts without data.
+- [x] Start a cluster again after the stop of every node: a recovery
+      that finds `replication` LogServers of the previous epoch lost
+      resets the database. The cluster starts without data. The reset is
+      the default for LogServers in memory, which the log system records
+      in the key `durability`. The log, the event `reset` of the
+      ClusterController and the key `generation` of the status report a
+      reset.
+- [ ] Recover from a StorageServer after the loss of LogServers. A
+      StorageServer that runs has the data up to its version. A recovery
+      could start the new epoch from the data of the StorageServer with
+      the highest version instead of a reset. The transactions above that
+      version are lost, so the recovery must report them.
 - [ ] Keep the data over the stop of every node. This needs LogServers
       or StorageServers on disk.
 - [ ] Model the election and the recruitment in TLA+, or state why the

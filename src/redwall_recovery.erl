@@ -49,8 +49,14 @@
 %% LogServers than it needs answer the lock. After the stop of every node
 %% of a cluster, no LogServer of the previous epoch runs.
 %%
-%% With the option `reset_after_log_loss => true', the recovery then
-%% resets the database:
+%% The recovery then resets the database, if the LogServers of the
+%% previous epoch keep their records in memory. The log system of the
+%% coordinated state has this in the key `durability', from
+%% `redwall_log:durability/0'. redwall has LogServers in memory only, so a
+%% reset is the default. A LogServer with a disk would have its records
+%% when it starts again, and the recovery would wait for it. The option
+%% `reset_after_log_loss' replaces the default: with `false' the recovery
+%% does not reset.
 %%
 %% <ol>
 %% <li>The recovery asks the node of each LogServer of the previous epoch
@@ -69,11 +75,13 @@
 %%
 %% The data of the database is lost by a reset, also the data of the
 %% records that a LogServer still has, and the data of a StorageServer
-%% that runs. Without the option, which is the default, the recovery
-%% fails with `too_few_replies', and the cluster has no epoch until the
-%% LogServers answer. FoundationDB has no reset. Its LogServers write to
-%% disk, and a cluster that has lost them needs an operator. This part is
-%% not in the paper.
+%% that runs. A reset is reported in three places: the recovery writes a
+%% warning to the log, the ClusterController sends the event `{reset,
+%% Epoch}' to its `notify' function, and `redwall_status:status/1' has the
+%% number of resets in the key `generation'. Without a reset, the recovery
+%% fails with `too_few_replies', and the cluster has no epoch.
+%% FoundationDB has no reset. Its LogServers write to disk, and a cluster
+%% that has lost them needs an operator. This part is not in the paper.
 %%
 %% The Resolver rejects a transaction with a read version at or above its
 %% commit version, so a transaction of the time before a reset does not
@@ -173,7 +181,7 @@ recover(Options = #{coordinators := Coordinators, logs := M, replication := K}) 
         {ok, Ended} ?= end_previous_epoch(Epoch, CState, Options#{owner => Owner}),
         #{pev := PEV, rv := RV, records := Records, end_version := EndVersion} = Ended,
         {ok, Logs} ?= recruit(M, #{epoch => Epoch, start => RV, kcv => PEV, records => Records}, Options),
-        LogSystem = #{epoch => Epoch, logs => Logs, replication => K},
+        LogSystem = #{epoch => Epoch, logs => Logs, replication => K, durability => redwall_log:durability()},
         case redwall_cstate:write(Coordinators, Epoch, Owner, LogSystem, EndVersion, Timeout) of
             ok ->
                 {ok, #{
@@ -201,7 +209,7 @@ recover(Options = #{coordinators := Coordinators, logs := M, replication := K}) 
 %% Steps 2 to 4.
 end_previous_epoch(_Epoch, #{current := undefined}, _Options) ->
     {ok, #{pev => 0, rv => 0, records => [], end_version => undefined}};
-end_previous_epoch(Epoch, #{current := #{logs := OldLogs, replication := OldK}}, Options) ->
+end_previous_epoch(Epoch, #{current := Previous = #{logs := OldLogs, replication := OldK}}, Options) ->
     Needed = length(OldLogs) - OldK + 1,
     maybe
         LockTimeoutMs = maps:get(lock_timeout_ms, Options, ?LOCK_TIMEOUT_MS),
@@ -213,24 +221,35 @@ end_previous_epoch(Epoch, #{current := #{logs := OldLogs, replication := OldK}},
         {ok, #{pev => PEV, rv => RV, records => Records, end_version => RV}}
     else
         {error, {too_few_replies, _Count, Needed}} = Error ->
-            reset(Epoch, OldLogs, OldK, Error, Options);
+            reset(Epoch, Previous, Error, Options);
         Other ->
             Other
     end.
 
 %% Resets the database after the loss of the LogServers of the previous
-%% epoch, if the option `reset_after_log_loss' is `true'. See "Reset" in
-%% the module documentation. `Error' is the result without a reset.
-reset(Epoch, OldLogs, OldK, Error, Options = #{coordinators := Coordinators}) ->
+%% epoch `Previous', if those LogServers keep their records in memory.
+%% See "Reset" in the module documentation. `Error' is the result without
+%% a reset.
+reset(Epoch, Previous = #{epoch := Lost, logs := OldLogs, replication := OldK}, Error, Options = #{coordinators := Coordinators}) ->
     Timeout = maps:get(cstate_timeout_ms, Options, ?CSTATE_TIMEOUT_MS),
-    Lost = length([Log || Log <- OldLogs, redwall_log:lost(Log, Timeout)]),
-    case maps:get(reset_after_log_loss, Options, false) andalso Lost >= OldK of
-        true ->
+    %% The records of a LogServer in memory are lost when its process
+    %% stops. A LogServer with a disk would have its records when it
+    %% starts again, so the recovery would wait for it.
+    InMemory = maps:get(durability, Previous, memory) =:= memory,
+    case maps:get(reset_after_log_loss, Options, InMemory) andalso length([Log || Log <- OldLogs, redwall_log:lost(Log, Timeout)]) of
+        Count when is_integer(Count), Count >= OldK ->
             case redwall_cstate:reset(Coordinators, Epoch, maps:get(owner, Options), Timeout) of
-                ok -> {ok, #{pev => 0, rv => 0, records => [], end_version => undefined, reset => true}};
-                {error, Reason} -> {error, {reset, Reason}}
+                ok ->
+                    logger:warning(
+                        "redwall: the database is reset. ~b of ~b LogServers of the epoch ~b do not run, and each record is on ~b of them. "
+                        "The LogServers keep their records in memory, so records of the epoch are lost. The epoch ~b starts without data.",
+                        [Count, length(OldLogs), Lost, OldK, Epoch]
+                    ),
+                    {ok, #{pev => 0, rv => 0, records => [], end_version => undefined, reset => true}};
+                {error, Reason} ->
+                    {error, {reset, Reason}}
             end;
-        false ->
+        _NotAllowedOrTooFew ->
             Error
     end.
 

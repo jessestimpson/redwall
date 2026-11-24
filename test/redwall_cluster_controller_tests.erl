@@ -151,6 +151,30 @@ on_peace() ->
 %% The leader waits for `min_workers' workers. It places the LogServers on
 %% the workers of the class `log', and the other roles on the workers of
 %% the class `stateless' and then `unset'.
+%% Every LogServer of an epoch stops. The LogServers keep their records
+%% in memory, so the recovery resets the database, and the leader sends
+%% the event `reset' after the event `recovered' of that epoch.
+reset_event_test_() ->
+    {timeout, 60, fun reset_event/0}.
+
+reset_event() ->
+    with_controller(#{}, fun(_Controller, CState) ->
+        Coordinators = {local, CState},
+        {ok, Worker} = redwall_worker:start(#{coordinators => Coordinators, poll_ms => 20}),
+        try
+            #{epoch := 1} = await_epoch(1),
+            ?assertMatch({recovered, #{epoch := 1, reset := false}}, next(recovered)),
+            ?assertEqual(none, peek(reset)),
+            ?assertMatch({ok, #{generation := 0}}, redwall_cstate:read(Coordinators)),
+            [exit(Pid, kill) || Pid <- log_pids(Coordinators)],
+            {reset, Epoch} = next(reset),
+            ?assert(Epoch > 1),
+            ?assertMatch({ok, #{generation := 1, old := [], current := #{epoch := Epoch, durability := memory}}}, redwall_cstate:read(Coordinators))
+        after
+            redwall_worker:stop(Worker)
+        end
+    end).
+
 placement_test_() ->
     {timeout, 60, fun() ->
         with_controller(#{min_workers => 5}, fun(Controller, CState) ->

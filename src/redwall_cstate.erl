@@ -88,7 +88,11 @@
 -type log_system() :: #{
     epoch := epoch(),
     logs := [term()],
-    replication := pos_integer()
+    replication := pos_integer(),
+    %% Where the LogServers of the epoch keep their records
+    %% (`redwall_log:durability/0'). A log system without the key has
+    %% LogServers that keep their records in memory.
+    durability => memory | disk
 }.
 
 -type old_log_system() :: #{
