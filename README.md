@@ -399,6 +399,44 @@ increments return 1 to 200 and give 200. In the benchmark of etx with
 three nodes on one computer, the p50 of `update_counter/3` is 135 us to
 139 us with ids, against 130 us to 135 us without.
 
+### Status
+
+`redwall_status:status/1` returns the health of a cluster and its fault
+tolerance in Erlang nodes ([redwall_status](src/redwall_status.erl)).
+FoundationDB reports the same two numbers for zones in the
+`fault_tolerance` section of its status.
+
+```erlang
+redwall_status:status(#{
+    coordinators => [{c1, 'a@host'}, {c2, 'b@host'}, {c3, 'c@host'}],
+    storages => [{storage, 'a@host'}, {storage, 'b@host'}, {storage, 'c@host'}],
+    min_workers => 2
+}).
+```
+
+| Key of the result | Meaning |
+|---|---|
+| `healthy` | The cluster has an epoch that the ClusterController has given to the workers, and every coordinator, every LogServer of the epoch and every StorageServer runs and is current |
+| `fault_tolerance` | `max_node_failures_without_losing_data` and `max_node_failures_without_losing_availability`: the numbers of nodes that can stop at the same time. `safe_to_stop`: the nodes whose stop alone leaves the cluster available |
+| `nodes` | The coordinator, the worker, the LogServers of the epoch and the StorageServer of each node |
+| `coordinators`, `logs`, `workers`, `storages` | The numbers of processes that run |
+| `problems` | The reasons for which the cluster is not healthy |
+
+- The cluster keeps its data after the stop of a set of nodes if fewer
+  than `replication` LogServers of the current epoch are stopped, and a
+  current StorageServer is on another node.
+- The cluster stays available if it also keeps a majority of the
+  coordinators and `min_workers` registered workers.
+- An operator who restarts the nodes one after another stops a node only
+  if it is in `safe_to_stop`, and waits for `healthy` before the next
+  node.
+- Limitations: the function knows only the StorageServers of the option
+  `storages`, asks the processes one after another, and does not examine
+  partitions.
+
+The simulation of etx uses the function for the kills of its runs with
+restarts of different nodes. See the README of etx.
+
 ### Select
 
 `redwall:select/4` evaluates an ETS match spec on the keys of a range,
@@ -1582,6 +1620,7 @@ make tlc-long   # the 2 TLC configs with three epochs, about 4 hours
 | [src/redwall_epoch.erl](src/redwall_epoch.erl) | The process of an epoch: the Sequencer, the Resolver and the Proxy |
 | [src/redwall_storage.erl](src/redwall_storage.erl) | The StorageServer |
 | [src/redwall.erl](src/redwall.erl) | The client, with the function names of erlfdb |
+| [src/redwall_status.erl](src/redwall_status.erl) | The health of a cluster and its fault tolerance in Erlang nodes |
 | [src/redwall_idempotency.erl](src/redwall_idempotency.erl) | The keys of the idempotency ids |
 | [src/redwall_mapper.erl](src/redwall_mapper.erl) | The mapper of a mapped range read |
 | [src/redwall_tuple.erl](src/redwall_tuple.erl), [src/redwall_float.erl](src/redwall_float.erl) | The tuple layer: copies of `erlfdb_tuple` and `erlfdb_float` of erlfdb 1.2.3 |
