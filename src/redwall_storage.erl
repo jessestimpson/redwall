@@ -521,6 +521,10 @@
     watch_timeout_ms => pos_integer() | infinity,
     max_watches => non_neg_integer(),
     watch_trigger => boolean(),
+    %% `false' plants a defect for the simulation: the end version of an
+    %% ended epoch is not a Known Committed Version. See "Known Committed
+    %% Version" in the module documentation.
+    committed_at_epoch_end => boolean(),
     %% A registered name for the StorageServer, so that a StorageServer of
     %% another node can name it as a peer: `{Name, Node}'.
     name => atom(),
@@ -641,6 +645,7 @@
     watch_timeout_ms :: pos_integer() | infinity,
     max_watches :: non_neg_integer(),
     watch_trigger :: boolean(),
+    committed_at_epoch_end :: boolean(),
     %% The number of answers `{ok, Version}' and of answers `timed_out' to
     %% a watch.
     watches_fired = 0 :: non_neg_integer(),
@@ -970,6 +975,7 @@ init(Options = #{coordinators := Coordinators}) ->
         watch_timeout_ms = maps:get(watch_timeout_ms, Options, ?WATCH_TIMEOUT_MS),
         max_watches = maps:get(max_watches, Options, ?MAX_WATCHES),
         watch_trigger = maps:get(watch_trigger, Options, true),
+        committed_at_epoch_end = maps:get(committed_at_epoch_end, Options, true),
         buffer = gb_trees:empty(),
         published = atomics:new(3, [{signed, true}]),
         requests = gen_server:reqids_new(),
@@ -1405,7 +1411,14 @@ follow(State = #state{system = #{epoch := Epoch}, systems = Systems, version = V
             %% of an ended epoch, so the version of the StorageServer is
             %% committed. See "Known Committed Version" in the module
             %% documentation.
-            follow(start(Next, State#state{kcv = max(State#state.kcv, End)}));
+            KCV =
+                case State#state.committed_at_epoch_end of
+                    true -> max(State#state.kcv, End);
+                    %% The planted defect `committed_at_epoch_end =>
+                    %% false'.
+                    false -> State#state.kcv
+                end,
+            follow(start(Next, State#state{kcv = KCV}));
         [System = #{end_version := End}] ->
             Buffer = gb_trees:from_orddict([R || R = {LSN, _} <- gb_trees:to_list(State#state.buffer), LSN =< End]),
             State#state{system = System, buffer = Buffer};
