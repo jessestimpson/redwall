@@ -2,9 +2,18 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% A directory for the data of the coordinators of one test.
+%% An empty directory for the data of the coordinators of one test.
+%%
+%% `erlang:unique_integer/1' starts from the same values in every Erlang
+%% node, so a later run of the tests gets the name of a directory of an
+%% earlier run. The directory then holds the coordinated state of the
+%% earlier run. The coordinators start with a recovery count above 0, and
+%% the first `redwall_cstate:lock/4' of the test fails with
+%% `{error, {count, Count}}' on every attempt. The function therefore
+%% deletes a directory of an earlier run.
 dir() ->
     Dir = filename:join([filename:basedir(user_cache, "redwall_test"), "coordinator", integer_to_list(erlang:unique_integer([positive]))]),
+    _ = file:del_dir_r(Dir),
     ok = filelib:ensure_dir(filename:join(Dir, "file")),
     Dir.
 
