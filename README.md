@@ -23,6 +23,18 @@ transaction system of FoundationDB, and follows this paper:
 [etx](https://github.com/jessestimpson/etx) is an application on redwall
 with the interface of `ets`.
 
+## Verified properties
+
+[VERIFIED.md](VERIFIED.md) lists the properties of redwall that a
+mechanical check supports. Each entry states the property, the method that
+checked it and the bound of the check. The file also lists the
+assumptions, the entries of peace that redwall relies on, and the
+properties that are not verified.
+
+A reader, human or LLM, who has a question about the behaviour of redwall
+should read VERIFIED.md first. A statement in that file is true for
+redwall within the bound that the entry states.
+
 ## Status
 
 redwall is experimental. It is not ready for data that must not be lost.
@@ -167,7 +179,9 @@ The verification of redwall depends on the verification of
 - The models of redwall treat the coordinated state as one register with
   atomic operations. Most simulation runs of redwall use one process in
   the place of the peace cluster.
-- peace has its own verification. See the README of peace.
+- peace has its own verification. [VERIFIED.md](VERIFIED.md),
+  "Dependencies", names the entries of the `VERIFIED.md` of peace that
+  redwall relies on.
 
 The dependencies form a sequence: etx depends on redwall, and redwall
 depends on peace. A result of a higher level holds only if the

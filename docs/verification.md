@@ -21,7 +21,9 @@ The verification of redwall depends on the verification of
 - The models of redwall treat the coordinated state as one register with
   atomic operations. Most simulation runs of redwall use one process in
   the place of the peace cluster.
-- peace has its own verification. See the README of peace.
+- peace has its own verification. [VERIFIED.md](../VERIFIED.md),
+  "Dependencies", names the entries of the `VERIFIED.md` of peace that
+  redwall relies on.
 
 The dependencies form a sequence: etx depends on redwall, and redwall
 depends on peace. A result of a higher level holds only if the
