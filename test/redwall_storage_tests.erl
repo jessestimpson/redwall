@@ -19,6 +19,7 @@ storage_test_() ->
         fun(Ids) -> {timeout, 60, fun() -> copy(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> pop(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> reset(Ids) end} end,
+        fun(Ids) -> {timeout, 30, fun() -> committed_at_epoch_end(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> watches(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> watch_limits(Ids) end} end
     ]}.
@@ -301,6 +302,30 @@ rollback(Ids) ->
     {ok, 1003} = redwall_epoch:commit(P2, #{writes => [{y, 2}]}),
     ?assertEqual({ok, 1}, redwall_storage:read(Storage, x, 1003)),
     ?assertMatch(#{version := 1003, epoch := 2, rollbacks := 1}, redwall_storage:info(Storage)).
+
+%% The end version of an ended epoch is a Known Committed Version of the
+%% StorageServer. The LogServers send the Known Committed Version of a
+%% record with the next record, so after the last record of an epoch the
+%% stored version is below the version. After the start of the next
+%% epoch, without a commit, the stored version is the end version of the
+%% ended epoch, and a new StorageServer copies the data at that version.
+committed_at_epoch_end(Ids) ->
+    {P1, _} = epoch(Ids),
+    Storage = storage(Ids),
+    {ok, 2} = redwall_epoch:commit(P1, #{writes => [{x, 1}]}),
+    {ok, 3} = redwall_epoch:commit(P1, #{writes => [{x, 2}]}),
+    ok = await_version(Storage, 3),
+    {ok, #{stored := Before}} = redwall_storage:stored(Storage, 1000),
+    ?assert(Before < 3, Before),
+    {P2, _} = epoch(Ids),
+    {ok, 1003} = redwall_epoch:read_version(P2),
+    ok = await_version(Storage, 1003),
+    {ok, #{stored := After}} = redwall_storage:stored(Storage, 1000),
+    ?assertEqual(3, After),
+    {ok, Second} = redwall_storage:start(#{coordinators => Ids, poll_ms => 5, peers => [Storage]}),
+    ok = await_version(Second, 1003),
+    ?assertMatch(#{copies := 1}, redwall_storage:info(Second)),
+    ?assertEqual({ok, 2}, redwall_storage:read(Second, x, 1003)).
 
 %% Starts a process that sends a watch to the StorageServer, and sends
 %% the answer to the caller.

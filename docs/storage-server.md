@@ -79,6 +79,26 @@ version of the epoch. This is the rollback of the paper. A read at a read
 version from a Proxy is not affected, because a read version is the LSN of
 a record that no recovery discards.
 
+## Known Committed Version
+
+The StorageServer keeps a Known Committed Version: a version at or below
+which no recovery discards a record. The oldest version of the MVCC
+window, the version of a copy for another StorageServer, and the stored
+version for the pop are at or below it. It rises in two ways:
+
+- A LogServer sends its Known Committed Version with its records. A
+  Proxy sends the Known Committed Version with the next record, so on a
+  cluster without commits this version stays below the last record.
+- When the StorageServer has the end version of an ended epoch as its
+  version, that version is its Known Committed Version. Every record at
+  or below the end version of an ended epoch is committed.
+
+The second rule is from 2026-11-24. Before it, a StorageServer on a
+cluster without commits offered a copy at a version of an earlier epoch.
+A new StorageServer then could not read the records after that version,
+because the LogServers of that epoch did not run, and it stayed behind
+until the next commits.
+
 ## Several StorageServers
 
 Several StorageServers can run at the same time, on one Erlang node or on

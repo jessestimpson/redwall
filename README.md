@@ -147,7 +147,7 @@ Each module also has its design in its module documentation.
 
 | Level | What it checks | Command | Time |
 |---|---|---|---|
-| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 128 tests | `make test` | 30 seconds |
+| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 129 tests | `make test` | 30 seconds |
 | Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 52 tests with about 1,900 seeds and 24 planted defects | `make dst` | about 4 minutes |
 | Model checking | Three TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer; the Resolver; and the watch. 13 planted bugs | `make tlc` | about 6 minutes |
 | Model checking | The recovery with 3 epochs | `make tlc-long` | about 4 hours |

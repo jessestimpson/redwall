@@ -430,6 +430,27 @@
 %%   `{error, transaction_too_old}'.</li>
 %% </ul>
 %%
+%% == Known Committed Version ==
+%%
+%% The StorageServer keeps a Known Committed Version: a version at or below
+%% which no recovery discards a record. The oldest version, the version of
+%% a copy for another StorageServer and the stored version for the pop are
+%% at or below it. The StorageServer raises it in two ways:
+%%
+%% <ul>
+%% <li>A LogServer sends its Known Committed Version with its records. A
+%%   Proxy sends the Known Committed Version with the next record, so on a
+%%   cluster without commits this version stays below the last
+%%   record.</li>
+%% <li>When the StorageServer has the end version of an ended epoch as its
+%%   version, that version is its Known Committed Version. Every record at
+%%   or below the end version of an ended epoch is committed. Without this
+%%   rule, a StorageServer on a cluster without commits offers a copy at a
+%%   version of an earlier epoch, and a new StorageServer cannot read the
+%%   records after that version when the LogServers of that epoch do not
+%%   run.</li>
+%% </ul>
+%%
 %% The first version of an epoch is more than the window above the last
 %% version of the previous epoch (see {@link redwall_sequencer}). A read
 %% at a read version of the previous epoch is therefore too old when the
@@ -1380,7 +1401,11 @@ follow(State = #state{system = #{epoch := Epoch}, systems = Systems, version = V
             %% The next epoch. The coordinated state has it, because the
             %% epoch `Epoch' has an end version.
             [Next | _] = [System || System = #{epoch := E} <- Systems, E > Epoch],
-            follow(start(Next, State));
+            %% No recovery discards a record at or below the end version
+            %% of an ended epoch, so the version of the StorageServer is
+            %% committed. See "Known Committed Version" in the module
+            %% documentation.
+            follow(start(Next, State#state{kcv = max(State#state.kcv, End)}));
         [System = #{end_version := End}] ->
             Buffer = gb_trees:from_orddict([R || R = {LSN, _} <- gb_trees:to_list(State#state.buffer), LSN =< End]),
             State#state{system = System, buffer = Buffer};

@@ -171,7 +171,8 @@
 %%   the read version gives the result. An ETS table cannot be read from
 %%   another node.</li>
 %% <li>If no StorageServer gave a result, the read sends a message to each
-%%   StorageServer in the order, on any node. The StorageServer process
+%%   StorageServer in the order, with the StorageServers on the node of
+%%   the caller first. The StorageServer process
 %%   waits for the read version. The read has 5 seconds in total, in equal
 %%   parts for the StorageServers. When a StorageServer is not alive, or
 %%   does not answer in its part of the time, the read continues with the
@@ -1493,7 +1494,13 @@ read(Table, Query) ->
     case read_direct(Table, Storages, Query, Version) of
         {ok, Result} -> Result;
         too_old -> error({erlfdb_error, ?TRANSACTION_TOO_OLD});
-        none -> read_by_message(Storages, Query, Version, ?TIMEOUT_MS div length(Storages), ?PROCESS_BEHIND)
+        none ->
+            %% The StorageServers of this node come first. Such a
+            %% StorageServer is behind the read version by the time of
+            %% one record in most cases, and a wait for it is shorter
+            %% than a message to another node.
+            {Here, Others} = lists:partition(fun local/1, Storages),
+            read_by_message(Here ++ Others, Query, Version, ?TIMEOUT_MS div length(Storages), ?PROCESS_BEHIND)
     end.
 
 %% The StorageServers of the database, in the order of this read version.

@@ -310,6 +310,15 @@ has the basic functions. The remaining parts, in the planned order:
       StorageServer of the list of the coordinated state for its stored
       version, and sends the lowest one to the LogServers. A LogServer
       discards up to its Known Committed Version.
+- [x] Treat the end version of an ended epoch as a Known Committed
+      Version in the StorageServer, so that a new StorageServer on a
+      cluster without commits copies the data of the last epoch.
+- [ ] Send the Known Committed Version to the LogServers without a new
+      record, for example with an empty record after a time without
+      commits, as the proxies of FoundationDB do. On a cluster without
+      commits, the Known Committed Version of an epoch that runs stays
+      below the last record. The pop and the oldest version of a
+      StorageServer wait for the next commit.
 - [ ] Decide what a cluster does when every StorageServer with the
       discarded records has stopped and LogServers run. Today a new
       StorageServer applies no record, and the database is not reset.
