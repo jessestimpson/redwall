@@ -21,6 +21,7 @@ on:
         default: quick
         options:
           - resolver
+          - watch
           - recovery
           - quick
           - long

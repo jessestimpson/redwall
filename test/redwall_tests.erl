@@ -29,7 +29,10 @@ client_test_() ->
         fun(Db) -> {timeout, 60, fun() -> range_options_random(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> key_selectors(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> range_option_conflicts(Db) end} end,
-        fun(Db) -> {timeout, 30, fun() -> equal_keys(Db) end} end
+        fun(Db) -> {timeout, 30, fun() -> equal_keys(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> watches(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> watch_in_transaction(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> watch_futures(Db) end} end
     ]}.
 
 setup() ->
@@ -355,6 +358,247 @@ two_processes(Db) ->
     ok = redwall:commit(Tx),
     ?assertEqual([{a, 1}, {b, 2}], redwall:transactional(Db, fun(T) -> redwall:get_range(T, a, z) end)).
 
+%% The future is not ready after 100 ms.
+pending(Future = {redwall_future, MsgRef, _Watch}) ->
+    receive
+        {MsgRef, ready} -> error({ready, redwall:get_error(Future)})
+    after 100 -> ?assertNot(redwall:is_ready(Future))
+    end.
+
+%% The future of a watch becomes ready when another transaction changes
+%% the value of the key, with direct reads and with reads by message.
+watches(Db = {redwall_database, Servers}) ->
+    lists:foreach(
+        fun(Database) ->
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:clear_range(Tx, a, z) end),
+            %% A watch of a transaction that set the key.
+            Set = redwall:set_and_watch(Database, a, 1),
+            %% A watch of a transaction without a mutation, on a key with a
+            %% value and on a key without one.
+            Read = redwall:transactional(Database, fun(Tx) -> redwall:watch(Tx, a) end),
+            {not_found, Missing} = redwall:get_and_watch(Database, b),
+            %% A watch through a snapshot, and a watch on a database.
+            Snapshot = redwall:transactional(Database, fun(Tx) -> redwall:watch(redwall:snapshot(Tx), a) end),
+            OnDb = redwall:watch(Database, a),
+            Futures = [Set, Read, Missing, Snapshot, OnDb],
+            [ok = pending(Future) || Future <- Futures],
+            %% A set of the key to its value changes nothing.
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:set(Tx, a, 1) end),
+            [ok = pending(Future) || Future <- Futures],
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:set(Tx, a, 2) end),
+            ?assertEqual([ok, ok, ok, ok], redwall:wait_for_all([Set, Read, Snapshot, OnDb], [{timeout, 5000}])),
+            ?assertEqual(2, redwall:transactional(Database, fun(Tx) -> redwall:get(Tx, a) end)),
+            ok = pending(Missing),
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:set(Tx, b, 1) end),
+            ?assertEqual(ok, redwall:wait(Missing, [{timeout, 5000}])),
+            %% A clear, and a clear of a key range.
+            Cleared = redwall:transactional(Database, fun(Tx) -> redwall:watch(Tx, a) end),
+            InRange = redwall:transactional(Database, fun(Tx) -> redwall:watch(Tx, b) end),
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:clear(Tx, a) end),
+            ?assertEqual(ok, redwall:wait(Cleared, [{timeout, 5000}])),
+            ok = pending(InRange),
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:clear_range(Tx, a, c) end),
+            ?assertEqual(ok, redwall:wait(InRange, [{timeout, 5000}])),
+            %% A watch after a clear in the same transaction.
+            Empty = redwall:clear_and_watch(Database, a),
+            ok = pending(Empty),
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:set(Tx, a, 3) end),
+            ?assertEqual(ok, redwall:wait(Empty, [{timeout, 5000}])),
+            %% The value changed between the read version of the watch and
+            %% its commit: the watch is ready at once after the commit.
+            Tx1 = redwall:create_transaction(Database),
+            Late = redwall:watch(Tx1, a),
+            ok = redwall:transactional(Database, fun(Tx) -> redwall:set(Tx, a, 4) end),
+            ok = redwall:commit(Tx1),
+            ?assertEqual(ok, redwall:wait(Late, [{timeout, 5000}]))
+        end,
+        [Db, {redwall_database, Servers#{direct => false}}]
+    ).
+
+%% The watches of a transaction before its commit.
+watch_in_transaction(Db = {redwall_database, Servers}) ->
+    ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, a, 1) end),
+    %% A set or a clear of the key in the transaction with another value
+    %% makes the future ready before the commit. A set to the value of the
+    %% watch does not.
+    Tx = redwall:create_transaction(Db),
+    ?assertNot(redwall:has_watches(Tx)),
+    [Same, Other, Clear, Range, Outside] = [redwall:watch(Tx, a) || _ <- lists:seq(1, 5)],
+    ?assert(redwall:has_watches(Tx)),
+    ?assert(redwall:has_watches(redwall:snapshot(Tx))),
+    ok = redwall:set(Tx, a, 1),
+    [ok = pending(Future) || Future <- [Same, Other, Clear, Range, Outside]],
+    ok = redwall:set(Tx, a, 2),
+    ?assertEqual([ok, ok, ok, ok, ok], redwall:wait_for_all([Same, Other, Clear, Range, Outside], [{timeout, 5000}])),
+    %% A watch on a write of the transaction has the value of the write.
+    Written = redwall:watch(Tx, a),
+    ok = redwall:set(Tx, a, 2),
+    ok = redwall:clear_range(Tx, b, z),
+    ok = pending(Written),
+    ok = redwall:clear_range(Tx, a, b),
+    ?assertEqual(ok, redwall:wait(Written, [{timeout, 5000}])),
+    Gone = redwall:watch(Tx, a),
+    ok = redwall:clear(Tx, a),
+    ok = pending(Gone),
+    ok = redwall:set(Tx, a, 5),
+    ?assertEqual(ok, redwall:wait(Gone, [{timeout, 5000}])),
+    %% A reset gives the error 1025 to a watch that waits for the commit,
+    %% and so does a cancel of the transaction.
+    Reset = redwall:watch(Tx, a),
+    ok = redwall:reset(Tx),
+    ?assertNot(redwall:has_watches(Tx)),
+    ?assertError({erlfdb_error, 1025}, redwall:wait(Reset, [{timeout, 5000}])),
+    ?assertEqual({erlfdb_error, 1025}, redwall:get_error(Reset)),
+    Cancelled = redwall:watch(Tx, a),
+    ok = redwall:cancel(Tx),
+    ?assertError({erlfdb_error, 1025}, redwall:wait(Cancelled, [{timeout, 5000}])),
+    %% A failed commit gives its error to the watch, and
+    %% `transactional/2' runs the function again.
+    Conflict = redwall:create_transaction(Db),
+    Failed = redwall:watch(Conflict, a),
+    ok = redwall:set(Conflict, b, 1),
+    ok = redwall:transactional(Db, fun(T) -> redwall:set(T, a, 6) end),
+    ?assertError({erlfdb_error, 1020}, redwall:commit(Conflict)),
+    ?assertError({erlfdb_error, 1020}, redwall:wait(Failed, [{timeout, 5000}])),
+    Counter = counters:new(1, []),
+    Again = redwall:transactional(Db, fun(T) ->
+        Future = redwall:watch(T, a),
+        ok = redwall:set(T, b, 2),
+        case counters:get(Counter, 1) of
+            0 ->
+                ok = counters:add(Counter, 1, 1),
+                ok = redwall:transactional(Db, fun(T2) -> redwall:set(T2, a, 7) end),
+                put_first(Future);
+            _ ->
+                ok
+        end,
+        Future
+    end),
+    ?assertError({erlfdb_error, 1020}, redwall:wait(take_first(), [{timeout, 5000}])),
+    ok = pending(Again),
+    %% An exception of the function ends the watch with the error 1025.
+    Self = self(),
+    ?assertError(
+        my_error,
+        redwall:transactional(Db, fun(T) ->
+            Self ! {future, redwall:watch(T, a)},
+            error(my_error)
+        end)
+    ),
+    Abandoned =
+        receive
+            {future, Future} -> Future
+        end,
+    ?assertError({erlfdb_error, 1025}, redwall:wait(Abandoned, [{timeout, 5000}])),
+    %% The process that created a transaction ends before the commit.
+    {Owner, Monitor} = spawn_monitor(fun() ->
+        T = redwall:create_transaction(Db),
+        Self ! {future, redwall:watch(T, a, [{to, Self}])}
+    end),
+    receive
+        {'DOWN', Monitor, process, Owner, _} -> ok
+    end,
+    Orphan =
+        receive
+            {future, Future2} -> Future2
+        end,
+    ?assertError({erlfdb_error, 1025}, redwall:wait(Orphan, [{timeout, 5000}])),
+    %% A database with at most 2 watches.
+    Small = redwall:open(Servers#{max_watches => 2}),
+    First = redwall:watch(Small, a),
+    Second = redwall:watch(Small, a),
+    ?assertError({erlfdb_error, 1032}, redwall:watch(Small, a)),
+    ok = redwall:cancel(Second),
+    Third = redwall:watch(Small, a),
+    ?assertError({erlfdb_error, 1032}, redwall:watch(Small, a)),
+    ok = redwall:transactional(Db, fun(T) -> redwall:set(T, a, 8) end),
+    ?assertEqual([ok, ok], redwall:wait_for_all([First, Third], [{timeout, 5000}])),
+    %% The two ready futures do not count.
+    ok = redwall:cancel(redwall:watch(Small, a)),
+    ok = redwall:cancel(redwall:watch(Small, a)).
+
+%% One message carries the future of the first attempt out of the
+%% function of `transactional/2'.
+put_first(Future) ->
+    self() ! {first_attempt, Future},
+    ok.
+
+take_first() ->
+    receive
+        {first_attempt, Future} -> Future
+    after 0 -> error(no_first_attempt)
+    end.
+
+%% The functions for the future of a watch.
+watch_futures(Db) ->
+    ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, a, 1) end),
+    %% A cancelled future receives no message and has the error 1101.
+    Cancelled = {redwall_future, MsgRef, {Watcher, _Status, _Count}} = redwall:watch(Db, a),
+    Monitor = monitor(process, Watcher),
+    ?assertEqual({erlfdb_error, 2015}, redwall:get_error(Cancelled)),
+    ok = redwall:cancel(Cancelled, [{flush, true}]),
+    receive
+        {'DOWN', Monitor, process, Watcher, _} -> ok
+    after 5000 -> error(watcher_alive)
+    end,
+    ?assert(redwall:is_ready(Cancelled)),
+    ?assertError({erlfdb_error, 1101}, redwall:wait(Cancelled)),
+    %% The option `to' names the process that receives the message.
+    Self = self(),
+    Receiver = spawn_link(fun() ->
+        receive
+            {Ref, ready} -> Self ! {received, Ref}
+        end
+    end),
+    {redwall_future, ToRef, _} = To = redwall:watch(Db, a, [{to, Receiver}]),
+    %% `wait_for_any/2' returns a future that is ready.
+    Other = redwall:watch(Db, b),
+    Mine = redwall:watch(Db, a),
+    ?assertError({timeout, _}, redwall:wait_for_any([Other, Mine], [{timeout, 100}])),
+    ?assertError({timeout, _}, redwall:wait(Mine, [{timeout, 100}])),
+    ok = redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, a, 2) end),
+    ?assertEqual(Mine, redwall:wait_for_any([Other, Mine], [{timeout, 5000}])),
+    ?assertEqual(Mine, redwall:wait_for_any([Other, Mine])),
+    ?assertEqual(ok, redwall:get(Mine)),
+    ?assertEqual(ok, redwall:get_error(Mine)),
+    ?assertEqual(ok, redwall:block_until_ready(Mine)),
+    receive
+        {received, ToRef} -> ?assertEqual(ok, redwall:get(To))
+    after 5000 -> error(no_message)
+    end,
+    receive
+        {MsgRef, ready} -> error(cancelled_future_ready)
+    after 0 -> ok
+    end,
+    %% A value that is not a future.
+    ?assertEqual(value, redwall:wait(value)),
+    ?assertEqual(value, redwall:get(value)),
+    ?assert(redwall:is_ready(value)),
+    ?assertEqual([ok, value], redwall:wait_for_all([Mine, value])),
+    %% A watch ends when the process that receives its message ends.
+    {Pid, PidMonitor} = spawn_monitor(fun() ->
+        Self ! {future, redwall:watch(Db, b)},
+        receive
+            stop -> ok
+        end
+    end),
+    {redwall_future, _, {Ending, _, _}} =
+        Ended =
+        receive
+            {future, Future} -> Future
+        end,
+    EndingMonitor = monitor(process, Ending),
+    Pid ! stop,
+    receive
+        {'DOWN', PidMonitor, process, Pid, _} -> ok
+    end,
+    receive
+        {'DOWN', EndingMonitor, process, Ending, _} -> ok
+    after 5000 -> error(watcher_alive)
+    end,
+    ?assertEqual({erlfdb_error, 1101}, redwall:get_error(Ended)),
+    ok = redwall:cancel(Other).
+
 %% Reset, cancel and the errors that `on_error/2' does not accept.
 lifecycle(Db) ->
     Tx = redwall:create_transaction(Db),
@@ -501,9 +745,14 @@ profile_test() ->
     ?assertEqual(#{direct => true, retry_delay_ms => 10, max_retry_delay_ms => 1000}, redwall:profile(default)),
     ?assertEqual(#{direct => true, retry_delay_ms => 1, max_retry_delay_ms => 100}, redwall:profile(ets)),
     Servers = #{proxy => self(), storage => self()},
-    ?assertEqual({redwall_database, maps:merge(redwall:profile(default), Servers)}, redwall:open(Servers)),
-    ?assertEqual({redwall_database, maps:merge(redwall:profile(ets), Servers)}, redwall:open(Servers#{profile => ets})),
-    {redwall_database, Options} = redwall:open(Servers#{profile => ets, retry_delay_ms => 3, direct => false}),
+    %% A database also has the counter of its watches.
+    Open = fun(Map) ->
+        {redwall_database, Opened = #{watch_count := _}} = redwall:open(Map),
+        maps:remove(watch_count, Opened)
+    end,
+    ?assertEqual(maps:merge(redwall:profile(default), Servers), Open(Servers)),
+    ?assertEqual(maps:merge(redwall:profile(ets), Servers), Open(Servers#{profile => ets})),
+    Options = Open(Servers#{profile => ets, retry_delay_ms => 3, direct => false}),
     ?assertEqual(#{proxy => self(), storage => self(), direct => false, retry_delay_ms => 3, max_retry_delay_ms => 100}, Options),
     ?assertError(function_clause, redwall:open(Servers#{profile => unknown})),
     %% With the profile `ets', 30 errors wait for at most 100 ms each, and

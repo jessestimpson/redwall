@@ -4,10 +4,10 @@
 |---|---|---|---|
 | Unit tests | The coordinated state machine, alone and on a peace cluster of three servers on one node. One LogServer: the order of the LSNs, the KCV, repeated records and the lock. The recovery on a peace cluster: the first epoch, a second epoch with records to copy, 1 and 2 LogServers down, and two recoveries at the same time. The Proxy: commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down | `make test` | 3 seconds |
 | Simulation | The LogServer, the recovery, the Sequencer, the Resolver, the Proxy and the StorageServer under the scheduler and the simulated network of eta, with kills, partitions, and lost and delayed messages | `make dst` | about 3 minutes |
-| Model checking | The logging protocol, the recovery, the read versions, the StorageServer and the Resolver, with 2 epochs | `make tlc` | about 5 minutes |
+| Model checking | The logging protocol, the recovery, the read versions, the StorageServer and the Resolver, with 2 epochs, and the watch | `make tlc` | about 6 minutes |
 | Model checking | The logging protocol, the recovery and the StorageServer, with 3 epochs | `make tlc-long` | about 4 hours |
 
-The models have 10 planted bugs. TLC finds a counterexample for each. See
+The models have 13 planted bugs. TLC finds a counterexample for each. See
 [formal/README.md](../formal/README.md).
 
 ## Dependencies
@@ -102,7 +102,32 @@ LogServers discard records:
   version of a StorageServer, and a LogServer discards the records
   without the limit of its Known Committed Version.
 
-These runs have one more invariant after every step, `one_leader`: no
+In the runs with watches (the tests with the name `watch_`), the
+workload has watches. See [Watches](client.md#watches).
+
+- 1 operation in 4 is a watch, in the place of a transaction. A client
+  creates a watch on one of 2 keys, which are not the keys of the
+  transactions. 2 clients in 3 set the key to a value of their own in
+  the transaction of the watch. The other clients read the key.
+- No client clears a key of a watch, and each client writes its own
+  value, so the value of a key never changes back.
+- The client waits for the future. When the future is ready, the client
+  reads the key in a new transaction.
+- In the runs with faults, a StorageServer answers `timed_out` to a
+  watch after 300 ms, a request of a watch has a time limit of 1,000 ms,
+  and a client waits for its future for 3,000 ms.
+- In the runs without faults, a StorageServer and a request of a watch
+  have no time limit. A future is then ready only after the answer of a
+  StorageServer that the value differs. The harness checks `watch_fires`
+  at the end of the run: the future of every watch is ready, if an
+  acknowledged transaction set the key of the watch at a commit version
+  above the version of the watch.
+- The planted defect `watch_no_trigger`: a StorageServer does not read
+  the key of a watch when it applies a record.
+- The planted defect `watch_no_verify`: the client does not read the key
+  after the answer of a StorageServer.
+
+The runs with ClusterControllers have one more invariant after every step, `one_leader`: no
 two ClusterController processes are the leader of one term. The harness
 checks at the end of each of these runs:
 
@@ -133,6 +158,8 @@ The harness checks these invariants after every step:
 | `mapped_range_agrees` | A `redwall:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
 | `own_writes` | Before the commit, the reads of a transaction return its sets and its clears, and `get_mapped_range/4` raises 2039. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation |
 | `coordinators_agree` | In a run with a peace cluster, no two servers have two states of the coordinated state for one index of the log of peace |
+| `watch_change` | In a run with watches, the read of a client after a ready future returns another value than the value of the watch |
+| `watch_error` | In a run with watches, the future of a watch whose commit failed has the error of the commit, and the future of a watch whose commit succeeded has no error |
 | `kcv_below_dv` | In each epoch, the KCV of every LogServer is at or below the DV of every LogServer |
 | `chain` | In each LogServer, the previous LSN of each record is the LSN of the record before it |
 
@@ -178,6 +205,20 @@ Results of the 5 tests with the pop in a run of `make dst` on
 | Pop, kills of StorageServers only | 60 seeds in 1 test | No violation. 1,577 acknowledged transactions, 150 kills of a StorageServer, 594 LogServers with discarded records, 139 copies from another StorageServer. A StorageServer received the answer `popped` above its version 25 times |
 | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing, for the runs with the pop | 12 seeds, 3 runs each | Pass |
 | Planted defect `pop_no_limit` | Seeds from 1 | Found at seed 2, `epoch`: a recovery finds no LogServer with a record that it must copy, and the run ends without an epoch. The same seed passes without the defect |
+
+Results of the 5 tests with watches in a run of `make dst` on
+2026-11-24. The 52 tests of that run pass in 249 s:
+
+| Test | Runs | Result |
+|---|---|---|
+| Watches, no kills, no partitions, no lost or delayed messages, no time limit of a watch | 60 seeds in 1 test, 80 operations each | No violation, and `watch_fires` holds at the end of each run. 1,087 committed watches, 902 ready futures, 894 reads after a ready future, 911 answers of a StorageServer that the value differs, 0 answers `timed_out` |
+| Watches, kills, partitions, lost and delayed messages | 150 seeds in 1 test | No violation. 1,154 committed watches, 703 ready futures, 674 reads after a ready future, 1,253 futures with the error of a failed commit, 3,902 answers `timed_out` of a StorageServer, 271 rollbacks of a StorageServer |
+| The same seed gives the same trace, the trace replays, and the audit of eta reports nothing, for the two kinds of runs with watches | 12 seeds, 3 runs each | Pass |
+| Planted defect `watch_no_trigger` | Seeds from 1, runs without faults | Found at seed 1, `watch_fires`: 14 futures are not ready at the end of the run. The same seed passes without the defect |
+| Planted defect `watch_no_verify` | Seeds from 1, runs with faults | Found at seed 2, `watch_change`: the read after a ready future returns the value of the watch. The same seed passes without the defect |
+
+The tests without the name `watch_` have no watch, and their operations
+are the operations of the runs before 2026-11-24.
 
 A run of `make dst` on 2026-11-23, with the invariants
 `mapped_range_agrees` and `own_writes`: the 32 tests pass in 130 s

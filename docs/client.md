@@ -186,6 +186,102 @@ end).
   encoding that keeps the order of the Erlang terms. redwall has no such
   engine and no such encoding.
 
+## Watches
+
+A watch is a future that becomes ready when the value of a key differs
+from the value that a transaction read. The functions are the functions
+of erlfdb: `watch/2,3`, `get_and_watch/2`, `set_and_watch/3`,
+`clear_and_watch/2` and `has_watches/1`. The design is the design of
+FoundationDB 7.3.62 (`fdbclient/ReadYourWrites.actor.cpp`,
+`fdbclient/NativeAPI.actor.cpp` and `fdbserver/storageserver.actor.cpp`).
+
+```erlang
+Future = redwall:transactional(Db, fun(Tx) -> redwall:watch(Tx, Key) end),
+%% Another transaction sets the key to another value.
+ok = redwall:wait(Future)
+```
+
+In the transaction:
+
+- `watch/2` reads the key as `get/2` does. The value of the watch is the
+  value at the read version, or the write of this transaction. The read
+  adds a read conflict key.
+- A later set or clear of the key in the same transaction with another
+  value makes the future ready at once.
+- The watch starts when the transaction commits. The version of the
+  watch is the commit version, or the read version for a transaction
+  without a mutation. `transactional/2` commits a transaction with a
+  watch also when the transaction has no mutation.
+- If the commit fails, the future has the error of the commit. If the
+  transaction is reset or cancelled before its commit, the future has
+  the error 1025, `transaction_cancelled`.
+- A database has at most `max_watches` watches whose futures are not
+  ready (default 10,000). Above the limit, `watch/2` raises 1032,
+  `too_many_watches`.
+
+After the commit, one process for each watch follows the watch:
+
+1. The process sends the key, the value and the version to a
+   StorageServer. The StorageServer answers when the value of the key at
+   its version differs from the value of the watch. See
+   [Watches](storage-server.md#watches).
+2. The process asks the Proxy for read versions until one is at or above
+   the version of the answer. It then reads the key at that read
+   version.
+3. If the value differs from the value of the watch, the future is
+   ready. Otherwise the process sends the watch again, with the read
+   version as its version.
+4. After the answer `timed_out` or `watch_cancelled`, and when the
+   StorageServer does not answer in `watch_call_timeout_ms` (default
+   35,000) or is not alive, the process waits, performs the read of
+   step 2, and sends the watch again. After a failed request, the next
+   request goes to the next StorageServer.
+
+The guarantees are the guarantees of FoundationDB:
+
+- If the value of the key differs from the value of the watch from some
+  commit on, the future becomes ready.
+- If the value changes and changes back, the future can stay not ready.
+- When a future is ready without an error, a read at a read version at
+  or above the version of the watch returned another value.
+
+The future is `{redwall_future, Reference, Watch}`. When it becomes
+ready or gets an error, a process receives the message
+`{Reference, ready}`, as with erlfdb. That process is the caller of
+`watch/2`, or the process of the option `to` of `watch/3`.
+
+| Function | Result for the future of a watch |
+|---|---|
+| `wait/1,2` | `ok`, or the error of the future. `{timeout, Ms}` limits the wait. Only the process that receives the message can wait |
+| `is_ready/1` | Whether the future is ready, has an error or is cancelled |
+| `get_error/1` | `ok` or `{erlfdb_error, Code}` |
+| `get/1` | `ok`, or the error of the future |
+| `cancel/1,2` | Ends the watch. `wait/1` then raises 1101, `operation_cancelled` |
+| `wait_for_any/1,2` | A future of the list that is ready |
+| `wait_for_all/1,2` | The result of each future of the list |
+
+Differences from FoundationDB and erlfdb:
+
+- Step 3 is a read of the key. FoundationDB compares versions: the
+  future is ready if the read version is less than 50,000,000 versions
+  above the version of the answer, because a recovery adds 100,000,000
+  versions. In redwall, a record that a recovery discards can be 1
+  version below the first version of the next epoch, so a comparison of
+  versions does not show a recovery.
+- The process performs the read of step 2 also after a failed request.
+  A watch therefore also becomes ready when no StorageServer has
+  answered that the value differs.
+- Each watch has its own process and its own request. The client of
+  FoundationDB keeps one request for each key, and the watches of a
+  database on the key share it.
+- After a reset of the database (see
+  [Reset after the loss of LogServers](recovery.md#reset-after-the-loss-of-logservers)), the future of
+  each watch is ready.
+- A watch ends when the process that receives its message ends. A
+  future of FoundationDB is cancelled when the application drops it.
+- A future of a read is the result itself, so `wait_for_any/1` waits
+  only for the futures of watches.
+
 ## Idempotency ids
 
 A client that receives no answer to a commit does not know whether the

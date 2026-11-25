@@ -10,15 +10,15 @@ State on 2026-11-24.
 
 | Part | Status |
 |---|---|
-| TLA+ models of the logging protocol, the recovery and the Resolver | Done, checked with TLC |
+| TLA+ models of the logging protocol, the recovery, the Resolver and the watch | Done, checked with TLC |
 | Coordinated state on peace | Done. A coordinator keeps its data on a disk (`redwall_coordinator`) |
 | LogServer | Done in memory. A LogServer discards the records that every StorageServer of the cluster has stored |
 | Process of an epoch: Sequencer, Resolver and Proxy | Done, as one process |
 | StorageServer | Done in memory, in ETS tables, with a copy from another StorageServer |
 | ClusterController and workers | Done: election, recruitment, one LogServer for each worker |
-| Client with the function names of erlfdb | The basic functions, `select`, `get_mapped_range`, the tuple layer, idempotency ids, list keys and binary keys |
+| Client with the function names of erlfdb | The basic functions, `select`, `get_mapped_range`, the tuple layer, idempotency ids, list keys and binary keys, range options, key selectors and watches |
 | Status | Done: the health of a cluster and its fault tolerance in Erlang nodes (`redwall_status`) |
-| Simulation with eta | 47 tests: kills, partitions, lost and delayed messages, a peace cluster with coordinators on the simulated disk |
+| Simulation with eta | 52 tests: kills, partitions, lost and delayed messages, a peace cluster with coordinators on the simulated disk |
 | Benchmark | Done for one computer with 7 nodes |
 | etx | A separate application with the interface of `ets` on redwall, with its own unit tests and simulation |
 
@@ -185,7 +185,21 @@ has the basic functions. The remaining parts, in the planned order:
 - [ ] `add_write_conflict_key`, `add_write_conflict_range` and
       `get_conflicting_keys`.
 - [ ] Atomic operations, versionstamped keys and versionstamped values.
-- [ ] Watches.
+- [x] Watches, with the design of FoundationDB: `watch/2,3`,
+      `get_and_watch/2`, `set_and_watch/3`, `clear_and_watch/2`,
+      `has_watches/1`, and the functions for the future of a watch. The
+      StorageServer answers a watch when the value of its key differs
+      (`redwall_storage:watch_value/5`), and the client confirms the
+      change with a read at a read version.
+- [ ] Share one request among the watches of a database on one key, as
+      the client of FoundationDB does (`watchValueMap`).
+- [ ] Answer a watch in the StorageServer only for a record at or below
+      the Known Committed Version, so that the client needs no read
+      after the answer. The source of FoundationDB names this change in
+      a comment of `watchValue`. A StorageServer of redwall learns the
+      Known Committed Version only with the next record.
+- [ ] Futures for the reads, so that `wait_for_any/1` waits for a read
+      and for a watch. A future of a read is the result itself today.
 - [ ] Tenants, and the functions for locality and statistics.
 - [ ] `get_last_error/0`. erlfdb keeps the last error in the process
       dictionary, and an error that causes a retry is hidden by a later
@@ -340,6 +354,14 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
 - [x] Extend the model with the StorageServer and the rollback above the
       Recovery Version.
 - [x] Model the Resolver, in the separate model `formal/Resolver.tla`.
+- [x] Model the watch, in the separate model `formal/Watch.tla`, with
+      the liveness property `Fires`.
+- [ ] Add watches to the simulation runs with ClusterControllers and to
+      the runs with the pop, and check `watch_fires` in a run with
+      faults after the harness has stopped the faults.
+- [ ] Add clears of the keys of the watches to the simulation. The
+      value of a key then changes back, and `watch_change` needs another
+      statement.
 - [ ] Add keys and values to the model of the StorageServer, so that the
       model has the value that a client reads.
 - [ ] Add the pop to `formal/Recovery.tla`: an action that discards the

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs TLC on one model config.
 #   usage: check.sh <ConfigBasenameWithout.cfg> [pass|fail]
-# With `fail`, the script requires TLC to find an invariant violation. Use
-# `fail` for the configs with a planted bug and for the reachability configs.
+# With `fail`, the script requires TLC to find a violation of an invariant
+# or of a temporal property. Use `fail` for the configs with a planted bug
+# and for the reachability configs.
 # The TLC jar is $TLA2TOOLS_JAR if it is set, and the jar in formal/vendor
 # otherwise.
 set -euo pipefail
@@ -11,9 +12,11 @@ cd "$(dirname "$0")"
 CFG="${1:?usage: check.sh <config-basename> [pass|fail]}"
 EXPECT="${2:-pass}"
 JAR="${TLA2TOOLS_JAR:-vendor/tla2tools-v1.8.0.jar}"
-# A config whose name starts with "Resolver" belongs to MCResolver.tla.
+# A config whose name starts with "Resolver" belongs to MCResolver.tla, and
+# a config whose name starts with "Watch" belongs to MCWatch.tla.
 case "$CFG" in
   Resolver*) MODULE=MCResolver.tla ;;
+  Watch*) MODULE=MCWatch.tla ;;
   *) MODULE=MCRecovery.tla ;;
 esac
 OUT="$(mktemp)"
@@ -32,9 +35,9 @@ set -e
 if [ "$EXPECT" = "pass" ]; then
   exit "$STATUS"
 fi
-if [ "$STATUS" -ne 0 ] && grep -Eq "Invariant .* is violated" "$OUT"; then
-  echo "OK: expected invariant violation was found"
+if [ "$STATUS" -ne 0 ] && grep -Eq "Invariant .* is violated|Temporal propert.* violated" "$OUT"; then
+  echo "OK: expected violation was found"
   exit 0
 fi
-echo "ERROR: expected an invariant violation, but TLC exited $STATUS without one"
+echo "ERROR: expected a violation, but TLC exited $STATUS without one"
 exit 1

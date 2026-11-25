@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # Runs a set of model configs. See README.md for each config.
-#   usage: check_all.sh [resolver|recovery|quick|long|all]
+#   usage: check_all.sh [resolver|watch|recovery|quick|long|all]
 # README.md states which set a change needs.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-QUICK_PASS="RecoverySafe RecoveryReads RecoveryStorage ResolverSafe ResolverSafeThreeEpochs ResolverSmallestGap"
+QUICK_PASS="RecoverySafe RecoveryReads RecoveryStorage ResolverSafe ResolverSafeThreeEpochs ResolverSmallestGap WatchSafe"
 # Planted bugs: each config must produce a counterexample.
-QUICK_FAIL="RecoveryAckReplicasOnly RecoveryFewReplies RecoveryNoCas RecoveryNoReport RecoveryFewConfirms RecoveryNoRollback RecoveryNoInFlightLimit ResolverNoCheck ResolverNoBatchCheck ResolverNoGap"
+QUICK_FAIL="RecoveryAckReplicasOnly RecoveryFewReplies RecoveryNoCas RecoveryNoReport RecoveryFewConfirms RecoveryNoRollback RecoveryNoInFlightLimit ResolverNoCheck ResolverNoBatchCheck ResolverNoGap WatchNoVerify WatchNoTrigger WatchNoRecheck"
 # Reachability: each config must reach the state that the invariant of the
 # config says is never reached.
-QUICK_REACH="RecoveryReachThirdEpoch RecoveryReachDiscard RecoveryReachCopy RecoveryReachRollback RecoveryReachReadSecondEpoch RecoveryReachStoreSecondEpoch ResolverReachConflict ResolverReachTooOldInEpoch ResolverReachTooOldAcrossEpochs ResolverReachCommitSecondEpoch ResolverReachTwoInBatch ResolverReachConflictInBatch"
+QUICK_REACH="RecoveryReachThirdEpoch RecoveryReachDiscard RecoveryReachCopy RecoveryReachRollback RecoveryReachReadSecondEpoch RecoveryReachStoreSecondEpoch ResolverReachConflict ResolverReachTooOldInEpoch ResolverReachTooOldAcrossEpochs ResolverReachCommitSecondEpoch ResolverReachTwoInBatch ResolverReachConflictInBatch WatchReachReady WatchReachResend WatchReachRollbackAnswer WatchReachReadyAfterTimeout"
 LONG_PASS="RecoverySafeThreeEpochs RecoveryStorageThreeEpochs"
 
 run() { # expectation configs...
   local expect="$1"; shift
   for cfg in "$@"; do
     echo "=== $cfg ($expect)"
-    ./check.sh "$cfg" "$expect" | grep -E "No error has been found|Invariant .* is violated|distinct states found, |Finished in|^OK:|^ERROR"
+    ./check.sh "$cfg" "$expect" | grep -E "No error has been found|Invariant .* is violated|Temporal propert.* violated|distinct states found, |Finished in|^OK:|^ERROR"
   done
 }
 
@@ -32,8 +32,9 @@ only() { # model configs...
 case "${1:-quick}" in
   quick) run pass $QUICK_PASS; run fail $QUICK_FAIL $QUICK_REACH ;;
   resolver) run pass $(only Resolver $QUICK_PASS); run fail $(only Resolver $QUICK_FAIL $QUICK_REACH) ;;
+  watch) run pass $(only Watch $QUICK_PASS); run fail $(only Watch $QUICK_FAIL $QUICK_REACH) ;;
   recovery) run pass $(only Recovery $QUICK_PASS); run fail $(only Recovery $QUICK_FAIL $QUICK_REACH) ;;
   long) run pass $LONG_PASS ;;
   all) run pass $QUICK_PASS $LONG_PASS; run fail $QUICK_FAIL $QUICK_REACH ;;
-  *) echo "usage: check_all.sh [resolver|recovery|quick|long|all]" >&2; exit 2 ;;
+  *) echo "usage: check_all.sh [resolver|watch|recovery|quick|long|all]" >&2; exit 2 ;;
 esac

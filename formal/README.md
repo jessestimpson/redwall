@@ -1,15 +1,21 @@
 # Formal model
 
-The directory has two models:
+The directory has three models:
 
 | Model | Contents | Module for model checking |
 |---|---|---|
 | [Recovery.tla](Recovery.tla) | The logging protocol, the recovery, read versions and the StorageServer (paper, sections 2.4.3, 2.4.4 and 2.5) | [MCRecovery.tla](MCRecovery.tla) |
 | [Resolver.tla](Resolver.tla) | The Resolver and the versions that protect a Resolver without history (paper, section 2.4.2 and Algorithm 1) | [MCResolver.tla](MCResolver.tla) |
+| [Watch.tla](Watch.tla) | The watch: the request to the StorageServer, the answer, and the read of the client after the answer (FoundationDB 7.3, `watchValue` and `watchWaitForValueChange`). The paper does not describe watches | [MCWatch.tla](MCWatch.tla) |
 
-The two models are separate because the Resolver depends on versions and
-epochs only, and not on the LogServers. One model with both parts has a
-state space that TLC does not finish.
+The models are separate:
+
+- The Resolver depends on versions and epochs only, and not on the
+  LogServers. One model with the recovery and the Resolver has a state
+  space that TLC does not finish.
+- The watch depends on the order of the records, on the acknowledged
+  records and on the discarded records only. `Watch.tla` has a log
+  without LogServers and without epochs.
 
 ## Contents of Recovery.tla
 
@@ -89,7 +95,29 @@ The model does not have the ordered set of bounds that
 `redwall_resolver` keeps. A unit test compares that set of bounds with one
 version for each key, for 3,000 random transactions.
 
-## Invariants
+## Contents of Watch.tla
+
+| Part | In the model |
+|---|---|
+| Log | A sequence of records. A record has an LSN and the value of one key after the record |
+| Acknowledged records | A prefix of the log. A read at a read version returns the value of the last acknowledged record |
+| Recovery | `Recover` discards the records that are not acknowledged, and adds the recovery transaction, which has a higher LSN and does not write the key |
+| StorageServer | One. `SSApply` applies the next record of the log, also a record that is not acknowledged. `SSRollback` removes the discarded records |
+| Watch | One, with a value and a version. `Create` takes them from the last acknowledged record |
+| Request | `SSReceive`: the StorageServer handles the request when its version is at or above the version of the request. It answers if the value differs, and keeps the request otherwise. It reads the key again after a record that writes the key and after a rollback |
+| Client | `ClientAnswer`: after the answer, the client waits for a read version at or above the version of the answer, and reads the key. The future is ready if the value differs. Otherwise the client sends the watch again with the read version |
+| Time limit | `Timeout`: the request ends without an answer, and the client reads the key (`ClientRetry`) |
+
+The model does not contain LogServers, epochs, the Resolver, more than
+one key, more than one watch, more than one StorageServer, or the
+watches of a transaction before its commit.
+
+`Fires` is a liveness property. The fairness conditions of the model
+are: a record is acknowledged unless a recovery discards it, and the
+StorageServer and the client take their steps. `Timeout` has no fairness
+condition, so `Fires` does not depend on the time limit of a request.
+
+## Invariants and properties
 
 | Model | Invariant | Meaning |
 |---|---|---|
@@ -103,13 +131,16 @@ version for each key, for 3,000 random transactions.
 | Recovery | `StorageComplete` | At that time the StorageServer has every acknowledged record at or below that version |
 | Resolver | `NoConflict` | No committed transaction read a key that another committed transaction wrote between the read version and the commit version of the first one, or at that commit version and earlier in the batch |
 | Resolver | `BlindWritesCommit` | A transaction without read keys is never rejected |
+| Watch | `ReadySound` | When the future of the watch is ready, an acknowledged record above the version of the watch has written another value than the value of the watch |
+| Watch | `Fires` (temporal property) | If the value of the last acknowledged record differs from the value of the watch from some time on, the future becomes ready |
 
 ## Configs and results
 
 All Recovery configs have 3 LogServers, a replication degree of 2 and a
 `Gap` of 2. All Resolver configs have 2 keys, 3 transactions, a window of 3
-versions and a `MaxStep` of 2. The results are from one machine with 10
-processors, on 2026-11-22.
+versions and a `MaxStep` of 2. All Watch configs have 2 values. The
+results are from one machine with 10 processors, on 2026-11-22 for
+Recovery and Resolver, and on 2026-11-24 for Watch.
 
 ### Configs that must pass
 
@@ -123,6 +154,7 @@ processors, on 2026-11-22.
 | `ResolverSafe` | 2 epochs, 11 versions, `Gap` 3 | `NoConflict`, `BlindWritesCommit` | 970,557 | 3 s |
 | `ResolverSafeThreeEpochs` | 3 epochs, 15 versions, `Gap` 3 | As `ResolverSafe` | 4,445,361 | 14 s |
 | `ResolverSmallestGap` | 2 epochs, 10 versions, `Gap` 2 | As `ResolverSafe` | 970,557 | 3 s |
+| `WatchSafe` | 6 LSNs, 2 recoveries | `ReadySound`, and the temporal property `Fires` | 1,591,146 | 22 s |
 
 Every config also checks `TypeOK`.
 
@@ -142,6 +174,9 @@ Each config must produce a counterexample.
 | `ResolverNoCheck` | `Check = FALSE` | `NoConflict` | under 1 s |
 | `ResolverNoBatchCheck` | `CheckBatch = FALSE` | `NoConflict` | under 1 s |
 | `ResolverNoGap` | `Gap = 1` with a window of 3 | `NoConflict` | under 1 s |
+| `WatchNoVerify` | `Verify = FALSE` | `ReadySound` | under 1 s |
+| `WatchNoTrigger` | `Trigger = FALSE` | `Fires` | under 1 s |
+| `WatchNoRecheck` | `Recheck = FALSE` | `Fires` | 3 s |
 
 - **`RecoveryAckReplicasOnly`**. A Proxy answers a client after the `K`
   LogServers that store the body have persisted the LSN. A LogServer that
@@ -180,6 +215,20 @@ Each config must produce a counterexample.
 - **`ResolverNoGap`**. The Resolver of the new epoch has no history, and
   the read version of a transaction of the previous epoch is inside the
   MVCC window. The Resolver admits the transaction.
+- **`WatchNoVerify`**. The StorageServer applies a record that is not
+  acknowledged and that writes another value. It answers the watch, and
+  the future is ready without a read. A recovery discards the record, so
+  no acknowledged record has written another value.
+- **`WatchNoTrigger`**. The StorageServer keeps the request, and applies
+  a record that writes another value without a read of the key. The
+  record is acknowledged, and the future never becomes ready.
+- **`WatchNoRecheck`**. The watch has the value `v1`. An acknowledged
+  record writes `v2`, and a record that is not acknowledged writes `v1`
+  again. The StorageServer has applied both, so it keeps the request. A
+  recovery discards the second record. After the rollback the
+  StorageServer has `v2`. Without a read of the key after the rollback,
+  the future never becomes ready. The recovery transaction does not
+  write the key, so it causes no read.
 
 ### The smallest gap
 
@@ -208,8 +257,12 @@ Each config must reach the state that its invariant says is never reached.
 | `ResolverReachCommitSecondEpoch` | A transaction with read keys commits in the second epoch |
 | `ResolverReachTwoInBatch` | Two transactions of one batch commit |
 | `ResolverReachConflictInBatch` | The Resolver rejects a transaction for a conflict with an earlier transaction of its batch, and for no other reason |
+| `WatchReachReady` | The future of the watch is ready |
+| `WatchReachResend` | The client sends the watch again after a read that returned the value of the watch |
+| `WatchReachRollbackAnswer` | The StorageServer answers the watch after a rollback |
+| `WatchReachReadyAfterTimeout` | The future is ready after a request without an answer |
 
-All 12 configs reach their state in 1 s or less.
+All 16 configs reach their state in 1 s or less.
 
 ### A finding of the model
 
@@ -227,8 +280,9 @@ invariant now applies to the records of clients, and the comments in
 ./check.sh RecoverySafe            # one config that must pass
 ./check.sh RecoveryNoCas fail      # one config that must find a violation
 ./check_all.sh resolver            # the Resolver configs, about 30 seconds
+./check_all.sh watch               # the Watch configs, about 40 seconds
 ./check_all.sh recovery            # the quick Recovery configs, about 5 minutes
-./check_all.sh quick               # resolver and recovery
+./check_all.sh quick               # resolver, watch and recovery
 ./check_all.sh long                # the Recovery configs with 3 epochs, about 4 hours
 ```
 
@@ -242,6 +296,7 @@ every config. The rule is:
 | Code, tests or documents, and no file in `formal/` | None | 0 |
 | A comment in a model | None | 0 |
 | `Resolver.tla` or `MCResolver.tla` | `./check_all.sh resolver` | about 30 seconds |
+| `Watch.tla` or `MCWatch.tla` | `./check_all.sh watch` | about 40 seconds |
 | `Recovery.tla` or `MCRecovery.tla` | `./check_all.sh recovery` | about 5 minutes |
 | `Recovery.tla`, before the end of a milestone or before a release | `./check_all.sh long`, as a background job | about 4 hours |
 
@@ -255,8 +310,13 @@ again.
 
 - The bounds are small: 3 LogServers, at most 3 epochs and 7 versions in
   Recovery; 2 keys, 3 transactions and at most 3 epochs in Resolver.
-- The two models are not composed. Resolver assumes that a recovery keeps
-  every record, and Recovery treats every transaction as admitted.
+- The three models are not composed. Resolver assumes that a recovery keeps
+  every record, and Recovery treats every transaction as admitted. Watch
+  assumes that a read at a read version returns the value of the last
+  acknowledged record, which Recovery states as `StorageSafe` and
+  `StorageComplete`.
+- Watch has one key, one watch, one StorageServer, 2 values, at most 6
+  LSNs and at most 2 recoveries. It has no LogServers and no epochs.
 - Recovery has no keys and no values. `StorageSafe` and `StorageComplete`
   are statements about sets of records, not about values that a client
   reads.
@@ -273,4 +333,5 @@ again.
   version.
 - A Sequencer whose lock fails is not modelled, because that Sequencer
   changes nothing.
-- The models check safety only. They have no liveness property.
+- Recovery and Resolver check safety only. Watch has one liveness
+  property, `Fires`.

@@ -122,6 +122,47 @@
 %%   not keep a discarded record.</li>
 %% </ul>
 %%
+%% == Runs with watches ==
+%%
+%% With the config key `watches', the workload has watches (see "Watches"
+%% in `redwall'). The value of the key is `true' or `live'.
+%%
+%% <ul>
+%% <li>1 operation in 4 is `{watch, R1, R2}', in the place of a
+%%   transaction. A client creates a watch on one of 2 keys, which are
+%%   not the keys of the transactions. 2 clients in 3 set the key to the
+%%   value `{watch, C}' in the transaction of the watch. The other
+%%   clients read the key. No client clears a key of a watch, and each
+%%   client writes its own value, so the value of a key never changes
+%%   back.</li>
+%% <li>The client waits for the future of its watch. When the future is
+%%   ready, the client reads the key in a new transaction.</li>
+%% <li>The invariant `watch_change': the read after a ready future
+%%   returns another value than the value of the watch.</li>
+%% <li>The invariant `watch_error': the future of a watch whose commit
+%%   failed has the error of the commit, and the future of a watch whose
+%%   commit succeeded has no error.</li>
+%% <li>With `watches => true', a StorageServer answers `timed_out' to a
+%%   watch after 300 ms, a request of a watch has a time limit of 1,000
+%%   ms, and a client waits for its future for 3,000 ms.</li>
+%% <li>With `watches => live', a StorageServer and a request of a watch
+%%   have no time limit, and a client waits without a limit. A watch then
+%%   becomes ready only after the answer of a StorageServer that the
+%%   value differs. `check_final/2' checks `watch_fires': the future of
+%%   every watch is ready, if an acknowledged transaction set the key of
+%%   the watch at a commit version above the version of the watch. The
+%%   run continues until the check holds, for at most the settle steps of
+%%   the run. This config is for runs without faults: a lost message is
+%%   not sent again.</li>
+%% <li>The planted defect `watch_no_trigger': a StorageServer does not
+%%   read the key of a watch when it applies a record. `watch_fires'
+%%   finds it.</li>
+%% <li>The planted defect `watch_no_verify': the client does not read the
+%%   key after the answer of a StorageServer. A StorageServer answers
+%%   for a record that a recovery discards, and `watch_change' finds the
+%%   ready future.</li>
+%% </ul>
+%%
 %% The invariants of the other runs hold in these runs. These runs have
 %% one more invariant, `one_leader': no two ClusterController processes
 %% are the leader of one term. `check_final/2' checks at the end of a run:
@@ -267,6 +308,8 @@
 %%   `select/4' of a snapshot. `get_mapped_range/4' raises 2039. After a
 %%   failed commit, `on_error/2' leaves a transaction without a read
 %%   version and without a mutation.</li>
+%% <li>`watch_change' and `watch_error' - in a run with watches. See
+%%   "Runs with watches".</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -316,6 +359,8 @@
 %% <li>`no_clear' - the StorageServer does not apply a clear.</li>
 %% <li>`no_window_check' - the StorageServer answers a read below its
 %%   oldest version, after it has removed older versions.</li>
+%% <li>`watch_no_trigger' and `watch_no_verify' - see "Runs with
+%%   watches".</li>
 %% <li>`pop_no_limit' - the pop version of the ClusterController is the
 %%   highest version of a StorageServer, and a LogServer discards the
 %%   records without the limit of its Known Committed Version. A recovery
@@ -374,6 +419,10 @@ init(Seed, Config) ->
     Tab = ets:new(redwall_dst, [public, ordered_set]),
     %% Whether the LogServers discard records. See "Runs with the pop".
     _ = maps:get(pop, Config, false) andalso ets:insert(Tab, {pop, true}),
+    %% Whether the workload has watches: `false', `true' or `live'. See
+    %% "Runs with watches".
+    Watches = maps:get(watches, Config, false),
+    _ = Watches =/= false andalso ets:insert(Tab, [{watches, Watches}, {mode, Mode}]),
     Cas = #{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas},
     %% The topology is declared before any process creates a monitor.
     CState =
@@ -413,6 +462,7 @@ init(Seed, Config) ->
         mode => Mode,
         window => Window,
         faults => maps:get(faults, Config, true),
+        watches => Watches,
         %% Whether ClusterControllers recruit the Sequencers of the run.
         controller => maps:get(controller, Config, false),
         %% Whether the workload cuts connections. With `controllers', it
@@ -475,7 +525,15 @@ start_storage(Tab, CState, {Mode, Window}, {Slot, N}, Generation) ->
         rollback => Mode =/= no_rollback,
         check_window => Mode =/= no_window_check,
         clear => Mode =/= no_clear andalso not (Mode =:= one_no_clear andalso Slot =:= 2),
-        wait => Mode =/= no_wait
+        wait => Mode =/= no_wait,
+        watch_trigger => Mode =/= watch_no_trigger,
+        %% The time limit of a watch. See "Runs with watches".
+        watch_timeout_ms =>
+            case ets:lookup(Tab, watches) of
+                [{watches, live}] -> infinity;
+                [{watches, true}] -> 300;
+                [] -> 30000
+            end
     }),
     Node = redwall_dst_client:storage_node({Slot, N}),
     true = ets:insert(Tab, [{{storage_started, {Slot, N}}, Storage}, {{storage, Slot}, Storage, Generation, Node}]),
@@ -494,11 +552,14 @@ storages(Tab) ->
 %% The first operation of a run is a recovery, which creates epoch 1.
 generate(#{n := 0}, Rand) ->
     {recover, Rand};
-generate(#{faults := Faults, cstate := CState}, Rand0) ->
+generate(#{faults := Faults, cstate := CState, watches := Watches}, Rand0) ->
     {Roll, Rand1} = rand:uniform_s(Rand0),
     {R, Rand2} = rand:uniform_s(1000, Rand1),
     Op =
         if
+            %% In a run with watches, 1 operation in 4 is a watch. Every
+            %% kind of run has a transaction for these values of `Roll'.
+            Watches =/= false, Roll >= 0.55, Roll < 0.80 -> {watch, R};
             %% With `faults => storage', the only fault is the kill of a
             %% StorageServer.
             Faults =:= storage, Roll < 0.08 -> recover;
@@ -529,6 +590,9 @@ generate(#{faults := Faults, cstate := CState}, Rand0) ->
         {transaction, R} ->
             {R2, Rand3} = rand:uniform_s(1000, Rand2),
             {{transaction, R, R2}, Rand3};
+        {watch, R} ->
+            {R2, Rand3} = rand:uniform_s(1000, Rand2),
+            {{watch, R, R2}, Rand3};
         _ ->
             {Op, Rand2}
     end.
@@ -672,6 +736,16 @@ execute({transaction, R1, R2}, N, S = #{tab := Tab}) ->
                 end,
             spawn_op(Node, fun() -> redwall_dst_client:transaction(Tab, N, Reader, Proxy, R1 + R2) end, S)
     end;
+execute({watch, R1, R2}, N, S = #{tab := Tab}) ->
+    %% A client with a watch. 1 client in 2 runs on the node of a
+    %% StorageServer that is alive, as the clients of the transactions do.
+    Local = [Node || [Storage, Node] <- lists:sort(ets:match(Tab, {{storage, '_'}, '$1', '_', '$2'})), is_process_alive(Storage)],
+    Node =
+        case {R1 rem 2, Local} of
+            {0, [_ | _]} -> pick(R2, Local);
+            _ -> clients
+        end,
+    spawn_op(Node, fun() -> redwall_dst_client:watch(Tab, N, R1 + R2) end, S);
 execute({Kill, R}, _N, S = #{tab := Tab, controller := true}) when Kill =:= kill_log; Kill =:= kill_sequencer; Kill =:= kill_proxy; Kill =:= kill_resolver ->
     %% With ClusterControllers, a kill stops the worker node of a role
     %% that runs, with every role on the node. The process of an epoch
@@ -736,6 +810,8 @@ execute({kill_storage, R}, N, S = #{tab := Tab, cstate := CState, mode := Mode, 
                 Observed = #{rollbacks := Rollbacks, copies := Copies} ->
                     bump(rollbacks, Rollbacks),
                     bump(storage_copies, Copies),
+                    bump(storage_watches_fired, maps:get(watches_fired, Observed, 0)),
+                    bump(storage_watches_timed_out, maps:get(watches_timed_out, Observed, 0)),
                     bump(storage_popped, maps:get(popped, Observed, 0));
                 _ ->
                     ok
@@ -802,8 +878,35 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> mapped_range_agrees(Tab) end,
         fun() -> range_options_agree(Tab) end,
         fun() -> own_writes(Tab) end,
-        fun() -> coordinators_agree(Tab) end
+        fun() -> coordinators_agree(Tab) end,
+        fun() -> watches(Tab) end
     ]).
+
+%% `watch_change' and `watch_error'. A client with a watch records a
+%% violation in the table of the run. See "Runs with watches".
+watches(Tab) ->
+    case lists:sort(ets:match(Tab, {{watch_violation, '_'}, '$1'})) of
+        [] -> ok;
+        [[Detail = #{property := Property}] | _] -> violation(Property, Detail)
+    end.
+
+%% `watch_fires': the future of a watch is ready, if an acknowledged
+%% transaction set the key of the watch at a commit version above the
+%% version of the watch. The harness checks it at the end of a run with
+%% `watches => live'.
+watch_fires(Tab) ->
+    Watches = [{C, Watch} || [C, Watch] <- lists:sort(ets:match(Tab, {{watch, '$1'}, '$2'}))],
+    Sets = [{Key, Version} || {_C, #{set := true, key := Key, version := Version}} <- Watches],
+    Late = [
+        {C, Watch}
+     || {C, Watch = #{key := Key, version := Version}} <- Watches,
+        not ets:member(Tab, {watch_fired, C}),
+        lists:any(fun({K, V}) -> K =:= Key andalso V > Version end, Sets)
+    ],
+    case Late of
+        [] -> ok;
+        [{C, Watch} | _] -> violation(watch_fires, #{client => C, watch => Watch, not_ready => length(Late)})
+    end.
 
 %% A `select/4' of a client returned the result of the match spec on the
 %% result of `get_range/3' at the same read version.
@@ -925,6 +1028,8 @@ check_final(_Settled, #{tab := Tab, cstate := CState, controller := true, last_o
         _ ->
             violation(leader, #{term => Term, leaders => [T || {T, _, _} <- Leaders]})
     end;
+check_final(_Settled, #{tab := Tab, watches := live}) ->
+    watch_fires(Tab);
 check_final(_Settled, _State) ->
     ok.
 
@@ -934,6 +1039,8 @@ check_final(_Settled, _State) ->
 %% limit.
 settle_done(State = #{controller := true, last_op := Last}) when is_integer(Last) ->
     check_final(settle_done, State) =:= ok;
+settle_done(#{tab := Tab, watches := live}) ->
+    watch_fires(Tab) =:= ok;
 settle_done(_State) ->
     false.
 
@@ -945,6 +1052,9 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
                 Observed = #{rollbacks := Rollbacks, copies := Copies} ->
                     bump(rollbacks, Rollbacks),
                     bump(storage_copies, Copies),
+                    %% The answers of the StorageServers to watches.
+                    bump(storage_watches_fired, maps:get(watches_fired, Observed, 0)),
+                    bump(storage_watches_timed_out, maps:get(watches_timed_out, Observed, 0)),
                     %% The answers `popped' of a LogServer with a popped
                     %% version above the version of the StorageServer.
                     bump(storage_popped, maps:get(popped, Observed, 0));
@@ -1018,6 +1128,21 @@ record_stats(Tab) ->
     [
         bump(Counter, case ets:lookup(Tab, Counter) of [{Counter, Count}] -> Count; [] -> 0 end)
      || Counter <- [own_mapped_reads, own_write_checks, on_errors]
+    ],
+    %% The watches: the committed ones, the ready futures, the reads
+    %% after a ready future, the futures with the error of a failed
+    %% commit, the futures that were not ready in the time of the client,
+    %% and the clients whose first read failed.
+    [
+        bump(Stat, length(ets:match(Tab, {{Row, '_'}, '_'})))
+     || {Stat, Row} <- [
+            {watches, watch},
+            {watches_ready, watch_fired},
+            {watch_rereads, watch_checked},
+            {watch_commit_errors, watch_error},
+            {watches_not_ready, watch_pending},
+            {watch_no_read, watch_no_read}
+        ]
     ],
     bump(runs_with_two_leaders, length(ets:lookup(Tab, two_leaders))),
     bump(leaders, length(ets:match(Tab, {{leader, '_'}, '_'}))),

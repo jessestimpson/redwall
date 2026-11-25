@@ -8,9 +8,23 @@
   iterator. A database with the kind `any` has no key selectors. A key
   selector in a database with the kind `binary` does not find a key at
   or above `<<255>>`. The client has no atomic operations, no
-  versionstamped keys and values, no watches, no transaction options, no
+  versionstamped keys and values, no transaction options, no
   tenants and no `get_last_error/0`. It has the tuple layer, but no subspaces
   and no directory layer.
+- Each watch has a process in the client and a request at one
+  StorageServer. Two watches of one database on one key do not share a
+  request, as they do in FoundationDB.
+- A watch ends when the process that receives its message ends. The
+  client does not learn that an application has dropped a future.
+- Only the process that receives the message of a watch can wait for
+  its future with `wait/1,2`.
+- A StorageServer does not learn the stop of a client with a watch. It
+  removes the request of the watch after `watch_timeout_ms`.
+- The simulation with watches and a check that every watch becomes
+  ready has no faults. In the runs with faults, a client waits for
+  3,000 ms, and the simulation checks only a future that is ready.
+- The model of the watch has one key, one watch and one StorageServer.
+  It is not composed with the model of the recovery.
 - A database of the client is a Proxy and a list of StorageServers that
   the caller names. redwall has no process that tells a client which
   Proxy and which StorageServers run.
@@ -117,8 +131,8 @@
   `pop_storages` StorageServers. Otherwise the memory of a LogServer
   grows with every record. See [Pop](log-server.md#pop).
 - The number of records that wait in a LogServer has no limit.
-- The model of the recovery and the model of the Resolver are separate.
-  No model has both.
+- The model of the recovery, the model of the Resolver and the model of
+  the watch are separate. No model has two of the three.
 - The models have no keys and values in the StorageServer, no tags, no
   clock and no election of a ClusterController. The model of the Resolver
   has a key range as a set of keys, without the bounds.

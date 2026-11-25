@@ -18,7 +18,9 @@ storage_test_() ->
         fun(Ids) -> {timeout, 30, fun() -> many_versions(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> copy(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> pop(Ids) end} end,
-        fun(Ids) -> {timeout, 60, fun() -> reset(Ids) end} end
+        fun(Ids) -> {timeout, 60, fun() -> reset(Ids) end} end,
+        fun(Ids) -> {timeout, 60, fun() -> watches(Ids) end} end,
+        fun(Ids) -> {timeout, 60, fun() -> watch_limits(Ids) end} end
     ]}.
 
 setup() ->
@@ -299,6 +301,119 @@ rollback(Ids) ->
     {ok, 1003} = redwall_epoch:commit(P2, #{writes => [{y, 2}]}),
     ?assertEqual({ok, 1}, redwall_storage:read(Storage, x, 1003)),
     ?assertMatch(#{version := 1003, epoch := 2, rollbacks := 1}, redwall_storage:info(Storage)).
+
+%% Starts a process that sends a watch to the StorageServer, and sends
+%% the answer to the caller.
+watcher(Storage, Key, Value, Version) ->
+    Self = self(),
+    spawn_link(fun() -> Self ! {self(), redwall_storage:watch_value(Storage, Key, Value, Version, 10000)} end).
+
+answer(Watcher) ->
+    receive
+        {Watcher, Answer} -> Answer
+    after 5000 -> error(no_answer)
+    end.
+
+no_answer(Watcher) ->
+    receive
+        {Watcher, Answer} -> error({answer, Answer})
+    after 100 -> ok
+    end.
+
+%% Waits until the StorageServer keeps `Count' watches.
+await_watches(Storage, Count) ->
+    await_watches(Storage, Count, 500).
+
+await_watches(Storage, Count, 0) ->
+    error({watches, Count, redwall_storage:info(Storage)});
+await_watches(Storage, Count, N) ->
+    case redwall_storage:info(Storage) of
+        #{watches := Count} ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            await_watches(Storage, Count, N - 1)
+    end.
+
+%% A watch is answered when the value of its key differs from its value
+%% at a version of the StorageServer at or above its version.
+watches(Ids) ->
+    {P1, [L1, L2, _L3]} = epoch(Ids),
+    Storage = storage(Ids),
+    {ok, 2} = redwall_epoch:commit(P1, #{writes => [{x, w}]}),
+    ok = await_version(Storage, 2),
+    %% The value differs at once: another value, a key with a value for a
+    %% watch without one, and a key without a value for a watch with one.
+    ?assertEqual({ok, 2}, redwall_storage:watch_value(Storage, x, {ok, other}, 2, 1000)),
+    ?assertEqual({ok, 2}, redwall_storage:watch_value(Storage, x, not_found, 0, 1000)),
+    ?assertEqual({ok, 2}, redwall_storage:watch_value(Storage, y, {ok, 1}, 2, 1000)),
+    %% Three watches whose value does not differ. The third one has a
+    %% version that the StorageServer has not applied.
+    A = watcher(Storage, x, {ok, w}, 2),
+    B = watcher(Storage, y, not_found, 2),
+    C = watcher(Storage, x, {ok, w}, 4),
+    ok = await_watches(Storage, 3),
+    %% A set of the key to the same value answers no watch.
+    {ok, 3} = redwall_epoch:commit(P1, #{writes => [{x, w}]}),
+    ok = await_version(Storage, 3),
+    [ok = no_answer(Watcher) || Watcher <- [A, B, C]],
+    %% A clear of a key range answers the watches on the keys of the range
+    %% that had a value.
+    {ok, 4} = redwall_epoch:commit(P1, #{mutations => [{clear_range, x, z}]}),
+    ?assertEqual({ok, 4}, answer(A)),
+    ?assertEqual({ok, 4}, answer(C)),
+    ok = no_answer(B),
+    {ok, 5} = redwall_epoch:commit(P1, #{writes => [{y, 1}]}),
+    ?assertEqual({ok, 5}, answer(B)),
+    ?assertMatch(#{watches := 0, watches_fired := 6, watches_timed_out := 0}, redwall_storage:info(Storage)),
+    %% A clear of the key answers a watch with a value.
+    D = watcher(Storage, y, {ok, 1}, 5),
+    ok = await_watches(Storage, 1),
+    {ok, 6} = redwall_epoch:commit(P1, #{mutations => [{clear, y}]}),
+    ?assertEqual({ok, 6}, answer(D)),
+    %% The record 9 of epoch 1 is on 2 of the 3 LogServers. It sets `x'
+    %% back to the value of the watch, so the watch is not answered. The
+    %% recovery discards the record. After the rollback the value differs,
+    %% and the StorageServer answers the watch.
+    {ok, 7} = redwall_epoch:commit(P1, #{writes => [{x, w}]}),
+    {ok, 8} = redwall_epoch:commit(P1, #{writes => [{x, z}]}),
+    [{ok, 9} = redwall_log:push(redwall_log:ref(L), 1, 8, 9, 8, {body, {batch, [[{set, x, w}]]}}) || L <- [L1, L2]],
+    ok = await_version(Storage, 9),
+    ?assertEqual({ok, w}, redwall_storage:read(Storage, x, 9)),
+    E = watcher(Storage, x, {ok, w}, 7),
+    ok = await_watches(Storage, 1),
+    ok = no_answer(E),
+    {P2, _} = epoch(Ids),
+    ?assertEqual({ok, 8}, answer(E)),
+    {ok, ReadVersion} = redwall_epoch:read_version(P2),
+    ?assertEqual({ok, z}, redwall_storage:read(Storage, x, ReadVersion)),
+    ?assertMatch(#{watches := 0, rollbacks := 1}, redwall_storage:info(Storage)).
+
+%% The time limit of a watch and the highest number of watches.
+watch_limits(Ids) ->
+    {P1, _Logs} = epoch(Ids),
+    {ok, Storage} = redwall_storage:start(#{coordinators => Ids, poll_ms => 5, watch_timeout_ms => 300, max_watches => 2}),
+    {ok, 2} = redwall_epoch:commit(P1, #{writes => [{x, w}]}),
+    ok = await_version(Storage, 2),
+    %% The value does not differ in the time limit. The same holds for a
+    %% watch with a version that the StorageServer does not reach.
+    ?assertEqual({error, timed_out}, redwall_storage:watch_value(Storage, x, {ok, w}, 2, 5000)),
+    ?assertEqual({error, timed_out}, redwall_storage:watch_value(Storage, x, {ok, w}, 50, 5000)),
+    ?assertMatch(#{watches := 0, watches_timed_out := 2}, redwall_storage:info(Storage)),
+    %% With 2 watches, the StorageServer answers `watch_cancelled' to a
+    %% watch whose value does not differ, and answers a watch whose value
+    %% differs.
+    A = watcher(Storage, x, {ok, w}, 2),
+    B = watcher(Storage, x, {ok, w}, 50),
+    ok = await_watches(Storage, 2),
+    ?assertEqual({error, watch_cancelled}, redwall_storage:watch_value(Storage, x, {ok, w}, 2, 5000)),
+    ?assertEqual({error, watch_cancelled}, redwall_storage:watch_value(Storage, x, {ok, w}, 60, 5000)),
+    ?assertEqual({ok, 2}, redwall_storage:watch_value(Storage, x, {ok, other}, 2, 5000)),
+    ?assertEqual({error, timed_out}, answer(A)),
+    ?assertEqual({error, timed_out}, answer(B)),
+    %% A StorageServer that is not alive.
+    ok = redwall_storage:stop(Storage),
+    ?assertMatch({error, _}, redwall_storage:watch_value(Storage, x, {ok, w}, 2, 1000)).
 
 %% A StorageServer that starts in the third epoch reads the records of the
 %% ended epochs from their LogServers.

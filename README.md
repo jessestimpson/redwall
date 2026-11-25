@@ -86,6 +86,8 @@ end).
 - **Range reads.** `redwall:get_range/4` has the options `limit` and
   `reverse` of erlfdb, and `redwall:get_key/2` resolves a key selector.
   The StorageServer reads only the keys of the result.
+- **Watches.** `redwall:watch/2` returns a future that becomes ready
+  when the value of a key changes, as a watch of FoundationDB does.
 - **Select.** `redwall:select/4` evaluates an ETS match spec on a key
   range in the StorageServer. FoundationDB has no such read.
 - **Mapped range read.** `redwall:get_mapped_range/4` reads the rows of
@@ -132,8 +134,8 @@ The design is in [docs](docs/README.md):
 | [docs/log-server.md](docs/log-server.md) | The LogServer and the pop |
 | [docs/recovery.md](docs/recovery.md) | The recovery, the versions, and the reset after the loss of LogServers |
 | [docs/transactions.md](docs/transactions.md) | The Proxy, the batches, the read versions and the Resolver |
-| [docs/storage-server.md](docs/storage-server.md) | The StorageServer, its store, select and the mapped range read |
-| [docs/client.md](docs/client.md) | The client, the kinds of key and the idempotency ids |
+| [docs/storage-server.md](docs/storage-server.md) | The StorageServer, its store, select, the mapped range read and the watches |
+| [docs/client.md](docs/client.md) | The client, the kinds of key, the watches and the idempotency ids |
 | [docs/cluster.md](docs/cluster.md) | The ClusterController, the start of a node, the coordinators and the status |
 | [docs/verification.md](docs/verification.md) | The simulation, its invariants and its results |
 | [docs/limitations.md](docs/limitations.md) | The complete list of limitations |
@@ -145,12 +147,12 @@ Each module also has its design in its module documentation.
 
 | Level | What it checks | Command | Time |
 |---|---|---|---|
-| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 123 tests | `make test` | 30 seconds |
-| Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 47 tests with about 1,700 seeds and 22 planted defects | `make dst` | about 4 minutes |
-| Model checking | Two TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer, and the Resolver. 10 planted bugs | `make tlc` | about 5 minutes |
+| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 128 tests | `make test` | 30 seconds |
+| Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 52 tests with about 1,900 seeds and 24 planted defects | `make dst` | about 4 minutes |
+| Model checking | Three TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer; the Resolver; and the watch. 13 planted bugs | `make tlc` | about 6 minutes |
 | Model checking | The recovery with 3 epochs | `make tlc-long` | about 4 hours |
 
-The simulation checks 19 invariants after every step, for example: no
+The simulation checks 21 invariants after every step, for example: no
 acknowledged transaction is lost by a recovery, no two acknowledged
 transactions conflict, and a read returns the last acknowledged write at
 or below its read version. See
@@ -203,8 +205,7 @@ The most important limitations are:
 - One process performs the conflict checks of an epoch. redwall cannot
   add Proxies or Resolvers.
 - The client has a part of the functions of erlfdb. It has no atomic
-  operations, no versionstamps, no
-  watches, no transaction options and no tenants.
+  operations, no versionstamps, no transaction options and no tenants.
 - redwall does not send a message again. A lost message to a LogServer
   stops the commits of the epoch until the next recovery.
 - The coordinators of a cluster cannot change.

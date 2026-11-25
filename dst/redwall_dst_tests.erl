@@ -333,6 +333,90 @@ pop_no_limit_is_found_test_() ->
         ?assertEqual(ok, maps:get(outcome, run(pop(Seed, correct))), {seed, Seed})
     end}.
 
+%% The runs with watches. See "Runs with watches" in `redwall_dst'.
+%%
+%% Runs without faults, in which a StorageServer and a request of a watch
+%% have no time limit. A future is then ready only after the answer of a
+%% StorageServer that the value differs. At the end of a run, the future
+%% of every watch with a later acknowledged set of its key is ready
+%% (`watch_fires'). 60 seeds.
+watch_calm_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 60), fun(Seed) -> watch_live(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("watch calm: ~p", [Stats]),
+        ok = write_stats({watch_calm, 1}, Stats),
+        ?assert(maps:get(watches, Stats, 0) > 300, Stats),
+        ?assert(maps:get(watches_ready, Stats, 0) > 200, Stats),
+        ?assert(maps:get(watch_rereads, Stats, 0) > 200, Stats),
+        ?assertEqual(0, maps:get(storage_watches_timed_out, Stats, 0), Stats)
+    end}.
+
+watch_live(Seed, Mode) ->
+    (opts(Seed, #{faults => false, watches => live, mode => Mode}))#{net => true, settle_steps => 20000}.
+
+%% Runs with kills, partitions, and lost and delayed messages. A
+%% StorageServer answers `timed_out' after 300 ms. 150 seeds.
+watch_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 150), fun(Seed) -> watch_faults(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("watch faults: ~p", [Stats]),
+        ok = write_stats({watch_faults, 1}, Stats),
+        ?assert(maps:get(watches, Stats, 0) > 100, Stats),
+        ?assert(maps:get(watches_ready, Stats, 0) > 30, Stats),
+        ?assert(maps:get(watch_commit_errors, Stats, 0) > 10, Stats),
+        ?assert(maps:get(storage_watches_timed_out, Stats, 0) > 30, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 5, Stats)
+    end}.
+
+watch_faults(Seed, Mode) ->
+    opts(Seed, #{watches => true, mode => Mode}).
+
+%% The same seed gives the same trace, the trace replays, and the audit
+%% of eta reports nothing, for the two kinds of runs with watches. 6 seeds
+%% each, 3 runs for each seed.
+watch_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Kinds = [fun(Seed) -> watch_live(Seed, correct) end, fun(Seed) -> watch_faults(Seed, correct) end],
+        lists:foreach(
+            fun({Kind, Seed}) ->
+                Opts = Kind(Seed),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                Replayed = eta_run:replay(redwall_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [{Kind, Seed} || Kind <- Kinds, Seed <- lists:seq(1, 6)]
+        )
+    end}.
+
+%% A planted defect: a StorageServer does not read the key of a watch
+%% when it applies a record. The future of a watch is then not ready
+%% after a later set of its key.
+watch_no_trigger_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 60), fun(Seed) -> watch_live(Seed, watch_no_trigger) end),
+        ?debugFmt("watch_no_trigger: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := watch_fires}, Violation),
+        ?assertEqual(ok, maps:get(outcome, run(watch_live(Seed, correct))), {seed, Seed})
+    end}.
+
+%% A planted defect: the client does not read the key after the answer
+%% of a StorageServer. A StorageServer answers for a record that a
+%% recovery discards, and the read after the ready future returns the
+%% value of the watch.
+watch_no_verify_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> watch_faults(Seed, watch_no_verify) end),
+        ?debugFmt("watch_no_verify: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := watch_change}, Violation),
+        ?assertEqual(ok, maps:get(outcome, run(watch_faults(Seed, correct))), {seed, Seed})
+    end}.
+
 %% A planted defect: the coordinated state accepts the proposal of a
 %% candidate with any term. Two candidates are the leader of one term.
 no_elect_cas_is_found_test_() ->

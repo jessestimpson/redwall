@@ -8,7 +8,7 @@
 
 -include("redwall_eta.hrl").
 
--export([recover/4, transaction/5, join/2, start_log/3]).
+-export([recover/4, transaction/5, watch/3, join/2, start_log/3]).
 -export([worker/5, force_recovery/1, worker_node/1, register_storage/4]).
 -export([sequencer_node/1, log_node/1, storage_node/1, keys/0]).
 -export([coordinators/1, coordinator_ids/0, coordinator_node/1, coordinator/3, form_cluster/2]).
@@ -327,6 +327,129 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             true = ets:insert(Tab, {{no_read_version, C}, ReaderEpoch})
     end.
 
+%% Creates one watch, and waits for its future. `C' is the number of the
+%% client, and `R' selects the key and the kind of the transaction. See
+%% "Runs with watches" in `redwall_dst'.
+%%
+%% <ul>
+%% <li>2 clients in 3 set the key to `{watch, C}' and create the watch in
+%%   the same transaction. The other clients read the key and create the
+%%   watch, in a transaction without a mutation.</li>
+%% <li>The Proxy of the database is the Proxy of the highest epoch that
+%%   runs, at the time of each request. The StorageServers are the
+%%   StorageServers of the table of the run at that time.</li>
+%% <li>After a commit, the client records the row `{watch, C}' with the
+%%   key, the value and the version of the watch. When the future is
+%%   ready, it records the row `{watch_fired, C}', and reads the key in
+%%   a new transaction. The value of the watch is then a violation of
+%%   `watch_change'.</li>
+%% <li>After a failed commit, the future must have the error of the
+%%   commit (`watch_error').</li>
+%% </ul>
+watch(Tab, C, R) ->
+    [{watches, Kind}] = ets:lookup(Tab, watches),
+    [{mode, Mode}] = ets:lookup(Tab, mode),
+    Key = watch_key(R rem 2 + 1),
+    Db = redwall:open(#{
+        proxy => fun() ->
+            case latest_proxy(Tab, none) of
+                {Proxy, _Epoch} -> Proxy;
+                none -> undefined
+            end
+        end,
+        storage => fun() -> storages(Tab) end,
+        direct => R rem 5 =/= 0,
+        watch_call_timeout_ms =>
+            case Kind of
+                live -> infinity;
+                true -> 1000
+            end,
+        watch_verify => Mode =/= watch_no_verify
+    }),
+    Tx = redwall:create_transaction(Db),
+    Sets = R rem 3 =/= 0,
+    try
+        Seen =
+            case Sets of
+                true ->
+                    ok = redwall:set(Tx, Key, {watch, C}),
+                    {watch, C};
+                false ->
+                    redwall:get(Tx, Key)
+            end,
+        {Seen, redwall:watch(Tx, Key)}
+    of
+        {Value, Future} ->
+            try redwall:commit(Tx) of
+                ok ->
+                    Version =
+                        case redwall:get_committed_version(Tx) of
+                            -1 -> redwall:get_read_version(Tx);
+                            LSN -> LSN
+                        end,
+                    true = ets:insert(Tab, {{watch, C}, #{key => Key, value => Value, version => Version, set => Sets}}),
+                    watch_wait(Tab, C, Db, Key, Value, Future, Kind)
+            catch
+                error:{erlfdb_error, Code} ->
+                    Got =
+                        try
+                            redwall:wait(Future, [{timeout, 1000}])
+                        catch
+                            error:{erlfdb_error, FutureCode} -> FutureCode;
+                            error:{timeout, _} -> timeout
+                        end,
+                    case Got of
+                        Code -> ets:insert(Tab, {{watch_error, C}, Code});
+                        _ -> ets:insert(Tab, {{watch_violation, C}, #{property => watch_error, client => C, commit => Code, future => Got}})
+                    end
+            end
+    catch
+        error:{erlfdb_error, Code} ->
+            %% The read of the key failed.
+            ets:insert(Tab, {{watch_no_read, C}, Code})
+    end.
+
+watch_wait(Tab, C, Db, Key, Value, Future, Kind) ->
+    Timeout =
+        case Kind of
+            live -> infinity;
+            true -> 3000
+        end,
+    try redwall:wait(Future, [{timeout, Timeout}]) of
+        ok ->
+            true = ets:insert(Tab, {{watch_fired, C}, true}),
+            case watch_reread(Db, Key, 10) of
+                {ok, Value} -> ets:insert(Tab, {{watch_violation, C}, #{property => watch_change, client => C, key => Key, value => Value}});
+                {ok, _Other} -> ets:insert(Tab, {{watch_checked, C}, true});
+                error -> true
+            end
+    catch
+        error:{timeout, _} ->
+            ok = redwall:cancel(Future),
+            ets:insert(Tab, {{watch_pending, C}, true});
+        error:{erlfdb_error, Code} ->
+            ets:insert(Tab, {{watch_violation, C}, #{property => watch_error, client => C, commit => ok, future => Code}})
+    end.
+
+%% Reads the key in a new transaction, for at most `Tries' attempts.
+watch_reread(_Db, _Key, 0) ->
+    error;
+watch_reread(Db, Key, Tries) ->
+    Tx = {redwall_transaction, Table} = redwall:create_transaction(Db),
+    try
+        {ok, redwall:get(redwall:snapshot(Tx), Key)}
+    catch
+        error:{erlfdb_error, _Code} ->
+            ok = timer:sleep(50),
+            watch_reread(Db, Key, Tries - 1)
+    after
+        ets:delete(Table)
+    end.
+
+%% The keys of the watches. They are not keys of the transactions of the
+%% workload, and no read range of the workload contains them.
+watch_key(I) -> redwall_tuple:pack({<<"w">>, I}).
+
 %% Reads the keys and the ranges through the client library, which reads
 %% the ETS table of the StorageServer in this process. The result has
 %% `{Key, not_found}' or `{Key, {Value, unknown}}' for each key, and for
@@ -458,9 +581,9 @@ range_options(Tab, {redwall_database, Servers}, ReadVersion, {Begin, End}, Found
         N = ets:update_counter(Tab, range_option_reads, 1, {range_option_reads, 0}),
         Limit = N rem 3 + 1,
         Backward = lists:reverse(Found),
-        %% Every key of the workload, for the keys of the selectors.
-        {From, To} = redwall_mapper:range(range, redwall_tuple:pack({<<"k">>})),
-        Keys = [Key || {Key, _Value} <- redwall:get_range(redwall:snapshot(Tx), From, To)],
+        %% Every key of the database, for the keys of the selectors. A
+        %% run with watches also has the keys of the watches.
+        Keys = [Key || {Key, _Value} <- redwall:get_range(redwall:snapshot(Tx), <<>>, <<255>>)],
         Expected = {
             Backward,
             lists:sublist(Found, Limit),

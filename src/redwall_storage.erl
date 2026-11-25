@@ -170,6 +170,70 @@
 %%
 %% The handle has the feature `scan'.
 %%
+%% == Watches ==
+%%
+%% A watch is a request that the StorageServer answers when the value of
+%% a key differs from a value (`watch_value/5'). The request is the
+%% `WatchValueRequest' of FoundationDB 7.3 (`watchValueSendReply' and
+%% `watchWaitForValueChange' of `fdbserver/storageserver.actor.cpp'). The
+%% client of redwall sends the request after the commit of a transaction
+%% with a watch (see "Watches" in {@link redwall}).
+%%
+%% The request has a key, a value and a version. The value is `{ok, Value}',
+%% or `not_found' for a key without a value.
+%%
+%% <ol>
+%% <li>The StorageServer keeps the request until its version is at or
+%%   above the version of the request.</li>
+%% <li>The StorageServer reads the key at its version. If the value
+%%   differs from the value of the request, the StorageServer answers
+%%   `{ok, Version}' with its version.</li>
+%% <li>Otherwise the StorageServer keeps the request in an ETS table of
+%%   type `ordered_set' with the key `{Key, Reference}'. When the
+%%   StorageServer applies a record with a set or a clear of the key, or
+%%   with a clear of a key range that contains the key, it reads the key
+%%   again after the record, as in step 2.</li>
+%% <li>After `watch_timeout_ms' (default 30,000, `WATCH_TIMEOUT' of
+%%   FoundationDB) the StorageServer answers `{error, timed_out}' and
+%%   removes the request. The client sends a new request. A request of a
+%%   client that has stopped therefore leaves the StorageServer.</li>
+%% <li>With `max_watches' requests (default 100,000), the StorageServer
+%%   answers `{error, watch_cancelled}' to a new request whose value does
+%%   not differ. The client then asks again at an interval.</li>
+%% </ol>
+%%
+%% The StorageServer compares with the value at its version. That version
+%% can be the LSN of a record that a recovery discards later, so an answer
+%% `{ok, Version}' is not a proof of a committed change. The client
+%% confirms the change with a read at a read version.
+%%
+%% <ul>
+%% <li>After a rollback, the StorageServer reads the key of every request
+%%   again. A discarded record can be the reason that a value did not
+%%   differ.</li>
+%% <li>A StorageServer that removes its data, for a copy from a peer or
+%%   after a reset of the database, answers `{error, not_ready}' to every
+%%   request.</li>
+%% </ul>
+%%
+%% Departures from FoundationDB:
+%%
+%% <ul>
+%% <li>The StorageServer keeps one entry for each request. FoundationDB
+%%   keeps one entry for each key, and the requests for the key share the
+%%   entry. A request with another value and a higher version then
+%%   answers the earlier requests.</li>
+%% <li>The limit is a number of requests. The limit of FoundationDB is a
+%%   number of bytes (`MAX_STORAGE_SERVER_WATCH_BYTES').</li>
+%% <li>FoundationDB uses a shorter time limit of 20 seconds while a
+%%   StorageServer has no recent update (`FAST_WATCH_TIMEOUT'). redwall
+%%   has one time limit.</li>
+%% </ul>
+%%
+%% `watch_trigger => false' plants a defect for the simulation: the
+%% StorageServer does not read the key of a request when it applies a
+%% record.
+%%
 %% == Copy from another StorageServer ==
 %%
 %% A StorageServer with the option `peers' that starts without data copies
@@ -395,13 +459,14 @@
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
--eta_observe({state, [version, oldest, data, history, rollbacks, copies, resets, popped]}).
+-eta_observe({state, [version, oldest, data, history, rollbacks, copies, resets, popped, watching, watches_fired, watches_timed_out]}).
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1, stored/2]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([handle/1, read_direct/3, versions/1]).
--export([select/7, select_rows/2, mapped_range/7, scan/6]).
+-export([select/7, select_rows/2, mapped_range/7, scan/6, watch_value/5, watch_request/4]).
+-export_type([watched/0]).
 -export_type([bound/0, scan_options/0]).
 -export_type([mapped_row/0]).
 -export_type([handle/0, query/0]).
@@ -429,6 +494,12 @@
     check_window => boolean(),
     clear => boolean(),
     wait => boolean(),
+    %% The time after which the StorageServer answers `timed_out' to a
+    %% watch, and the highest number of watches. See "Watches" in the
+    %% module documentation. `watch_trigger => false' plants a defect.
+    watch_timeout_ms => pos_integer() | infinity,
+    max_watches => non_neg_integer(),
+    watch_trigger => boolean(),
     %% A registered name for the StorageServer, so that a StorageServer of
     %% another node can name it as a peer: `{Name, Node}'.
     name => atom(),
@@ -454,6 +525,10 @@
     wait => boolean(),
     features => [select | mapped_range | scan]
 }.
+
+%% The value of a watch: the value of the key, or `not_found' for a key
+%% without a value.
+-type watched() :: {ok, term()} | not_found.
 
 %% A bound of a scan: the key is in the range (`incl') or is not (`excl').
 -type bound() :: {incl, term()} | {excl, term()}.
@@ -532,6 +607,23 @@
     stopped = [] :: [redwall_log:id()],
     %% The reads that wait for a version.
     waiting = [] :: [{gen_server:from(), {key, term()} | {range, term(), term()}, version()}],
+    %% The watches. See "Watches" in the module documentation. `watches'
+    %% is the ETS table of the watches whose value did not differ at the
+    %% last read of the key, with the rows
+    %% `{{Key, Reference}, Value, Version, From, Timer}'. `watching' is
+    %% the number of its rows. `watch_waiting' has the watches that wait
+    %% for a version of the StorageServer:
+    %% `{Reference, Key, Value, Version, From, Timer}'.
+    watches :: ets:tid(),
+    watching = 0 :: non_neg_integer(),
+    watch_waiting = [] :: [{reference(), term(), watched(), version(), gen_server:from() | {watch_request, pid(), reference()}, reference() | undefined}],
+    watch_timeout_ms :: pos_integer() | infinity,
+    max_watches :: non_neg_integer(),
+    watch_trigger :: boolean(),
+    %% The number of answers `{ok, Version}' and of answers `timed_out' to
+    %% a watch.
+    watches_fired = 0 :: non_neg_integer(),
+    watches_timed_out = 0 :: non_neg_integer(),
     %% The number of rollbacks.
     rollbacks = 0 :: non_neg_integer(),
     %% The peers, and the copy in progress: `probe' before a peer has
@@ -579,6 +671,10 @@
 -define(CSTATE_TIMEOUT_MS, 1000).
 %% The StorageServer sends every request again at each tenth interval.
 -define(RESEND_TICKS, 10).
+%% WATCH_TIMEOUT of `fdbclient/ClientKnobs.cpp', in milliseconds, and the
+%% highest number of watches.
+-define(WATCH_TIMEOUT_MS, 30000).
+-define(MAX_WATCHES, 100000).
 
 %% ---------------------------------------------------------------------------
 %% Client
@@ -673,6 +769,42 @@ scan(Storage, From, To, Options, Version, Timeout) ->
     catch
         exit:Reason -> {error, Reason}
     end.
+
+%% @doc Waits until the value of `Key' differs from `Value' at a version
+%% of the StorageServer at or above `Version'. See "Watches" in the module
+%% documentation. The results are:
+%%
+%% <ul>
+%% <li>`{ok, Changed}': the value differs at the version `Changed' of the
+%%   StorageServer. A recovery can discard the record `Changed'.</li>
+%% <li>`{error, timed_out}': the value did not differ in the time
+%%   `watch_timeout_ms' of the StorageServer.</li>
+%% <li>`{error, watch_cancelled}': the StorageServer has `max_watches'
+%%   watches.</li>
+%% <li>`{error, not_ready}': the StorageServer has removed its data.</li>
+%% <li>`{error, Reason}': the StorageServer is not alive, or did not
+%%   answer in `Timeout'.</li>
+%% </ul>
+%%
+%% `watch_request/4' sends the same request and does not wait.
+-spec watch_value(gen_server:server_ref(), term(), watched(), version(), timeout()) -> {ok, version()} | {error, term()}.
+watch_value(Storage, Key, Value, Version, Timeout) ->
+    try
+        gen_server:call(Storage, {watch, Key, Value, Version}, Timeout)
+    catch
+        exit:Reason -> {error, Reason}
+    end.
+
+%% @doc Sends a watch to the StorageServer, and returns the tag of the
+%% request. The caller receives the answer of `watch_value/5' in the
+%% message `{redwall_watch_answer, Tag, Answer}'. The tag is a monitor of
+%% the StorageServer, so the caller receives `{'DOWN', Tag, process, _,
+%% Reason}' if the StorageServer is not alive.
+-spec watch_request(gen_server:server_ref(), term(), watched(), version()) -> reference().
+watch_request(Storage, Key, Value, Version) ->
+    Tag = monitor(process, Storage),
+    ok = gen_server:cast(Storage, {watch, {watch_request, self(), Tag}, Key, Value, Version}),
+    Tag.
 
 %% @doc Evaluates a match spec on the keys of the range `{Begin, End}' at
 %% the read version `Version'. See "Select" in the module documentation.
@@ -771,6 +903,11 @@ read_direct(Handle = #{data := Data0, history := History, published := Published
         %% version above the version of the StorageServer. See "Pop" in
         %% the module documentation.
         popped := non_neg_integer(),
+        %% The number of watches that the StorageServer keeps, and the
+        %% numbers of answers `{ok, Version}' and `timed_out' to a watch.
+        watches := non_neg_integer(),
+        watches_fired := non_neg_integer(),
+        watches_timed_out := non_neg_integer(),
         %% The ETS table of the data. See "Store" in the module
         %% documentation.
         data := ets:tid(),
@@ -808,6 +945,10 @@ init(Options = #{coordinators := Coordinators}) ->
         data = ets:new(redwall_storage_data, [ordered_set, protected, {read_concurrency, true}]),
         history = ets:new(redwall_storage_history, [ordered_set, protected, {read_concurrency, true}]),
         changes = ets:new(redwall_storage_changes, [ordered_set, private]),
+        watches = ets:new(redwall_storage_watches, [ordered_set, private]),
+        watch_timeout_ms = maps:get(watch_timeout_ms, Options, ?WATCH_TIMEOUT_MS),
+        max_watches = maps:get(max_watches, Options, ?MAX_WATCHES),
+        watch_trigger = maps:get(watch_trigger, Options, true),
         buffer = gb_trees:empty(),
         published = atomics:new(3, [{signed, true}]),
         requests = gen_server:reqids_new(),
@@ -881,7 +1022,7 @@ handle_continue({probed, Answer, Probe}, State) ->
             true = ets:delete_all_objects(State#state.data),
             true = ets:delete_all_objects(State#state.history),
             true = ets:delete_all_objects(State#state.changes),
-            State1 = State#state{
+            State1 = (watch_drop(State))#state{
                 copy = #{peer => Peer, ref => Ref, version => Version, next => first},
                 version = 0,
                 oldest = Version,
@@ -980,6 +1121,8 @@ handle_call({select, Begin, End, MatchSpec, Limit, Version}, From, State) ->
     read_at({select, Begin, End, MatchSpec, Limit}, Version, From, State);
 handle_call({mapped, Begin, End, Mapper, Limit, Version}, From, State) ->
     read_at({mapped, Begin, End, Mapper, Limit}, Version, From, State);
+handle_call({watch, Key, Value, Version}, From, State) ->
+    {noreply, watch_add(Key, Value, Version, From, State)};
 handle_call(handle, _From, State) ->
     {reply, handle_of(State), State};
 handle_call(copy_start, _From, State = #state{copy = Copy}) when is_map(Copy) ->
@@ -1038,6 +1181,9 @@ handle_call(info, _From, State = #state{version = Version, system = System, roll
         copying => State#state.copy =/= undefined,
         resets => State#state.resets,
         popped => State#state.popped,
+        watches => State#state.watching + length(State#state.watch_waiting),
+        watches_fired => State#state.watches_fired,
+        watches_timed_out => State#state.watches_timed_out,
         data => State#state.data,
         history => State#state.history
     },
@@ -1048,6 +1194,8 @@ handle_call(stop, _From, State) ->
 %% @private
 handle_cast({copy_done, Ref}, State) ->
     {noreply, advance_oldest(unpin(Ref, State))};
+handle_cast({watch, From = {watch_request, _Pid, _Tag}, Key, Value, Version}, State) ->
+    {noreply, watch_add(Key, Value, Version, From, State)};
 handle_cast(_Message, State) ->
     {noreply, State}.
 
@@ -1069,6 +1217,8 @@ handle_info(copy, State) ->
     {noreply, State};
 handle_info({unpin, Ref}, State) ->
     {noreply, advance_oldest(unpin(Ref, State))};
+handle_info({watch_timeout, Key, Ref}, State) ->
+    {noreply, watch_timeout(Key, Ref, State)};
 handle_info(poll, State = #state{poll_ms = PollMs, system = System, stopped = Stopped}) ->
     %% The StorageServer also reads the coordinated state at every tenth
     %% interval. A LogServer of an ended epoch that does not run, or that
@@ -1192,7 +1342,7 @@ generation(#{generation := Generation}, State = #state{generation = Mine, copy =
     true = ets:delete_all_objects(State#state.changes),
     ok = atomics:put(State#state.published, 2, 0),
     lists:foreach(fun({From, _Query, _Version}) -> gen_server:reply(From, {error, transaction_too_old}) end, State#state.waiting),
-    State#state{
+    (watch_drop(State))#state{
         generation = Generation,
         resets = State#state.resets + 1,
         version = 0,
@@ -1249,7 +1399,9 @@ rollback(End, State = #state{rollback = false}) ->
 rollback(End, State = #state{changes = Changes, rollbacks = Rollbacks}) ->
     ok = atomics:put(State#state.published, 1, End),
     ok = remove_above(End, ets:last(Changes), State),
-    State#state{version = End, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1}.
+    %% A removed write can be the reason that the value of a watch did not
+    %% differ, so the StorageServer reads the key of every watch again.
+    watch_ready(watch_requeue(State#state{version = End, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1})).
 
 %% Removes the versions above `End', from the highest version down. The
 %% oldest version is at or below `End', so the table of the versions has a
@@ -1378,7 +1530,7 @@ apply_records(State = #state{version = Version, buffer = Buffer}) ->
                     %% The rows are written before the version is published.
                     ok = atomics:put(State#state.published, 1, LSN),
                     State1 = State#state{version = LSN, buffer = gb_trees:delete(LSN, Buffer)},
-                    apply_records(State1);
+                    apply_records(watch_trigger(Body, State1));
                 _BodyNotReceivedOrPreviousRecordNotReceived ->
                     answer_waiting(State)
             end
@@ -1534,7 +1686,7 @@ read_at(Query, Version, From, State = #state{waiting = Waiting}) ->
 answer_waiting(State = #state{version = Version, waiting = Waiting}) ->
     {Ready, Later} = lists:partition(fun({_From, _Query, V}) -> V =< Version end, Waiting),
     lists:foreach(fun({From, Query, V}) -> answer(From, Query, V, State) end, Ready),
-    State#state{waiting = Later}.
+    watch_ready(State#state{waiting = Later}).
 
 %% Answers a read at a version that the StorageServer has applied. A
 %% select and a mapped range read can read many rows, so a temporary
@@ -1557,6 +1709,180 @@ answer(From, Query, Version, State) when element(1, Query) =:= select; element(1
 answer(From, Query, Version, State) ->
     gen_server:reply(From, lookup(Query, Version, {State#state.data, State#state.history})),
     ok.
+
+%% ---------------------------------------------------------------------------
+%% Watches
+%% ---------------------------------------------------------------------------
+
+%% A new watch. See "Watches" in the module documentation.
+watch_add(Key, Value, Version, From, State = #state{version = Mine, copy = undefined}) when Version =< Mine ->
+    case watch_differs(Key, Value, State) of
+        true ->
+            watch_reply(From, {ok, Mine}),
+            State#state{watches_fired = State#state.watches_fired + 1};
+        false ->
+            case watch_full(State) of
+                true ->
+                    watch_reply(From, {error, watch_cancelled}),
+                    State;
+                false ->
+                    Ref = make_ref(),
+                    watch_keep(Ref, Key, Value, Version, From, watch_timer(Key, Ref, State), State)
+            end
+    end;
+watch_add(Key, Value, Version, From, State = #state{watch_waiting = Waiting}) ->
+    %% The StorageServer has not applied the version of the watch, or it
+    %% copies from a peer.
+    case watch_full(State) of
+        true ->
+            watch_reply(From, {error, watch_cancelled}),
+            State;
+        false ->
+            Ref = make_ref(),
+            State#state{watch_waiting = [{Ref, Key, Value, Version, From, watch_timer(Key, Ref, State)} | Waiting]}
+    end.
+
+%% Sends the answer to a watch: to the caller of `watch_value/5', or to
+%% the process of `watch_request/4'.
+watch_reply({watch_request, Pid, Tag}, Answer) ->
+    Pid ! {redwall_watch_answer, Tag, Answer},
+    ok;
+watch_reply(From, Answer) ->
+    gen_server:reply(From, Answer),
+    ok.
+
+watch_full(#state{watching = Watching, watch_waiting = Waiting, max_watches = Max}) ->
+    Watching + length(Waiting) >= Max.
+
+watch_timer(_Key, _Ref, #state{watch_timeout_ms = infinity}) ->
+    undefined;
+watch_timer(Key, Ref, #state{watch_timeout_ms = Ms}) ->
+    erlang:send_after(Ms, self(), {watch_timeout, Key, Ref}).
+
+%% Whether the value of the key at the version of the StorageServer
+%% differs from the value of a watch.
+watch_differs(Key, Value, #state{version = Version, data = Data, history = History}) ->
+    Now =
+        case lookup({key, Key}, Version, {Data, History}) of
+            {ok, Stored, _Written} -> {ok, Stored};
+            not_found -> not_found
+        end,
+    Now =/= Value.
+
+%% Adds a watch whose value does not differ to the table of the watches.
+watch_keep(Ref, Key, Value, Version, From, Timer, State = #state{watches = Watches, watching = Watching}) ->
+    true = ets:insert(Watches, {{Key, Ref}, Value, Version, From, Timer}),
+    State#state{watching = Watching + 1}.
+
+%% Handles the watches that have waited for a version at or below the
+%% version of the StorageServer: an answer, or a row in the table of the
+%% watches.
+watch_ready(State = #state{watch_waiting = []}) ->
+    State;
+watch_ready(State = #state{copy = Copy}) when Copy =/= undefined ->
+    State;
+watch_ready(State = #state{version = Mine, watch_waiting = Waiting}) ->
+    {Ready, Later} = lists:partition(fun({_Ref, _Key, _Value, Version, _From, _Timer}) -> Version =< Mine end, Waiting),
+    lists:foldl(
+        fun({Ref, Key, Value, Version, From, Timer}, Acc) ->
+            case watch_differs(Key, Value, Acc) of
+                true -> watch_answer(From, Timer, Acc);
+                false -> watch_keep(Ref, Key, Value, Version, From, Timer, Acc)
+            end
+        end,
+        State#state{watch_waiting = Later},
+        %% The order of the requests.
+        lists:reverse(Ready)
+    ).
+
+%% Answers a watch whose value differs.
+watch_answer(From, Timer, State = #state{version = Mine, watches_fired = Fired}) ->
+    _ = Timer =/= undefined andalso erlang:cancel_timer(Timer),
+    watch_reply(From, {ok, Mine}),
+    State#state{watches_fired = Fired + 1}.
+
+%% Reads the key of each watch that a mutation of the applied record
+%% names. With the planted defect `watch_trigger => false' the function
+%% does nothing.
+watch_trigger({batch, Entries}, State = #state{watching = Watching, watch_trigger = true, watches = Watches}) when Watching > 0 ->
+    Named = lists:usort(lists:append([watch_named(Mutation, Watches) || Entry <- Entries, is_list(Entry), Mutation <- Entry])),
+    lists:foldl(
+        fun(Id = {Key, _Ref}, Acc) ->
+            case ets:lookup(Watches, Id) of
+                [{Id, Value, _Version, From, Timer}] ->
+                    case watch_differs(Key, Value, Acc) of
+                        true ->
+                            true = ets:delete(Watches, Id),
+                            watch_answer(From, Timer, Acc#state{watching = Acc#state.watching - 1});
+                        false ->
+                            Acc
+                    end;
+                [] ->
+                    Acc
+            end
+        end,
+        State,
+        Named
+    );
+watch_trigger(_Body, State) ->
+    State.
+
+%% The ids `{Key, Reference}' of the watches on the key of a mutation, or
+%% on the keys of a cleared range. The rows of a key are next to each
+%% other in the table, because a number is below a reference in the order
+%% of Erlang terms.
+watch_named({clear_range, Begin, End}, Watches) ->
+    watch_ids(ets:next(Watches, {Begin, 0}), fun(Key) -> Key < End end, Watches);
+watch_named(Mutation, Watches) when tuple_size(Mutation) >= 2 ->
+    Key = element(2, Mutation),
+    watch_ids(ets:next(Watches, {Key, 0}), fun(Other) -> Other == Key end, Watches);
+watch_named(_Other, _Watches) ->
+    [].
+
+watch_ids(Id = {Key, _Ref}, Within, Watches) ->
+    case Within(Key) of
+        true -> [Id | watch_ids(ets:next(Watches, Id), Within, Watches)];
+        false -> []
+    end;
+watch_ids('$end_of_table', _Within, _Watches) ->
+    [].
+
+%% Moves every watch of the table to the watches that wait for a version.
+watch_requeue(State = #state{watching = 0}) ->
+    State;
+watch_requeue(State = #state{watches = Watches, watch_waiting = Waiting}) ->
+    Rows = [{Ref, Key, Value, Version, From, Timer} || {{Key, Ref}, Value, Version, From, Timer} <- ets:tab2list(Watches)],
+    true = ets:delete_all_objects(Watches),
+    State#state{watching = 0, watch_waiting = Rows ++ Waiting}.
+
+%% Answers `not_ready' to every watch. The StorageServer removes its
+%% data.
+watch_drop(State0) ->
+    State = #state{watch_waiting = Waiting} = watch_requeue(State0),
+    lists:foreach(
+        fun({_Ref, _Key, _Value, _Version, From, Timer}) ->
+            _ = Timer =/= undefined andalso erlang:cancel_timer(Timer),
+            watch_reply(From, {error, not_ready})
+        end,
+        Waiting
+    ),
+    State#state{watch_waiting = []}.
+
+%% The time limit of a watch has passed.
+watch_timeout(Key, Ref, State = #state{watches = Watches, watch_waiting = Waiting, watches_timed_out = Count}) ->
+    case ets:take(Watches, {Key, Ref}) of
+        [{_Id, _Value, _Version, From, _Timer}] ->
+            watch_reply(From, {error, timed_out}),
+            State#state{watching = State#state.watching - 1, watches_timed_out = Count + 1};
+        [] ->
+            case lists:keytake(Ref, 1, Waiting) of
+                {value, {Ref, _Key, _Value, _Version, From, _Timer}, Rest} ->
+                    watch_reply(From, {error, timed_out}),
+                    State#state{watch_waiting = Rest, watches_timed_out = Count + 1};
+                false ->
+                    State
+            end
+    end.
 
 %% Ends a copy that another StorageServer reads from this one.
 unpin(Ref, State = #state{pins = Pins}) ->

@@ -198,6 +198,52 @@ guards for the range reads every row of the table: about 20 ms for a
 range of 100 keys, against 6 us for the walk. The owner of the project
 chose the walk.
 
+## Watches
+
+A watch is a request with a key, a value and a version
+(`redwall_storage:watch_value/5`). It is the `WatchValueRequest` of
+FoundationDB 7.3.62. The client sends it after the commit of a
+transaction with a watch. See [Watches](client.md#watches).
+
+1. The StorageServer keeps the request until its version is at or above
+   the version of the request.
+2. The StorageServer reads the key at its version. If the value differs
+   from the value of the request, it answers `{ok, Version}` with its
+   version.
+3. Otherwise it keeps the request in an ETS table of the type
+   `ordered_set` with the key `{Key, Reference}`. When it applies a
+   record with a set or a clear of the key, or with a clear of a key
+   range that contains the key, it reads the key again.
+4. After `watch_timeout_ms` (default 30,000, `WATCH_TIMEOUT` of
+   FoundationDB), it answers `{error, timed_out}` and removes the
+   request. A request of a client that has stopped therefore leaves the
+   StorageServer.
+5. With `max_watches` requests (default 100,000), it answers
+   `{error, watch_cancelled}` to a new request whose value does not
+   differ.
+
+- The version of the StorageServer can be the LSN of a record that a
+  recovery discards. An answer `{ok, Version}` is therefore not a proof
+  of a committed change, and the client reads the key at a read version.
+- After a rollback, the StorageServer reads the key of every request
+  again. A discarded record can be the reason that a value did not
+  differ. The planted bug `WatchNoRecheck` of the model shows a watch
+  that never becomes ready without this read.
+- A StorageServer that removes its data, for a copy from a peer or after
+  a reset of the database, answers `{error, not_ready}` to every
+  request.
+- A StorageServer without a watch performs one comparison of an integer
+  for each record that it applies.
+
+Differences from FoundationDB:
+
+- The StorageServer keeps one entry for each request. FoundationDB keeps
+  one entry for each key, and the requests for the key share it.
+- The limit is a number of requests. The limit of FoundationDB is a
+  number of bytes.
+- redwall has one time limit. FoundationDB uses 20 seconds in the place
+  of 30 seconds while a StorageServer has no recent update.
+
 ## Mapped range
 
 `redwall:get_mapped_range/4,5` is `erlfdb:get_mapped_range/4,5`, which

@@ -49,8 +49,109 @@
 %%   range. A read of a snapshot (`snapshot/1') adds none.</li>
 %% <li>`get/2' returns a future, as in erlfdb. The future of redwall is
 %%   the result itself, and `wait/1' returns its argument. `wait/1' of
-%%   erlfdb also returns an argument that is not a future.</li>
+%%   erlfdb also returns an argument that is not a future. Only a watch
+%%   has a future that is not the result. See "Watches".</li>
 %% </ul>
+%%
+%% == Watches ==
+%%
+%% `watch/2' creates a watch on a key, and returns a future. The future
+%% becomes ready when the value of the key differs from the value that the
+%% transaction read. The design is the design of FoundationDB 7.3
+%% (`ReadYourWritesTransaction::watch' of
+%% `fdbclient/ReadYourWrites.actor.cpp', and `Transaction::watch',
+%% `setupWatches' and `watchValue' of `fdbclient/NativeAPI.actor.cpp').
+%%
+%% In the transaction:
+%%
+%% <ul>
+%% <li>`watch/2' reads the key as `get/2' does. The value of the watch is
+%%   the result: the value at the read version, or the write of this
+%%   transaction. The read adds a read conflict key.</li>
+%% <li>A later set or clear of the key in the same transaction with
+%%   another value makes the future ready at once.</li>
+%% <li>The watch starts when the transaction commits. Its version is the
+%%   commit version, or the read version for a transaction without a
+%%   mutation. `transactional/2' commits a transaction with a watch also
+%%   when the transaction has no mutation.</li>
+%% <li>If the commit fails, the future has the error of the commit. If
+%%   the transaction is reset or cancelled before its commit, or the
+%%   process that created the transaction ends, the future has the error
+%%   1025, `transaction_cancelled'.</li>
+%% <li>A database has at most `max_watches' watches whose futures are not
+%%   ready (default 10,000, as in FoundationDB). `watch/2' raises 1032,
+%%   `too_many_watches', above the limit.</li>
+%% </ul>
+%%
+%% After the commit, one process for each watch does the work of
+%% `watchValue':
+%%
+%% <ol>
+%% <li>The process sends the key, the value and the version to a
+%%   StorageServer (`redwall_storage:watch_value/5'). The StorageServer
+%%   answers when the value at its version differs. See "Watches" in
+%%   {@link redwall_storage}.</li>
+%% <li>After an answer with the version `Changed', the process asks the
+%%   Proxy for read versions until one is at or above `Changed'
+%%   (`waitForCommittedVersion' of FoundationDB). It then reads the key at
+%%   that read version.</li>
+%% <li>If the value differs from the value of the watch, the future is
+%%   ready. Otherwise a recovery has discarded the record that the
+%%   StorageServer answered for, or the value has changed back. The
+%%   process sends the watch again with the read version as its
+%%   version.</li>
+%% <li>After `timed_out', after `watch_cancelled', and when the
+%%   StorageServer does not answer in `watch_call_timeout_ms' (default
+%%   35,000) or is not alive, the process waits, performs the read of
+%%   step 2, and sends the watch again. The waits are 10 ms, 1,000 ms
+%%   (`WATCH_POLLING_TIME') and 10 ms. After a failed request, the next
+%%   request goes to the next StorageServer.</li>
+%% </ol>
+%%
+%% The guarantees are the guarantees of FoundationDB:
+%%
+%% <ul>
+%% <li>If the value of the key differs from the value of the watch from
+%%   some commit on, the future becomes ready.</li>
+%% <li>If the value changes and changes back, the future can stay not
+%%   ready.</li>
+%% <li>When a future is ready without an error, a read at a read version
+%%   at or above the version of the watch returned another value.</li>
+%% </ul>
+%%
+%% The future is `{redwall_future, Reference, Watch}'. When the future
+%% becomes ready, or gets an error, the process `To' receives the message
+%% `{Reference, ready}', as with erlfdb. `To' is the caller of `watch/2',
+%% or the process of the option `to' of `watch/3'. `wait/1,2', `is_ready/1',
+%% `get_error/1', `get/1', `cancel/1,2', `wait_for_any/1,2' and
+%% `wait_for_all/1,2' take the future. A watch ends when its future is
+%% ready or cancelled, and when the process `To' ends.
+%%
+%% Departures from FoundationDB:
+%%
+%% <ul>
+%% <li>Step 3 is a read of the key. FoundationDB compares versions: the
+%%   future is ready if the read version is less than 50,000,000 versions
+%%   above `Changed', because a recovery adds 100,000,000 versions. In
+%%   redwall a discarded record can be 1 version below the first version
+%%   of the next epoch (see {@link redwall_sequencer}), so the comparison
+%%   of versions does not show a recovery.</li>
+%% <li>The process performs the read of step 2 also after a failed
+%%   request. A watch therefore also becomes ready when no StorageServer
+%%   has answered that the value differs.</li>
+%% <li>Each watch has its own process and its own request. The client of
+%%   FoundationDB keeps one request for each key, and the watches of a
+%%   database on the key share it.</li>
+%% <li>After a reset of the database (see {@link redwall_recovery}), the
+%%   read versions are below the version of the watch. The future is then
+%%   ready.</li>
+%% <li>A future of FoundationDB is cancelled when the application drops
+%%   it. A watch of redwall ends with the process `To'.</li>
+%% </ul>
+%%
+%% `watch_verify => false' of `open/1' plants a defect for the simulation:
+%% the future is ready after the answer of the StorageServer, without the
+%% read of step 2.
 %%
 %% == StorageServers ==
 %%
@@ -111,6 +212,8 @@
 %%   id can be removed, so the result of the commit cannot be
 %%   determined.</li>
 %% <li>1025, `transaction_cancelled'.</li>
+%% <li>1032, `too_many_watches', and 1101, `operation_cancelled', for a
+%%   cancelled future.</li>
 %% <li>2030, 2032, 2039, 2041, 2042, 2043 and 2108: the errors of
 %%   `get_mapped_range/5'.</li>
 %% <li>1037, `process_behind': the Proxy does not answer, or no
@@ -207,9 +310,9 @@
 %% <li>`get_range/4' has the options `limit', `reverse' and `snapshot'
 %%   of erlfdb. A database with the kind `any' has no key selectors. See
 %%   the documentation of `get_range/4' and of `get_key/2'.</li>
-%% <li>The module has no atomic operations, no versionstamped keys and values, no watches, no
-%%   tenants and no `get_last_error/0'. The only transaction option is
-%%   `automatic_idempotency'.</li>
+%% <li>The module has no atomic operations, no versionstamped keys and
+%%   values, no tenants and no `get_last_error/0'. The only transaction
+%%   option is `automatic_idempotency'.</li>
 %% <li>A database is a Proxy and a list of StorageServers that the caller
 %%   names. redwall has no process that tells a client which Proxy and
 %%   which StorageServers run.</li>
@@ -231,15 +334,25 @@
 
 -include("redwall_eta.hrl").
 
+%% `get/1' of this module is `erlfdb:get/1', the result of a future.
+-compile({no_auto_import, [get/1]}).
+
 -export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
 -export([get/2, get_range/3, get_range/4, get_key/2, select/4, select/5, set/3, clear/2, clear_range/3]).
 -export([get_mapped_range/4, get_mapped_range/5]).
 -export([get_range_startswith/2, clear_range_startswith/2]).
--export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2, set_option/2]).
+-export([commit/1, reset/1, cancel/1, cancel/2, on_error/2, wait/1, wait/2, set_option/2]).
+-export([watch/2, watch/3, get_and_watch/2, set_and_watch/3, clear_and_watch/2, has_watches/1]).
+-export([is_ready/1, get_error/1, get/1, block_until_ready/1, wait_for_any/1, wait_for_any/2, wait_for_all/1, wait_for_all/2]).
 -export([get_read_version/1, set_read_version/2, get_committed_version/1, get_versionstamp/1]).
 -export([add_read_conflict_key/2, add_read_conflict_range/3, is_read_only/1]).
 
--export_type([database/0, transaction/0, snapshot/0, key/0, value/0, profile/0, mapper/0, mapped_kv/0]).
+-export_type([database/0, transaction/0, snapshot/0, key/0, value/0, profile/0, mapper/0, mapped_kv/0, future/0]).
+
+%% The future of a watch. See "Watches" in the module documentation. The
+%% third element has the process of the watch, the state of the future
+%% and the counter of the watches of the database.
+-type future() :: {redwall_future, reference(), {pid(), atomics:atomics_ref(), atomics:atomics_ref() | undefined}}.
 
 -type key() :: term().
 -type value() :: term().
@@ -271,7 +384,14 @@
     max_retry_delay_ms => number(),
     automatic_idempotency => boolean(),
     keys => redwall_key:kind(),
-    profile => profile()
+    profile => profile(),
+    %% The watches. See "Watches" in the module documentation.
+    %% `watch_count' is the counter of the watches of the database, which
+    %% `open/1' creates.
+    max_watches => non_neg_integer(),
+    watch_call_timeout_ms => timeout(),
+    watch_verify => boolean(),
+    watch_count => atomics:atomics_ref()
 }.
 
 -type profile() :: default | ets.
@@ -283,6 +403,7 @@
 -define(IS_DB, {redwall_database, _}).
 -define(IS_TX, {redwall_transaction, _}).
 -define(IS_SS, {redwall_snapshot, _}).
+-define(IS_FUTURE, {redwall_future, _, _}).
 
 -define(TIMEOUT_MS, 5000).
 %% DEFAULT_BACKOFF, DEFAULT_MAX_BACKOFF and FUTURE_VERSION_RETRY_DELAY of
@@ -290,6 +411,14 @@
 -define(BACKOFF_MS, 10).
 -define(MAX_BACKOFF_MS, 1000).
 -define(FUTURE_VERSION_RETRY_DELAY_MS, 10).
+%% DEFAULT_MAX_OUTSTANDING_WATCHES, WATCH_POLLING_TIME and
+%% WRONG_SHARD_SERVER_DELAY of `fdbclient/ClientKnobs.cpp', the last two
+%% in milliseconds. The time limit of a request of a watch is above
+%% WATCH_TIMEOUT, the time limit of the StorageServer.
+-define(MAX_WATCHES, 10000).
+-define(WATCH_POLLING_TIME_MS, 1000).
+-define(WRONG_SHARD_SERVER_DELAY_MS, 10).
+-define(WATCH_CALL_TIMEOUT_MS, 35000).
 
 -define(TRANSACTION_TOO_OLD, 1007).
 -define(FUTURE_VERSION, 1009).
@@ -297,6 +426,8 @@
 -define(COMMIT_UNKNOWN_RESULT, 1021).
 -define(COMMIT_UNKNOWN_RESULT_FATAL, 1022).
 -define(TRANSACTION_CANCELLED, 1025).
+-define(TOO_MANY_WATCHES, 1032).
+-define(OPERATION_CANCELLED, 1101).
 -define(PROCESS_BEHIND, 1037).
 -define(GET_MAPPED_RANGE_READS_YOUR_WRITES, 2039).
 -define(UNSUPPORTED_OPERATION, 2108).
@@ -329,13 +460,23 @@
 %% `profile' is `default' or `ets'. See "Profiles" in the module
 %% documentation. The default is `default'. Each option above replaces the
 %% option of the profile.
+%%
+%% `max_watches' is the highest number of watches of the database whose
+%% futures are not ready. The default is 10,000. `watch_call_timeout_ms'
+%% is the time limit of one request of a watch to a StorageServer. The
+%% default is 35,000. See "Watches" in the module documentation.
 -spec open(servers()) -> database().
 open(Servers) when not is_map_key(proxy, Servers); not is_map_key(storage, Servers) ->
     open(maps:merge(local(), Servers));
 open(Servers = #{proxy := _, storage := _}) ->
-    Options = maps:with([proxy, storage, direct, retry_delay_ms, max_retry_delay_ms, automatic_idempotency, keys], Servers),
+    Options = maps:with(
+        [proxy, storage, direct, retry_delay_ms, max_retry_delay_ms, automatic_idempotency, keys, max_watches, watch_call_timeout_ms, watch_verify],
+        Servers
+    ),
     _ = lists:member(maps:get(keys, Options, any), [any, list, binary]) orelse error(badarg),
-    {redwall_database, maps:merge(profile(maps:get(profile, Servers, default)), Options)}.
+    %% The counter of the watches of this database.
+    Count = atomics:new(1, [{signed, true}]),
+    {redwall_database, maps:merge(profile(maps:get(profile, Servers, default)), Options#{watch_count => Count})}.
 
 %% @equiv open(#{})
 -spec open() -> database().
@@ -400,6 +541,8 @@ transactional(?IS_DB = Db, Fun) when is_function(Fun, 1) ->
     try
         attempt(Tx, Fun)
     after
+        %% A watch of a transaction that did not commit.
+        ok = fail_watches(Table, ?TRANSACTION_CANCELLED),
         ets:delete(Table)
     end;
 transactional(?IS_TX = Tx, Fun) when is_function(Fun, 1) ->
@@ -410,7 +553,7 @@ transactional(?IS_SS = Snapshot, Fun) when is_function(Fun, 1) ->
 attempt(Tx, Fun) ->
     try
         Result = Fun(Tx),
-        case is_read_only(Tx) of
+        case is_read_only(Tx) andalso not has_watches(Tx) of
             true -> ok;
             false -> ok = wait(commit(Tx))
         end,
@@ -428,13 +571,443 @@ attempt(Tx, Fun) ->
 snapshot(?IS_TX = Tx) -> {redwall_snapshot, Tx};
 snapshot(?IS_SS = Snapshot) -> Snapshot.
 
-%% @doc Returns the result of a future. A future of redwall is the result
-%% itself.
--spec wait(Result) -> Result.
-wait(Result) -> Result.
+%% @equiv wait(Future, [])
+-spec wait(future() | Result) -> ok | Result.
+wait(Future) -> wait(Future, []).
 
--spec wait(Result, [term()]) -> Result.
-wait(Result, _Options) -> Result.
+%% @doc Returns the result of a future. The future of a watch gives `ok'
+%% when it is ready, and raises its error. Another future of redwall is
+%% the result itself.
+%%
+%% For the future of a watch that is not ready, the function waits for
+%% the message `{Reference, ready}'. The process `To' of the watch
+%% receives that message, so only that process can wait. The option
+%% `{timeout, Ms}' limits the wait, and the function then raises
+%% `{timeout, Future}', as erlfdb does.
+-spec wait(future() | Result, [{timeout, timeout()} | term()]) -> ok | Result.
+wait(?IS_FUTURE = Future, Options) ->
+    {redwall_future, MsgRef, _Watch} = Future,
+    case is_ready(Future) of
+        true ->
+            ok = flush(MsgRef),
+            get(Future);
+        false ->
+            receive
+                {MsgRef, ready} -> get(Future)
+            after proplists:get_value(timeout, Options, infinity) ->
+                error({timeout, Future})
+            end
+    end;
+wait(Result, _Options) ->
+    Result.
+
+%% Removes the message of a future from the mailbox of the caller.
+flush(MsgRef) ->
+    receive
+        {MsgRef, ready} -> ok
+    after 0 -> ok
+    end.
+
+%% @doc Whether the future is ready: it has a result or an error, or it
+%% is cancelled.
+-spec is_ready(future() | term()) -> boolean().
+is_ready({redwall_future, _MsgRef, {_Pid, Status, _Count}}) -> atomics:get(Status, 1) =/= 0;
+is_ready(_Result) -> true.
+
+%% @doc Returns `ok' for a future that is ready without an error, and
+%% `{erlfdb_error, Code}' for a future with an error. A future that is not
+%% ready gives `{erlfdb_error, 2015}', `future_not_set'.
+-spec get_error(future() | term()) -> ok | {erlfdb_error, integer()}.
+get_error({redwall_future, _MsgRef, {_Pid, Status, _Count}}) ->
+    case atomics:get(Status, 1) of
+        0 -> {erlfdb_error, 2015};
+        1 -> ok;
+        -1 -> {erlfdb_error, ?OPERATION_CANCELLED};
+        Code -> {erlfdb_error, Code}
+    end;
+get_error(_Result) ->
+    ok.
+
+%% @doc Returns the result of a ready future: `ok' for the future of a
+%% watch. The function raises the error of the future.
+-spec get(future() | Result) -> ok | Result.
+get(?IS_FUTURE = Future) ->
+    case get_error(Future) of
+        ok -> ok;
+        Error -> error(Error)
+    end;
+get(Result) ->
+    Result.
+
+%% @doc Waits until the future is ready. See `wait/2' for the process
+%% that can wait.
+-spec block_until_ready(future() | term()) -> ok.
+block_until_ready(?IS_FUTURE = Future) ->
+    {redwall_future, MsgRef, _Watch} = Future,
+    case is_ready(Future) of
+        true ->
+            flush(MsgRef);
+        false ->
+            receive
+                {MsgRef, ready} -> ok
+            end
+    end;
+block_until_ready(_Result) ->
+    ok.
+
+%% @equiv wait_for_any(Futures, [])
+-spec wait_for_any([future()]) -> future().
+wait_for_any(Futures) ->
+    wait_for_any(Futures, []).
+
+%% @doc Waits until one future of the list is ready, and returns that
+%% future. The option `{timeout, Ms}' limits the wait.
+-spec wait_for_any([future()], [{timeout, timeout()} | term()]) -> future().
+wait_for_any(Futures, Options) ->
+    case [Future || Future <- Futures, is_ready(Future)] of
+        [Ready | _] ->
+            Ready;
+        [] ->
+            %% A selective receive for the references of the futures.
+            Refs = [MsgRef || {redwall_future, MsgRef, _Watch} <- Futures],
+            receive
+                {MsgRef, ready} when is_reference(MsgRef), Refs =/= [] ->
+                    case lists:keyfind(MsgRef, 2, Futures) of
+                        false ->
+                            %% The message of another future. It goes to
+                            %% the end of the mailbox.
+                            self() ! {MsgRef, ready},
+                            wait_for_any(Futures, Options);
+                        Future ->
+                            Future
+                    end
+            after proplists:get_value(timeout, Options, infinity) ->
+                error({timeout, Futures})
+            end
+    end.
+
+%% @equiv wait_for_all(Futures, [])
+-spec wait_for_all([future() | term()]) -> [term()].
+wait_for_all(Futures) ->
+    wait_for_all(Futures, []).
+
+%% @doc Returns the result of each future, in the order of the list.
+-spec wait_for_all([future() | term()], [{timeout, timeout()} | term()]) -> [term()].
+wait_for_all(Futures, Options) ->
+    [wait(Future, Options) || Future <- Futures].
+
+%% ---------------------------------------------------------------------------
+%% Watches
+%% ---------------------------------------------------------------------------
+
+%% @equiv watch(DbOrTx, Key, [])
+-spec watch(database() | transaction() | snapshot(), key()) -> future().
+watch(DbOrTx, Key) ->
+    watch(DbOrTx, Key, []).
+
+%% @doc Creates a watch on `Key', and returns its future. The function is
+%% `erlfdb:watch/3'. See "Watches" in the module documentation.
+%%
+%% ```
+%% Future = redwall:transactional(Db, fun(Tx) -> redwall:watch(Tx, Key) end),
+%% %% Another transaction sets the key to another value.
+%% ok = redwall:wait(Future)
+%% '''
+%%
+%% The option `{to, Pid}' names the process that receives the message
+%% `{Reference, ready}'. The default is the caller. With a database, the
+%% function creates the watch in a transaction of its own. With a
+%% snapshot, the function uses the transaction of the snapshot, and the
+%% read adds a read conflict key, as in erlfdb.
+-spec watch(database() | transaction() | snapshot(), key(), [{to, pid()}]) -> future().
+watch(?IS_DB = Db, Key, Options) ->
+    transactional(Db, fun(Tx) -> watch(Tx, Key, Options) end);
+watch({redwall_snapshot, Tx}, Key, Options) ->
+    watch(Tx, Key, Options);
+watch(?IS_TX = Tx, Key, Options) when is_list(Options) ->
+    {Table, _} = table(Tx),
+    To = proplists:get_value(to, Options, self()),
+    true = is_pid(To) orelse error(badarg),
+    Value = read_own(Table, Key, true),
+    [{db, Servers}] = ets:lookup(Table, db),
+    Count = maps:get(watch_count, Servers, undefined),
+    ok = count_watch(Count, maps:get(max_watches, Servers, ?MAX_WATCHES)),
+    MsgRef = make_ref(),
+    Status = atomics:new(1, [{signed, true}]),
+    Watch = #{
+        ref => MsgRef,
+        to => To,
+        owner => ets:info(Table, owner),
+        status => Status,
+        count => Count,
+        servers => Servers,
+        key => Key,
+        value => Value
+    },
+    Pid = spawn(fun() -> watcher(Watch) end),
+    true = ets:insert(Table, [{{watch, MsgRef}, Key, Value, Pid}, {has_watches, true}]),
+    {redwall_future, MsgRef, {Pid, Status, Count}}.
+
+%% @doc Reads `Key' and creates a watch on it, in one transaction. The
+%% function is `erlfdb:get_and_watch/2'.
+-spec get_and_watch(database(), key()) -> {value() | not_found, future()}.
+get_and_watch(?IS_DB = Db, Key) ->
+    transactional(Db, fun(Tx) ->
+        Value = wait(get(Tx, Key)),
+        {Value, watch(Tx, Key)}
+    end).
+
+%% @doc Sets `Key' and creates a watch on it, in one transaction. The
+%% function is `erlfdb:set_and_watch/3'.
+-spec set_and_watch(database(), key(), value()) -> future().
+set_and_watch(?IS_DB = Db, Key, Value) ->
+    transactional(Db, fun(Tx) ->
+        ok = set(Tx, Key, Value),
+        watch(Tx, Key)
+    end).
+
+%% @doc Clears `Key' and creates a watch on it, in one transaction. The
+%% function is `erlfdb:clear_and_watch/2'.
+-spec clear_and_watch(database(), key()) -> future().
+clear_and_watch(?IS_DB = Db, Key) ->
+    transactional(Db, fun(Tx) ->
+        ok = clear(Tx, Key),
+        watch(Tx, Key)
+    end).
+
+%% @doc Whether the transaction has created a watch since its start or
+%% its last reset.
+-spec has_watches(transaction() | snapshot()) -> boolean().
+has_watches({redwall_snapshot, Tx}) -> has_watches(Tx);
+has_watches({redwall_transaction, Table}) -> ets:member(Table, has_watches).
+
+%% @doc Cancels the future of a watch. The watch ends, and `wait/1' of the
+%% future raises 1101, `operation_cancelled'. With `{flush, true}', the
+%% function removes the message of the future from the mailbox of the
+%% caller.
+-spec cancel(future(), [{flush, boolean()}]) -> ok.
+cancel({redwall_future, MsgRef, {Pid, Status, Count}}, Options) ->
+    case atomics:compare_exchange(Status, 1, 0, -1) of
+        ok -> uncount_watch(Count);
+        _Ready -> ok
+    end,
+    true = exit(Pid, shutdown),
+    case proplists:get_value(flush, Options, false) of
+        true -> flush(MsgRef);
+        false -> ok
+    end.
+
+%% Adds 1 to the number of watches of the database, or raises 1032.
+count_watch(undefined, _Max) ->
+    ok;
+count_watch(Count, Max) ->
+    case atomics:add_get(Count, 1, 1) > Max of
+        true ->
+            ok = atomics:sub(Count, 1, 1),
+            error({erlfdb_error, ?TOO_MANY_WATCHES});
+        false ->
+            ok
+    end.
+
+uncount_watch(undefined) -> ok;
+uncount_watch(Count) -> atomics:sub(Count, 1, 1).
+
+%% Sends the message to the process of each watch of the transaction that
+%% waits for the commit, and removes the watches from the transaction.
+tell_watches(Table, Message) ->
+    lists:foreach(
+        fun({{watch, MsgRef}, _Key, _Value, Pid}) ->
+            Pid ! {redwall_watch, MsgRef, Message},
+            true = ets:delete(Table, {watch, MsgRef})
+        end,
+        ets:match_object(Table, {{watch, '_'}, '_', '_', '_'})
+    ).
+
+%% The futures of the watches of the transaction get the error `Code'.
+fail_watches(Table, Code) ->
+    tell_watches(Table, {error, Code}).
+
+%% The transaction sets or clears `Key'. `New' is the new value. A watch
+%% of the transaction on the key with another value is ready.
+own_change(Table, Key, New) ->
+    Guards = [{'==', '$2', {const, Key}}, {'=/=', '$3', {const, New}}],
+    fire_own(Table, ets:select(Table, [{{{watch, '$1'}, '$2', '$3', '$4'}, Guards, [{{'$1', '$4'}}]}])).
+
+%% The transaction clears the keys of a range.
+own_clear_range(Table, Begin, End) ->
+    Guards = [{'>=', '$2', {const, Begin}}, {'<', '$2', {const, End}}, {'=/=', '$3', not_found}],
+    fire_own(Table, ets:select(Table, [{{{watch, '$1'}, '$2', '$3', '$4'}, Guards, [{{'$1', '$4'}}]}])).
+
+fire_own(Table, Watches) ->
+    lists:foreach(
+        fun({MsgRef, Pid}) ->
+            Pid ! {redwall_watch, MsgRef, fire},
+            true = ets:delete(Table, {watch, MsgRef})
+        end,
+        Watches
+    ).
+
+%% The process of one watch. It waits for the commit of the transaction,
+%% and then follows the watch at the StorageServers. See "Watches" in the
+%% module documentation.
+watcher(Watch0 = #{ref := MsgRef, to := To, owner := Owner}) ->
+    ToMonitor = monitor(process, To),
+    OwnerMonitor = monitor(process, Owner),
+    Watch = Watch0#{to_monitor => ToMonitor},
+    receive
+        {redwall_watch, MsgRef, fire} ->
+            watch_done(Watch, 1);
+        {redwall_watch, MsgRef, {error, Code}} ->
+            watch_done(Watch, Code);
+        {redwall_watch, MsgRef, {start, Version}} ->
+            true = demonitor(OwnerMonitor, [flush]),
+            watch_send(Watch, Version, erlang:phash2(Version));
+        {'DOWN', ToMonitor, process, _Pid, _Reason} ->
+            watch_done(Watch, -1);
+        {'DOWN', OwnerMonitor, process, _Pid, _Reason} ->
+            %% The table of the transaction does not exist.
+            watch_done(Watch, ?TRANSACTION_CANCELLED)
+    end.
+
+%% Ends the watch. `Result' is 1 for a ready future, -1 for a cancelled
+%% one, or an error code. The process `To' receives the message of the
+%% future, unless the future is cancelled.
+watch_done(#{ref := MsgRef, to := To, status := Status, count := Count}, Result) ->
+    case atomics:compare_exchange(Status, 1, 0, Result) of
+        ok ->
+            ok = uncount_watch(Count),
+            _ = Result =/= -1 andalso (To ! {MsgRef, ready}),
+            ok;
+        _Cancelled ->
+            ok
+    end.
+
+%% Sends the watch with the version `Version' to a StorageServer. `Turn'
+%% selects the StorageServer.
+watch_send(Watch = #{servers := Servers, key := Key, value := Value}, Version, Turn) ->
+    ok = watch_flush(),
+    case watch_storage(Servers, Turn) of
+        none ->
+            watch_again(Watch, Version, Turn + 1, ?WRONG_SHARD_SERVER_DELAY_MS);
+        Storage ->
+            Timeout = maps:get(watch_call_timeout_ms, Servers, ?WATCH_CALL_TIMEOUT_MS),
+            Tag = redwall_storage:watch_request(Storage, Key, Value, Version),
+            case watch_answer(Watch, Tag, Timeout) of
+                stop ->
+                    ok;
+                {ok, Changed} ->
+                    case maps:get(watch_verify, Servers, true) of
+                        true -> watch_verify(Watch, Version, Turn, Changed);
+                        %% The planted defect `watch_verify => false'.
+                        false -> watch_done(Watch, 1)
+                    end;
+                {error, timed_out} ->
+                    watch_again(Watch, Version, Turn, ?FUTURE_VERSION_RETRY_DELAY_MS);
+                {error, watch_cancelled} ->
+                    watch_again(Watch, Version, Turn, ?WATCH_POLLING_TIME_MS);
+                {error, _Reason} ->
+                    watch_again(Watch, Version, Turn + 1, ?WRONG_SHARD_SERVER_DELAY_MS)
+            end
+    end.
+
+%% Waits for the answer of a StorageServer to a watch. The result is
+%% `stop' if the process `To' has ended in that time.
+watch_answer(Watch = #{to_monitor := ToMonitor}, Tag, Timeout) ->
+    receive
+        {'DOWN', ToMonitor, process, _Pid, _Reason} ->
+            ok = watch_done(Watch, -1),
+            stop;
+        {redwall_watch_answer, Tag, Answer} ->
+            true = demonitor(Tag, [flush]),
+            Answer;
+        {'DOWN', Tag, process, _Storage, Reason} ->
+            {error, Reason}
+    after Timeout ->
+        true = demonitor(Tag, [flush]),
+        {error, timeout}
+    end.
+
+%% Removes the answers to the requests that had no answer in their time
+%% limit.
+watch_flush() ->
+    receive
+        {redwall_watch_answer, _Tag, _Answer} -> watch_flush()
+    after 0 -> ok
+    end.
+
+%% Waits, and then reads the key before the next request.
+watch_again(Watch, Version, Turn, Ms) ->
+    case watch_pause(Watch, Ms) of
+        ok -> watch_verify(Watch, Version, Turn, 0);
+        stop -> ok
+    end.
+
+%% Reads the key at a read version at or above `Changed'. The future is
+%% ready if the value differs from the value of the watch. Otherwise the
+%% process sends the watch again with the read version.
+watch_verify(Watch = #{servers := Servers, key := Key, value := Value}, Version, Turn, Changed) ->
+    case watch_read(Servers, Key) of
+        {ok, ReadVersion, _Now} when ReadVersion < Version ->
+            %% The versions start again after a reset of the database.
+            watch_done(Watch, 1);
+        {ok, ReadVersion, _Now} when ReadVersion < Changed ->
+            %% The record `Changed' is not committed, or a recovery will
+            %% discard it.
+            case watch_pause(Watch, ?FUTURE_VERSION_RETRY_DELAY_MS) of
+                ok -> watch_verify(Watch, Version, Turn, Changed);
+                stop -> ok
+            end;
+        {ok, _ReadVersion, Now} when Now =/= Value ->
+            watch_done(Watch, 1);
+        {ok, ReadVersion, _Same} ->
+            watch_send(Watch, ReadVersion, Turn);
+        error ->
+            case watch_pause(Watch, ?FUTURE_VERSION_RETRY_DELAY_MS) of
+                ok when Changed =:= 0 -> watch_send(Watch, Version, Turn + 1);
+                ok -> watch_verify(Watch, Version, Turn, Changed);
+                stop -> ok
+            end
+    end.
+
+%% Waits for `Ms'. The result is `stop' if the process `To' has ended.
+watch_pause(Watch = #{to_monitor := ToMonitor}, Ms) ->
+    receive
+        {'DOWN', ToMonitor, process, _Pid, _Reason} ->
+            ok = watch_done(Watch, -1),
+            stop
+    after Ms -> ok
+    end.
+
+%% A read version, and the value of the key at that read version, in a
+%% transaction of its own.
+watch_read(Servers, Key) ->
+    Table = ets:new(redwall_transaction, [ordered_set, public]),
+    true = ets:insert(Table, [{db, Servers}, {state, open}, {seq, 0}]),
+    try
+        Version = read_version(Table),
+        case read(Table, {key, Key}) of
+            {ok, Value, _Written} -> {ok, Version, {ok, Value}};
+            not_found -> {ok, Version, not_found}
+        end
+    catch
+        error:{erlfdb_error, _Code} -> error
+    after
+        ets:delete(Table)
+    end.
+
+%% The StorageServer of the turn `Turn', or `none'.
+watch_storage(#{storage := Storage}, Turn) ->
+    Named =
+        case is_function(Storage, 0) of
+            true -> Storage();
+            false -> Storage
+        end,
+    case Named of
+        undefined -> none;
+        [] -> none;
+        [_ | _] -> lists:nth(Turn rem length(Named) + 1, Named);
+        One -> One
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Reads
@@ -444,10 +1017,20 @@ wait(Result, _Options) -> Result.
 -spec get(transaction() | snapshot(), key()) -> value() | not_found.
 get(TxOrSnapshot, Key) ->
     {Table, Conflict} = table(TxOrSnapshot),
+    case read_own(Table, Key, Conflict) of
+        {ok, Value} -> Value;
+        not_found -> not_found
+    end.
+
+%% The value of the key as the transaction reads it: `{ok, Value}' or
+%% `not_found'. The value is the write of this transaction, or the value
+%% at the read version. With `Conflict', a read from a StorageServer adds
+%% a read conflict key.
+read_own(Table, Key, Conflict) ->
     ok = check_key(Table, Key),
     case ets:lookup(Table, {w, Key}) of
         [{_, {set, Value}}] ->
-            Value;
+            {ok, Value};
         [{_, clear}] ->
             not_found;
         [] ->
@@ -457,7 +1040,7 @@ get(TxOrSnapshot, Key) ->
                 false ->
                     Result =
                         case read(Table, {key, Key}) of
-                            {ok, Value, _Written} -> Value;
+                            {ok, Value, _Written} -> {ok, Value};
                             not_found -> not_found
                         end,
                     _ = Conflict andalso ets:insert(Table, {{r, Key}}),
@@ -1024,14 +1607,14 @@ set(?IS_TX = Tx, Key, Value) ->
     {Table, _} = table(Tx),
     ok = check_key(Table, Key),
     true = ets:insert(Table, [{{w, Key}, {set, Value}}, {{m, next(Table)}, {set, Key, Value}}]),
-    ok.
+    own_change(Table, Key, {ok, Value}).
 
 -spec clear(transaction(), key()) -> ok.
 clear(?IS_TX = Tx, Key) ->
     {Table, _} = table(Tx),
     ok = check_key(Table, Key),
     true = ets:insert(Table, [{{w, Key}, clear}, {{m, next(Table)}, {clear, Key}}]),
-    ok.
+    own_change(Table, Key, not_found).
 
 %% @doc Clears the keys `K' with `Begin =< K' and `K < End'.
 -spec clear_range(transaction(), key(), key()) -> ok.
@@ -1044,7 +1627,7 @@ clear_range(?IS_TX = Tx, Begin, End) ->
     _ = ets:select_delete(Table, [{{{w, '$1'}, '_'}, Guards, [true]}]),
     N = next(Table),
     true = ets:insert(Table, [{{cr, N}, Begin, End}, {{m, N}, {clear_range, Begin, End}}]),
-    ok.
+    own_clear_range(Table, Begin, End).
 
 %% ---------------------------------------------------------------------------
 %% Commit
@@ -1052,9 +1635,34 @@ clear_range(?IS_TX = Tx, Begin, End) ->
 
 %% @doc Commits the transaction. A transaction without a mutation sends no
 %% message, and its committed version is -1, as in FoundationDB.
+%%
+%% After the commit, the watches of the transaction start with the commit
+%% version, or with the read version for a transaction without a
+%% mutation. After a failed commit, the future of each watch has the error
+%% of the commit.
 -spec commit(transaction()) -> ok.
 commit(?IS_TX = Tx) ->
     {Table, _} = table(Tx),
+    try commit_mutations(Table) of
+        ok ->
+            case ets:member(Table, has_watches) of
+                true ->
+                    Version =
+                        case ets:lookup(Table, committed) of
+                            [{committed, -1, _}] -> read_version(Table);
+                            [{committed, LSN, _}] -> LSN
+                        end,
+                    tell_watches(Table, {start, Version});
+                false ->
+                    ok
+            end
+    catch
+        error:{erlfdb_error, Code} ->
+            ok = fail_watches(Table, Code),
+            error({erlfdb_error, Code})
+    end.
+
+commit_mutations(Table) ->
     case ets:select(Table, [{{{m, '_'}, '$1'}, [], ['$1']}]) of
         [] ->
             true = ets:insert(Table, [{state, committed}, {committed, -1, 0}]),
@@ -1172,6 +1780,8 @@ determine(Servers, Id, Backoff) ->
 %% @doc Removes the reads and the writes of the transaction.
 -spec reset(transaction()) -> ok.
 reset({redwall_transaction, Table}) ->
+    %% A watch of a transaction that did not commit.
+    ok = fail_watches(Table, ?TRANSACTION_CANCELLED),
     [{db, Servers}] = ets:lookup(Table, db),
     [{backoff, Backoff}] = ets:lookup(Table, backoff),
     %% The transaction keeps the option for an idempotency id. It keeps
@@ -1188,11 +1798,15 @@ reset({redwall_transaction, Table}) ->
     ok.
 
 %% @doc Cancels the transaction. A later operation of the transaction
-%% raises the error 1025.
--spec cancel(transaction()) -> ok.
+%% raises the error 1025. The future of each watch of the transaction that
+%% waits for the commit gets the error 1025. With the future of a watch,
+%% the function is `cancel(Future, [])'.
+-spec cancel(transaction() | future()) -> ok.
+cancel(?IS_FUTURE = Future) ->
+    cancel(Future, []);
 cancel({redwall_transaction, Table}) ->
     true = ets:insert(Table, {state, cancelled}),
-    ok.
+    fail_watches(Table, ?TRANSACTION_CANCELLED).
 
 %% @doc Handles the error of an operation of the transaction. See "Errors"
 %% in the module documentation.
