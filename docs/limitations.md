@@ -3,8 +3,11 @@
 - A commit waits for the time of a batch, 1 ms by default, also when no
   other transaction arrives. The time does not change with the load.
 - A batch has no limit in bytes.
-- The client has the basic functions of erlfdb only. It has no key
-  selectors, no options of `get_range`, no atomic operations, no
+- The client has a part of the functions of erlfdb. `get_range/4` has
+  the options `limit`, `reverse` and `snapshot`, and no fold and no
+  iterator. A database with the kind `any` has no key selectors. A key
+  selector in a database with the kind `binary` does not find a key at
+  or above `<<255>>`. The client has no atomic operations, no
   versionstamped keys and values, no watches, no transaction options, no
   tenants and no `get_last_error/0`. It has the tuple layer, but no subspaces
   and no directory layer.

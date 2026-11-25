@@ -16,7 +16,7 @@ end).
 | Group | Functions |
 |---|---|
 | Database and transaction | `open/1`, `create_transaction/1`, `transactional/2`, `snapshot/1` |
-| Reads | `get/2`, `get_range/3`, `wait/1`, `wait/2` |
+| Reads | `get/2`, `get_range/3,4`, `get_key/2`, `wait/1`, `wait/2` |
 | Writes | `set/3`, `clear/2`, `clear_range/3` |
 | Commit and errors | `commit/1`, `reset/1`, `cancel/1`, `on_error/2` |
 | Versions | `get_read_version/1`, `set_read_version/2`, `get_committed_version/1`, `get_versionstamp/1` |
@@ -110,6 +110,60 @@ end).
   the application expects.
 - The default is `any`. A key is then any term, and the application has
   to know the order of the Erlang terms for its key ranges.
+
+## Range options and key selectors
+
+`redwall:get_range/4` is `erlfdb:get_range/4`, and `redwall:get_key/2`
+is `erlfdb:get_key/2`.
+
+```erlang
+Db = redwall:open(#{proxy => Proxy, storage => Storage, keys => list}),
+redwall:transactional(Db, fun(Tx) ->
+    {Begin, End} = redwall_key:range([users]),
+    %% The 10 highest keys with the prefix, the highest key first.
+    Rows = redwall:get_range(Tx, Begin, End, [{reverse, true}, {limit, 10}]),
+    %% The last key with the prefix.
+    Last = redwall:get_key(Tx, redwall_key:last_less_than(End)),
+    {Rows, Last}
+end).
+```
+
+| Option of `get_range/4` | Meaning |
+|---|---|
+| `{limit, N}` | The result has the first `N` keys. 0 is no limit |
+| `{reverse, true}` | The result has the highest key first, and a limit keeps the highest keys |
+| `{snapshot, true}` | The read adds no read conflict range |
+
+| Key selector | Key |
+|---|---|
+| `redwall_key:last_less_than(Key)`, `{Key, lt}` | The last key below `Key` |
+| `redwall_key:last_less_or_equal(Key)`, `{Key, lteq}` | The last key at or below `Key` |
+| `redwall_key:first_greater_than(Key)`, `{Key, gt}` | The first key above `Key` |
+| `redwall_key:first_greater_or_equal(Key)`, `{Key, gteq}` | The first key at or above `Key` |
+| `{Key, Selector, Offset}` | The key `Offset` keys after the key of `{Key, Selector}` |
+
+- The StorageServer applies the limit and the order
+  (`redwall_storage:scan/6`). It reads the keys of the result and the
+  key after them, in the order of the keys or in the reverse order.
+- A read with a limit returns the sets and the clears of the
+  transaction. If the transaction has changed a key of the range, the
+  client reads the stored keys in parts until it has `N` keys.
+- With a limit that the result reaches, the read conflict range ends at
+  the last key of the result, as in FoundationDB. A key selector has a
+  read conflict range from its key to the result.
+- Only a database with the kind `list` or `binary` has key selectors,
+  because the Erlang terms have no lowest and no highest term. With the
+  kind `any`, `get_key/2` raises `{unsupported, key_selector}`, and a
+  tuple as a bound of `get_range/4` is a key.
+- A key selector that names a key before the first key gives `[]` or
+  `<<>>`. A key selector that names a key after the last key gives
+  `<<>>` for the kind `list` and `<<255>>` for the kind `binary`.
+- In a database with the kind `binary`, a key selector does not find a
+  key at or above `<<255>>`. In FoundationDB these keys are the system
+  keys.
+- Differences from erlfdb: the first argument is a transaction or a
+  snapshot, and the result is the list or the key. erlfdb also takes a
+  database, and can return a future.
 - Recommendation: list keys for an application in Erlang, and binary
   keys of the tuple layer for an application that comes from erlfdb.
   `get_mapped_range/5` needs binary keys of the tuple layer.

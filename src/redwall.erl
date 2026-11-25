@@ -204,8 +204,10 @@
 %% <ul>
 %% <li>`get_mapped_range/5' has a part of the options of erlfdb. See the
 %%   documentation of the function.</li>
-%% <li>The module has no key selectors, no options of `get_range', no
-%%   atomic operations, no versionstamped keys and values, no watches, no
+%% <li>`get_range/4' has the options `limit', `reverse' and `snapshot'
+%%   of erlfdb. A database with the kind `any' has no key selectors. See
+%%   the documentation of `get_range/4' and of `get_key/2'.</li>
+%% <li>The module has no atomic operations, no versionstamped keys and values, no watches, no
 %%   tenants and no `get_last_error/0'. The only transaction option is
 %%   `automatic_idempotency'.</li>
 %% <li>A database is a Proxy and a list of StorageServers that the caller
@@ -230,7 +232,7 @@
 -include("redwall_eta.hrl").
 
 -export([open/0, open/1, profile/1, create_transaction/1, transactional/2, snapshot/1]).
--export([get/2, get_range/3, select/4, select/5, set/3, clear/2, clear_range/3]).
+-export([get/2, get_range/3, get_range/4, get_key/2, select/4, select/5, set/3, clear/2, clear_range/3]).
 -export([get_mapped_range/4, get_mapped_range/5]).
 -export([get_range_startswith/2, clear_range_startswith/2]).
 -export([commit/1, reset/1, cancel/1, on_error/2, wait/1, wait/2, set_option/2]).
@@ -463,23 +465,239 @@ get(TxOrSnapshot, Key) ->
             end
     end.
 
-%% @doc Reads the keys `K' with `Begin =< K' and `K < End'. The result is
-%% the list of `{Key, Value}' in the order of the keys.
+%% @equiv get_range(TxOrSnapshot, Begin, End, [])
 -spec get_range(transaction() | snapshot(), key(), key()) -> [{key(), value()}].
 get_range(TxOrSnapshot, Begin, End) ->
-    {Table, Conflict} = table(TxOrSnapshot),
+    get_range(TxOrSnapshot, Begin, End, []).
+
+%% @doc Reads the keys `K' with `Begin =< K' and `K < End'. The result is
+%% the list of `{Key, Value}' in the order of the keys. The function is
+%% `erlfdb:get_range/4'.
+%%
+%% `Options' is a list:
+%%
+%% <ul>
+%% <li>`{limit, N}': the result has the first `N' keys. 0 is no limit.</li>
+%% <li>`{reverse, true}': the result has the highest key first, and a
+%%   limit keeps the highest keys. An integer other than 0 has the same
+%%   meaning, as in erlfdb.</li>
+%% <li>`{snapshot, true}': the read adds no read conflict range.</li>
+%% <li>The function ignores the other options of erlfdb, for example
+%%   `target_bytes' and `streaming_mode'.</li>
+%% </ul>
+%%
+%% In a database with the kind `list' or `binary', `Begin' and `End' can
+%% be key selectors (see {@link redwall_key} and `get_key/2'). The range
+%% is then the range between the keys of the two selectors. In a database
+%% with the kind `any', a tuple is a key.
+%%
+%% <ul>
+%% <li>The function returns the sets and the clears of this
+%%   transaction.</li>
+%% <li>The StorageServer reads only the keys of the result, and the key
+%%   after them: it applies the limit and the order. If the transaction
+%%   has changed a key of the range, the client reads the stored keys in
+%%   parts until it has `N' keys.</li>
+%% <li>The read conflict range is the range `{Begin, End}'. With a limit
+%%   that the result reaches, the read conflict range ends at the last
+%%   key of the result, as in FoundationDB.</li>
+%% </ul>
+%%
+%% Differences from erlfdb: the first argument is a transaction or a
+%% snapshot, and not a database. The result is the list. erlfdb can return
+%% a future with the option `wait'.
+-spec get_range(transaction() | snapshot(), key() | redwall_key:selector(), key() | redwall_key:selector(), [{atom(), term()}]) ->
+    [{key(), value()}].
+get_range(TxOrSnapshot, Begin0, End0, Options) when is_list(Options) ->
+    {Table, Conflict0} = table(TxOrSnapshot),
+    Conflict = Conflict0 andalso proplists:get_value(snapshot, Options, false) =/= true,
+    Begin = bound(Table, Begin0, Conflict),
+    End = bound(Table, End0, Conflict),
     ok = check_bounds(Table, Begin, End),
-    {ok, Rows} = read(Table, {range, Begin, End}),
-    %% The stored keys that the transaction has not written and not
-    %% cleared, and the keys that the transaction has set.
-    Stored = [
-        {Key, Value}
-     || {Key, Value, _Written} <- Rows, not ets:member(Table, {w, Key}), not cleared(Table, Key)
-    ],
-    Guards = [{'>=', '$1', {const, Begin}}, {'<', '$1', {const, End}}],
-    Written = ets:select(Table, [{{{w, '$1'}, {set, '$2'}}, Guards, [{{'$1', '$2'}}]}]),
-    _ = Conflict andalso ets:insert(Table, {{rr, next(Table)}, Begin, End}),
-    lists:ukeymerge(1, Written, Stored).
+    Limit =
+        case proplists:get_value(limit, Options, 0) of
+            0 -> infinity;
+            N when is_integer(N), N > 0 -> N;
+            _ -> error(badarg)
+        end,
+    Reverse = not lists:member(proplists:get_value(reverse, Options, false), [false, 0]),
+    Rows = merged(Table, {incl, Begin}, {excl, End}, Reverse, Limit),
+    _ =
+        Conflict andalso
+            case length(Rows) =:= Limit andalso {Reverse, lists:last(Rows)} of
+                {false, {Last, _Value}} ->
+                    %% The keys from `Begin' up to the last key of the
+                    %% result, with that key.
+                    true = ets:insert(Table, [{{rr, next(Table)}, Begin, Last}, {{r, Last}}]);
+                {true, {Last, _Value}} ->
+                    true = ets:insert(Table, {{rr, next(Table)}, Last, End});
+                false ->
+                    true = ets:insert(Table, {{rr, next(Table)}, Begin, End})
+            end,
+    Rows.
+
+%% A bound of `get_range/4': a key, or the key of a key selector in a
+%% database with the kind `list' or `binary'.
+bound(Table, Bound, Conflict) ->
+    case kind(Table) =/= any andalso redwall_key:is_selector(Bound) of
+        true -> resolve(Table, Bound, Conflict);
+        false -> Bound
+    end.
+
+%% @doc Returns the key of a key selector. The function is
+%% `erlfdb:get_key/2'. See "Key selectors" in {@link redwall_key} for the
+%% forms of a key selector.
+%%
+%% ```
+%% %% The last key of the keys with the prefix [users].
+%% {_Begin, End} = redwall_key:range([users]),
+%% Last = redwall:get_key(Tx, redwall_key:last_less_than(End))
+%% '''
+%%
+%% <ul>
+%% <li>The database must have the kind `list' or `binary'. With the kind
+%%   `any', the function raises `{unsupported, key_selector}', because
+%%   the Erlang terms have no lowest and no highest term.</li>
+%% <li>A key selector that names a key before the first key gives the
+%%   lowest bound of the kind: `[]' or `<<>>'. A key selector that names
+%%   a key after the last key gives the highest bound: `<<>>' for the
+%%   kind `list', and `<<255>>' for the kind `binary'.</li>
+%% <li>The function sees the sets and the clears of this
+%%   transaction.</li>
+%% <li>A transaction gets a read conflict range for the keys between the
+%%   key of the selector and the result, with both keys. A snapshot gets
+%%   none.</li>
+%% <li>The StorageServer walks from the key of the selector to the
+%%   result. The read does not depend on the number of keys of the
+%%   database.</li>
+%% </ul>
+%%
+%% Difference from erlfdb: the result is the key. erlfdb returns a
+%% future.
+-spec get_key(transaction() | snapshot(), redwall_key:selector()) -> key().
+get_key(TxOrSnapshot, Selector) ->
+    {Table, Conflict} = table(TxOrSnapshot),
+    resolve(Table, Selector, Conflict).
+
+resolve(Table, Selector, Conflict) ->
+    {Lowest, Highest} = redwall_key:space(kind(Table)),
+    {Key, OrEqual, Offset} = redwall_key:selector(Selector),
+    ok = check_bounds(Table, Key, Key),
+    case Offset >= 1 of
+        true ->
+            %% The key number `Offset' above `Key', or at or above `Key'
+            %% without `OrEqual'.
+            From =
+                case OrEqual of
+                    true -> {excl, Key};
+                    false -> {incl, Key}
+                end,
+            Rows = merged(Table, From, {excl, Highest}, false, Offset),
+            case length(Rows) of
+                Offset ->
+                    {Found, _Value} = lists:last(Rows),
+                    _ = Conflict andalso ets:insert(Table, [{{rr, next(Table)}, Key, Found}, {{r, Found}}]),
+                    Found;
+                _Fewer ->
+                    _ = Conflict andalso ets:insert(Table, {{rr, next(Table)}, Key, Highest}),
+                    Highest
+            end;
+        false ->
+            %% The key number `1 - Offset' below `Key', or at or below
+            %% `Key' with `OrEqual', counted from `Key' down.
+            To =
+                case OrEqual of
+                    true -> {incl, Key};
+                    false -> {excl, Key}
+                end,
+            Count = 1 - Offset,
+            Rows = merged(Table, {incl, Lowest}, To, true, Count),
+            Low =
+                case length(Rows) of
+                    Count -> element(1, lists:last(Rows));
+                    _Fewer -> Lowest
+                end,
+            _ = Conflict andalso ets:insert(Table, [{{rr, next(Table)}, Low, Key} | [{{r, Key}} || OrEqual]]),
+            Low
+    end.
+
+%% The keys between the bounds `From' and `To' with their values, as this
+%% transaction reads them: the stored keys at the read version that the
+%% transaction has not written and not cleared, and the keys that the
+%% transaction has set. The result is in the order of the keys, or in the
+%% reverse order with `Reverse', and has at most `Limit' keys.
+merged(_Table, {_, Low}, {_, High}, _Reverse, _Limit) when Low > High ->
+    [];
+merged(Table, From, To, Reverse, infinity) ->
+    {ok, Rows} = read(Table, {scan, From, To, #{}}),
+    Merged = lists:ukeymerge(1, own(Table, From, To), unchanged(Table, Rows)),
+    case Reverse of
+        true -> lists:reverse(Merged);
+        false -> Merged
+    end;
+merged(Table, From, To, Reverse, Limit) ->
+    case touched(Table, From, To) of
+        false ->
+            %% The StorageServer applies the limit and the order.
+            {ok, Rows} = read(Table, {scan, From, To, #{limit => Limit, reverse => Reverse}}),
+            [{Key, Value} || {Key, Value, _Written} <- Rows];
+        true ->
+            parts(Table, From, To, Reverse, Limit, [])
+    end.
+
+%% Reads the stored keys in parts, in the order of the read, and merges
+%% each part with the sets of the transaction between the bounds of the
+%% part, until the result has `Left' keys or the range has no more stored
+%% key. A stored key can be a key that the transaction cleared, so a part
+%% can give fewer keys than the part has.
+parts(Table, From, To, Reverse, Left, Acc) ->
+    Size = max(2 * Left, 16),
+    {ok, Rows} = read(Table, {scan, From, To, #{limit => Size, reverse => Reverse}}),
+    Whole = length(Rows) < Size,
+    %% The bounds that this part covers, and the bounds of the rest.
+    {PartFrom, PartTo, Rest} =
+        case {Whole, Reverse} of
+            {true, _} ->
+                {From, To, none};
+            {false, false} ->
+                {Last, _, _} = lists:last(Rows),
+                {From, {incl, Last}, {{excl, Last}, To}};
+            {false, true} ->
+                {Last, _, _} = lists:last(Rows),
+                {{incl, Last}, To, {From, {excl, Last}}}
+        end,
+    Merged = lists:ukeymerge(1, own(Table, PartFrom, PartTo), unchanged(Table, lists:keysort(1, Rows))),
+    Ordered =
+        case Reverse of
+            true -> lists:reverse(Merged);
+            false -> Merged
+        end,
+    case {length(Ordered) >= Left, Rest} of
+        {true, _} -> Acc ++ lists:sublist(Ordered, Left);
+        {false, none} -> Acc ++ Ordered;
+        {false, {From1, To1}} -> parts(Table, From1, To1, Reverse, Left - length(Ordered), Acc ++ Ordered)
+    end.
+
+%% The stored rows that the transaction has not written and not cleared.
+unchanged(Table, Rows) ->
+    [{Key, Value} || {Key, Value, _Written} <- Rows, not ets:member(Table, {w, Key}), not cleared(Table, Key)].
+
+%% The keys that the transaction has set between the bounds, in the order
+%% of the keys.
+own(Table, From, To) ->
+    Guards = [guard(lower, From), guard(upper, To)],
+    ets:select(Table, [{{{w, '$1'}, {set, '$2'}}, Guards, [{{'$1', '$2'}}]}]).
+
+guard(lower, {incl, Key}) -> {'>=', '$1', {const, Key}};
+guard(lower, {excl, Key}) -> {'>', '$1', {const, Key}};
+guard(upper, {incl, Key}) -> {'=<', '$1', {const, Key}};
+guard(upper, {excl, Key}) -> {'<', '$1', {const, Key}}.
+
+%% The transaction has written or cleared a key between the keys of the
+%% bounds, or one of the two keys.
+touched(Table, {_, Low}, {_, High}) ->
+    ets:select_count(Table, [{{{w, '$1'}, '_'}, [{'>=', '$1', {const, Low}}, {'=<', '$1', {const, High}}], [true]}]) > 0 orelse
+        ets:select_count(Table, [{{{cr, '_'}, '$1', '$2'}, [{'=<', '$1', {const, High}}, {'<', {const, Low}, '$2'}], [true]}]) > 0.
 
 %% @doc Reads the keys with the prefix `Prefix', which is a list or a
 %% binary. The result is the list of `{Key, Value}' in the order of the
@@ -747,6 +965,7 @@ read_handle(Handle, Query, Version) ->
         case element(1, Query) of
             select -> select;
             mapped -> mapped_range;
+            scan -> scan;
             _KeyOrRange -> none
         end,
     case Feature =:= none orelse lists:member(Feature, maps:get(features, Handle, [])) of
@@ -783,6 +1002,7 @@ read_by_message([Storage | Storages], Query, Version, Timeout, Code) ->
         case Query of
             {key, Key} -> redwall_storage:read_with_version(Storage, Key, Version, Timeout);
             {range, Begin, End} -> redwall_storage:read_range_with_version(Storage, Begin, End, Version, Timeout);
+            {scan, From, To, Options} -> redwall_storage:scan(Storage, From, To, Options, Version, Timeout);
             {select, Begin, End, MatchSpec, Limit} -> redwall_storage:select(Storage, Begin, End, MatchSpec, Limit, Version, Timeout);
             {mapped, Begin, End, Mapper, Limit} -> redwall_storage:mapped_range(Storage, Begin, End, Mapper, Limit, Version, Timeout)
         end,

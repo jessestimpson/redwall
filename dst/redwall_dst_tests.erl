@@ -651,7 +651,14 @@ no_wait_is_found_test_() ->
     {timeout, ?TIMEOUT, fun() ->
         {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_wait}) end),
         ?debugFmt("no_wait: seed ~p, ~p", [Seed, Violation]),
-        ?assertMatch(#{property := read_value}, Violation)
+        %% The StorageServer applies records between two reads of one
+        %% transaction, so two reads at one read version can also differ.
+        %% The invariants that compare two reads then find the defect.
+        ?assert(
+            lists:member(maps:get(property, Violation), [read_value, own_writes, range_options_agree, select_agrees, mapped_range_agrees]),
+            Violation
+        ),
+        ?assertEqual(ok, maps:get(outcome, run(opts(Seed, #{}))), {seed, Seed})
     end}.
 
 %% A planted defect: the second StorageServer of a run does not apply a

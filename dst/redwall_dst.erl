@@ -257,6 +257,11 @@
 %%   `get_mapped_range/4' only, so that `no_conflict' checks the read
 %%   conflict ranges of a mapped range read. Each read with a limit
 %%   returns the first rows of the read without a limit.</li>
+%% <li>`range_options_agree' - a `redwall:get_range/4' of a client with
+%%   the options `reverse' and `limit' returned the rows of `get_range/3'
+%%   at the same read version in the reverse order, the first rows, and
+%%   the last rows. `redwall:get_key/2' returned the first key at or
+%%   above the start of the range, and the last key below its end.</li>
 %% <li>`own_writes' - before the commit, the reads of a transaction
 %%   return its sets and its clears: `get/2', `get_range/3' and
 %%   `select/4' of a snapshot. `get_mapped_range/4' raises 2039. After a
@@ -795,6 +800,7 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> one_leader(Tab) end,
         fun() -> select_agrees(Tab) end,
         fun() -> mapped_range_agrees(Tab) end,
+        fun() -> range_options_agree(Tab) end,
         fun() -> own_writes(Tab) end,
         fun() -> coordinators_agree(Tab) end
     ]).
@@ -822,6 +828,15 @@ own_writes(Tab) ->
     case ets:match(Tab, {{own_writes_differ, '_'}, '$1'}) of
         [] -> ok;
         [[Detail] | _] -> violation(own_writes, Detail)
+    end.
+
+%% A `get_range/4' of a client with the options `reverse' and `limit',
+%% and a `get_key/2', returned the results that follow from `get_range/3'
+%% at the same read version.
+range_options_agree(Tab) ->
+    case ets:match(Tab, {{range_options_differ, '_'}, '$1'}) of
+        [] -> ok;
+        [[Detail] | _] -> violation(range_options_agree, Detail)
     end.
 
 %% A `get_mapped_range/4' of a client returned the rows of `get_range/3'
@@ -999,6 +1014,7 @@ record_stats(Tab) ->
     bump(runs),
     bump(selects, case ets:lookup(Tab, selects) of [{selects, Selects}] -> Selects; [] -> 0 end),
     bump(mapped_reads, case ets:lookup(Tab, mapped_reads) of [{mapped_reads, Mapped}] -> Mapped; [] -> 0 end),
+    bump(range_option_reads, case ets:lookup(Tab, range_option_reads) of [{range_option_reads, Optioned}] -> Optioned; [] -> 0 end),
     [
         bump(Counter, case ets:lookup(Tab, Counter) of [{Counter, Count}] -> Count; [] -> 0 end)
      || Counter <- [own_mapped_reads, own_write_checks, on_errors]

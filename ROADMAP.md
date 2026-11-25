@@ -158,9 +158,15 @@ has the basic functions. The remaining parts, in the planned order:
       bound prefix of the key, together with `get_range_startswith`.
 - [ ] A count with a match spec, and a continuation for `select` with a
       limit.
-- [ ] `get_range` with `limit` and `reverse`, key selectors and
-      `get_key`. This step makes subspaces and the
-      directory layer of erlfdb usable.
+- [x] `get_range/4` with `limit`, `reverse` and `snapshot`, key
+      selectors and `get_key/2`, for a database with the kind `list` or
+      `binary`. The StorageServer reads in the reverse order and applies
+      the limit (`redwall_storage:scan/6`).
+- [ ] Subspaces and the directory layer of erlfdb, which the item above
+      makes possible.
+- [ ] Decide the bounds of the keys for key selectors in a database
+      with the kind `any`. The Erlang terms have no lowest and no highest
+      term, so such a database has no key selectors.
 - [x] Keys with the prefix property of the tuple layer: list keys and
       binary keys, the option `keys` of `open/1`, `redwall_key:range/1`,
       `get_range_startswith/2` and `clear_range_startswith/2`. Tuple
@@ -322,9 +328,10 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
       through etx, and compare them with an ETS table on one node. One
       measurement exists: `update_counter/3` of etx takes about 135 us
       with three nodes on one computer.
-- [ ] Read in the reverse order, and count the keys of a range, so that
-      `last/1`, `prev/2` and `info(T, size)` of etx do not read every
-      key.
+- [x] Read in the reverse order, so that `last/1` and `prev/2` of etx
+      read one key.
+- [ ] Count the keys of a range, so that `info(T, size)` of etx does
+      not read every key.
 
 ## Verification work
 

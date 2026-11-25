@@ -129,6 +129,7 @@ The harness checks these invariants after every step:
 | `storage_rollback` | When a StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one |
 | `replicas_agree` | Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both |
 | `select_agrees` | A `redwall:select/4` of a client returns the result of the match spec on the result of `get_range/3` at the same read version |
+| `range_options_agree` | A `redwall:get_range/4` of a client with the options `reverse` and `limit` returns the rows of `get_range/3` at the same read version in the reverse order, the first rows, and the last rows. `redwall:get_key/2` returns the first key at or above the start of the range, and the last key below its end |
 | `mapped_range_agrees` | A `redwall:get_mapped_range/4` of a client returns the rows of `get_range/3` at the same read version, each with the result of its second read. The client uses a mapper with a second read of a key, and a mapper with a second read of a prefix |
 | `own_writes` | Before the commit, the reads of a transaction return its sets and its clears, and `get_mapped_range/4` raises 2039. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation |
 | `coordinators_agree` | In a run with a peace cluster, no two servers have two states of the coordinated state for one index of the log of peace |
@@ -164,7 +165,7 @@ Results of `make dst` on 2026-11-22:
 | Planted defect: the StorageServer answers a read below its oldest version | Seeds from 1 | Found at seed 3, `select_agrees`: a select and a read of one range differ, because the StorageServer removed versions between the two |
 | Planted defect: the StorageServer does not apply a clear | Seeds from 1 | Found at seed 3, `read_value`: a read returned a value for a key that a later acknowledged transaction cleared |
 | Planted defect: the second StorageServer of a run does not apply a clear | Seeds from 1, runs without faults | Found at seed 2, `replicas_agree`: the first StorageServer has a clear of a key at a version, and the second one has none |
-| Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value` |
+| Planted defect: the StorageServer answers a read at a version that it has not applied | Seeds from 1 | Found at seed 1, `read_value`, on 2026-11-22. Since 2026-11-24, with the reads of `range_options_agree`, found at seed 5, `own_writes`: two reads of one transaction at one read version differ. The same seed passes without the defect |
 
 Results of the 5 tests with the pop in a run of `make dst` on
 2026-11-24. The 46 tests of that run pass in 219 s. The test

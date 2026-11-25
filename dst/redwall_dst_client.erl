@@ -362,6 +362,7 @@ read_keys(Tab, Db, Tx, Keys, Ranges) ->
                             Rows
                     end,
                 ok = mapped_range(Tab, Db, redwall:get_read_version(Tx), Range, Found),
+                ok = range_options(Tab, Db, redwall:get_read_version(Tx), Range, Found),
                 %% The read returns no key outside the range, and the keys
                 %% are in their order.
                 [] = [Key || {Key, _Value} <- Found, not lists:member(Key, keys_in(Range))],
@@ -439,6 +440,45 @@ mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found) ->
             end,
             Cases
         )
+    after
+        ets:delete(Table)
+    end.
+
+%% Reads the range with the options `reverse' and `limit' of
+%% `redwall:get_range/4', and resolves two key selectors with
+%% `redwall:get_key/2', at the read version of the transaction. `Found'
+%% is the result of `get_range/3' on the range. The reads use a second
+%% transaction with the same read version, in a database with the kind
+%% `binary', which has key selectors. The function records a difference
+%% in the table of the run, for the invariant `range_options_agree'.
+range_options(Tab, {redwall_database, Servers}, ReadVersion, {Begin, End}, Found) ->
+    Tx = {redwall_transaction, Table} = redwall:create_transaction({redwall_database, Servers#{keys => binary}}),
+    try
+        ok = redwall:set_read_version(Tx, ReadVersion),
+        N = ets:update_counter(Tab, range_option_reads, 1, {range_option_reads, 0}),
+        Limit = N rem 3 + 1,
+        Backward = lists:reverse(Found),
+        %% Every key of the workload, for the keys of the selectors.
+        {From, To} = redwall_mapper:range(range, redwall_tuple:pack({<<"k">>})),
+        Keys = [Key || {Key, _Value} <- redwall:get_range(redwall:snapshot(Tx), From, To)],
+        Expected = {
+            Backward,
+            lists:sublist(Found, Limit),
+            lists:sublist(Backward, Limit),
+            %% The first key at or above `Begin', and the last key below
+            %% `End', or a bound of the keys of the kind `binary'.
+            hd([Key || Key <- Keys, Key >= Begin] ++ [<<255>>]),
+            lists:last([<<>> | [Key || Key <- Keys, Key < End]])
+        },
+        Read = {
+            redwall:get_range(Tx, Begin, End, [{reverse, true}]),
+            redwall:get_range(Tx, Begin, End, [{limit, Limit}]),
+            redwall:get_range(Tx, Begin, End, [{limit, Limit}, {reverse, true}]),
+            redwall:get_key(Tx, redwall_key:first_greater_or_equal(Begin)),
+            redwall:get_key(Tx, redwall_key:last_less_than(End))
+        },
+        _ = Read =:= Expected orelse ets:insert(Tab, {{range_options_differ, N}, #{range => {Begin, End}, limit => Limit, expected => Expected, read => Read}}),
+        ok
     after
         ets:delete(Table)
     end.

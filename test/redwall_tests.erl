@@ -25,6 +25,10 @@ client_test_() ->
         fun(Db) -> {timeout, 60, fun() -> mapped_range_random(Db) end} end,
         fun(Db) -> {timeout, 60, fun() -> idempotency(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> keys(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> range_options(Db) end} end,
+        fun(Db) -> {timeout, 60, fun() -> range_options_random(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> key_selectors(Db) end} end,
+        fun(Db) -> {timeout, 30, fun() -> range_option_conflicts(Db) end} end,
         fun(Db) -> {timeout, 30, fun() -> equal_keys(Db) end} end
     ]}.
 
@@ -1036,3 +1040,261 @@ equal_keys(Db) ->
     ),
     %% The process of the epoch has not stopped.
     ?assertEqual(not_found, Run(fun(Tx) -> redwall:get(Tx, [n, 1]) end)).
+
+%% `get_range/4' with the options `limit' and `reverse', for a read from
+%% the ETS tables and for a read by message.
+range_options(Db = {redwall_database, Servers}) ->
+    Message = {redwall_database, Servers#{direct => false}},
+    ok = redwall:transactional(Db, fun(Tx) -> [redwall:set(Tx, [k, I], I) || I <- lists:seq(1, 9)], ok end),
+    Read = fun(D, Begin, End, Options) -> redwall:transactional(D, fun(Tx) -> redwall:get_range(Tx, Begin, End, Options) end) end,
+    lists:foreach(
+        fun(D) ->
+            ?assertEqual([{[k, I], I} || I <- lists:seq(2, 6)], Read(D, [k, 2], [k, 7], [])),
+            ?assertEqual([{[k, 2], 2}, {[k, 3], 3}], Read(D, [k, 2], [k, 7], [{limit, 2}])),
+            ?assertEqual([{[k, I], I} || I <- [6, 5, 4, 3, 2]], Read(D, [k, 2], [k, 7], [{reverse, true}])),
+            ?assertEqual([{[k, 6], 6}, {[k, 5], 5}], Read(D, [k, 2], [k, 7], [{reverse, true}, {limit, 2}])),
+            %% An integer other than 0 is `true', and a limit of 0 is no
+            %% limit, as in erlfdb.
+            ?assertEqual([{[k, 6], 6}], Read(D, [k, 2], [k, 7], [{reverse, 1}, {limit, 1}])),
+            ?assertEqual([{[k, 2], 2}], Read(D, [k, 2], [k, 7], [{reverse, 0}, {limit, 1}])),
+            ?assertEqual(5, length(Read(D, [k, 2], [k, 7], [{limit, 0}]))),
+            %% A limit above the number of keys, an empty range, and the
+            %% options of erlfdb that redwall ignores.
+            ?assertEqual(5, length(Read(D, [k, 2], [k, 7], [{limit, 100}, {streaming_mode, want_all}, {target_bytes, 10}]))),
+            ?assertEqual([], Read(D, [k, 7], [k, 2], [{limit, 3}])),
+            ?assertEqual([], Read(D, [x], [y], [{reverse, true}])),
+            ?assertError(badarg, Read(D, [k, 2], [k, 7], [{limit, -1}]))
+        end,
+        [Db, Message]
+    ),
+    %% The sets and the clears of the transaction, with a limit. The
+    %% transaction clears the keys 3 to 6 and sets the keys 4 and 10.
+    lists:foreach(
+        fun(D) ->
+            {Forward, Backward, All} = redwall:transactional(D, fun(Tx) ->
+                ok = redwall:clear_range(Tx, [k, 3], [k, 7]),
+                ok = redwall:set(Tx, [k, 4], own),
+                ok = redwall:set(Tx, [k, 10], own),
+                Result = {
+                    redwall:get_range(Tx, [k, 1], [k, 99], [{limit, 4}]),
+                    redwall:get_range(Tx, [k, 1], [k, 99], [{limit, 4}, {reverse, true}]),
+                    redwall:get_range(Tx, [k, 1], [k, 99], [{reverse, true}])
+                },
+                ok = redwall:reset(Tx),
+                Result
+            end),
+            Expected = [{[k, 1], 1}, {[k, 2], 2}, {[k, 4], own}, {[k, 7], 7}, {[k, 8], 8}, {[k, 9], 9}, {[k, 10], own}],
+            ?assertEqual(lists:sublist(Expected, 4), Forward),
+            ?assertEqual(lists:sublist(lists:reverse(Expected), 4), Backward),
+            ?assertEqual(lists:reverse(Expected), All)
+        end,
+        [Db, Message]
+    ).
+
+%% Random ranges, limits, orders and key selectors, in transactions with
+%% random sets and clears of their own. The expected result is from a
+%% model of the keys.
+range_options_random({redwall_database, Servers}) ->
+    Db = redwall:open(Servers#{keys => list}),
+    Message = redwall:open(Servers#{keys => list, direct => false}),
+    rand:seed(exsss, {1, 2, 3}),
+    Key = fun() -> [k, rand:uniform(60)] end,
+    lists:foreach(
+        fun(Round) ->
+            D =
+                case Round rem 2 of
+                    0 -> Db;
+                    1 -> Message
+                end,
+            %% The stored keys of the round.
+            Stored = maps:from_list([{[k, I], Round} || I <- lists:seq(1, 60), rand:uniform(3) =< 2]),
+            ok = redwall:transactional(D, fun(Tx) ->
+                ok = redwall:clear_range(Tx, [], <<>>),
+                maps:foreach(fun(K, V) -> ok = redwall:set(Tx, K, V) end, Stored)
+            end),
+            redwall:transactional(D, fun(Tx) ->
+                %% The sets and the clears of the transaction, in 2 rounds
+                %% of 3. The model has the keys that the transaction
+                %% reads.
+                Model = lists:foldl(
+                    fun(_, Acc) ->
+                        case rand:uniform(3) of
+                            1 ->
+                                K = Key(),
+                                ok = redwall:set(Tx, K, own),
+                                Acc#{K => own};
+                            2 ->
+                                K = Key(),
+                                ok = redwall:clear(Tx, K),
+                                maps:remove(K, Acc);
+                            3 ->
+                                [A, B] = lists:sort([Key(), Key()]),
+                                ok = redwall:clear_range(Tx, A, B),
+                                maps:filter(fun(K, _) -> K < A orelse K >= B end, Acc)
+                        end
+                    end,
+                    Stored,
+                    lists:seq(1, (Round rem 3) * 4)
+                ),
+                Sorted = lists:sort(maps:to_list(Model)),
+                ?assertEqual(Sorted, redwall:get_range(Tx, [], <<>>)),
+                lists:foreach(
+                    fun(_) ->
+                        [Begin, End] = lists:sort([Key(), Key()]),
+                        Limit = rand:uniform(12) - 1,
+                        Reverse = rand:uniform(2) =:= 1,
+                        InRange = [Row || Row = {K, _} <- Sorted, K >= Begin, K < End],
+                        Ordered =
+                            case Reverse of
+                                true -> lists:reverse(InRange);
+                                false -> InRange
+                            end,
+                        Expected =
+                            case Limit of
+                                0 -> Ordered;
+                                _ -> lists:sublist(Ordered, Limit)
+                            end,
+                        ?assertEqual(Expected, redwall:get_range(Tx, Begin, End, [{limit, Limit}, {reverse, Reverse}]), {Round, Begin, End, Limit, Reverse}),
+                        %% A key selector. The key at the offset 0 is the
+                        %% last key below the key of the selector, or at
+                        %% or below it with `OrEqual'.
+                        Selected = Key(),
+                        OrEqual = rand:uniform(2) =:= 1,
+                        Offset = rand:uniform(9) - 5,
+                        Keys = [K || {K, _} <- Sorted],
+                        Below = length([K || K <- Keys, K < Selected orelse (OrEqual andalso K == Selected)]),
+                        Found =
+                            case Below + Offset of
+                                Index when Index < 1 -> [];
+                                Index when Index > length(Keys) -> <<>>;
+                                Index -> lists:nth(Index, Keys)
+                            end,
+                        ?assertEqual(Found, redwall:get_key(Tx, {Selected, OrEqual, Offset}), {Round, Selected, OrEqual, Offset, Keys})
+                    end,
+                    lists:seq(1, 20)
+                ),
+                ok = redwall:reset(Tx)
+            end)
+        end,
+        lists:seq(1, 60)
+    ).
+
+%% `get_key/2' and key selectors as the bounds of `get_range/4'.
+key_selectors({redwall_database, Servers}) ->
+    Lists = redwall:open(Servers#{keys => list}),
+    Binaries = redwall:open(Servers#{keys => binary}),
+    Any = redwall:open(Servers),
+    ok = redwall:transactional(Lists, fun(Tx) -> [redwall:set(Tx, [users, I], I) || I <- [10, 20, 30]], ok end),
+    ok = redwall:transactional(Binaries, fun(Tx) -> [redwall:set(Tx, <<"b", I>>, I) || I <- [1, 2, 3]], ok end),
+    Get = fun(D, Selector) -> redwall:transactional(D, fun(Tx) -> redwall:get_key(Tx, Selector) end) end,
+    %% The four selectors of erlfdb.
+    ?assertEqual([users, 10], Get(Lists, redwall_key:last_less_than([users, 20]))),
+    ?assertEqual([users, 20], Get(Lists, redwall_key:last_less_or_equal([users, 20]))),
+    ?assertEqual([users, 30], Get(Lists, redwall_key:first_greater_than([users, 20]))),
+    ?assertEqual([users, 20], Get(Lists, redwall_key:first_greater_or_equal([users, 20]))),
+    ?assertEqual([users, 20], Get(Lists, redwall_key:first_greater_or_equal([users, 15]))),
+    ?assertEqual([users, 10], Get(Lists, redwall_key:last_less_or_equal([users, 15]))),
+    %% An offset, and the form of FoundationDB with `OrEqual'.
+    ?assertEqual([users, 30], Get(Lists, {[users, 10], gteq, 2})),
+    ?assertEqual([users, 10], Get(Lists, {[users, 30], lteq, -2})),
+    ?assertEqual([users, 20], Get(Lists, {[users, 20], true, 0})),
+    ?assertEqual([users, 10], Get(Lists, {[users, 20], false, 0})),
+    ?assertEqual([users, 30], Get(Lists, {[users, 20], 1, 1})),
+    %% The last key with a prefix.
+    {_Begin, End} = redwall_key:range([users]),
+    ?assertEqual([users, 30], Get(Lists, redwall_key:last_less_than(End))),
+    %% A selector before the first key and after the last key gives the
+    %% bounds of the kind.
+    ?assertEqual([], Get(Lists, redwall_key:last_less_than([users, 10]))),
+    ?assertEqual(<<>>, Get(Lists, redwall_key:first_greater_than([users, 30]))),
+    ?assertEqual(<<>>, Get(Lists, {[users, 10], gteq, 5})),
+    ?assertEqual(<<>>, Get(Binaries, redwall_key:last_less_than(<<"b", 1>>))),
+    ?assertEqual(<<255>>, Get(Binaries, redwall_key:first_greater_than(<<"b", 3>>))),
+    ?assertEqual(<<"b", 2>>, Get(Binaries, redwall_key:first_greater_than(<<"b", 1>>))),
+    %% The sets and the clears of the transaction.
+    ?assertEqual(
+        {[users, 25], [users, 10]},
+        redwall:transactional(Lists, fun(Tx) ->
+            ok = redwall:set(Tx, [users, 25], own),
+            ok = redwall:clear(Tx, [users, 20]),
+            Result = {redwall:get_key(Tx, redwall_key:first_greater_than([users, 10])), redwall:get_key(Tx, redwall_key:last_less_than([users, 25]))},
+            ok = redwall:reset(Tx),
+            Result
+        end)
+    ),
+    %% A snapshot.
+    ?assertEqual([users, 30], redwall:transactional(Lists, fun(Tx) -> redwall:get_key(redwall:snapshot(Tx), {[users, 20], gt}) end)),
+    %% Key selectors as the bounds of a range.
+    Range = fun(D, Begin, Finish, Options) -> redwall:transactional(D, fun(Tx) -> redwall:get_range(Tx, Begin, Finish, Options) end) end,
+    ?assertEqual([{[users, 20], 20}, {[users, 30], 30}], Range(Lists, {[users, 10], gt}, {[users, 30], gt}, [])),
+    ?assertEqual([{[users, 10], 10}], Range(Lists, {[users, 10], gteq}, {[users, 20], gteq}, [])),
+    ?assertEqual([{[users, 30], 30}], Range(Lists, {[users, 0], gteq}, {End, gteq}, [{reverse, true}, {limit, 1}])),
+    ?assertEqual([{<<"b", 2>>, 2}], Range(Binaries, {<<"b", 1>>, gt}, {<<"b", 3>>, gteq}, [])),
+    %% A database with the kind `any' has no key selectors: a tuple is a
+    %% key.
+    ?assertError({unsupported, key_selector}, Get(Any, {[users, 20], gt})),
+    ?assertEqual([], Range(Any, {a, gt}, {b, gt}, [])),
+    ?assertError(badarg, Get(Lists, {[users, 20], above})),
+    ?assertError(badarg, Get(Lists, {users, gt})).
+
+%% The read conflict range of a read with a limit ends at the last key of
+%% the result, and a key selector has a read conflict range between its
+%% key and the result.
+range_option_conflicts({redwall_database, Servers}) ->
+    Db = redwall:open(Servers#{keys => list}),
+    ok = redwall:transactional(Db, fun(Tx) -> [redwall:set(Tx, [k, I], I) || I <- [10, 20, 30, 40]], ok end),
+    Set = fun(Key) -> redwall:transactional(Db, fun(Tx) -> redwall:set(Tx, Key, other) end) end,
+    %% The result of the commit of a transaction that reads with `Read',
+    %% after another transaction has set `Key'.
+    Outcome = fun(Read, Key) ->
+        Tx = redwall:create_transaction(Db),
+        _ = Read(Tx),
+        ok = Set(Key),
+        ok = redwall:set(Tx, [a], 1),
+        Result =
+            try redwall:commit(Tx) of
+                ok -> committed
+            catch
+                error:{erlfdb_error, 1020} -> conflict
+            end,
+        %% The keys of the database are the 4 keys again.
+        ok = redwall:transactional(Db, fun(Restore) ->
+            case Key of
+                [k, I] when I =:= 10; I =:= 20; I =:= 30; I =:= 40 -> redwall:set(Restore, Key, I);
+                _ -> redwall:clear(Restore, Key)
+            end
+        end),
+        Result
+    end,
+    Forward = fun(Tx) -> [{[k, 10], _}, {[k, 20], _}] = redwall:get_range(Tx, [k, 0], [k, 99], [{limit, 2}]) end,
+    ?assertEqual(committed, Outcome(Forward, [k, 25])),
+    ?assertEqual(conflict, Outcome(Forward, [k, 20])),
+    ?assertEqual(conflict, Outcome(Forward, [k, 15])),
+    ?assertEqual(conflict, Outcome(Forward, [k, 5])),
+    Backward = fun(Tx) -> [{[k, 40], _}, {[k, 30], _}] = redwall:get_range(Tx, [k, 0], [k, 99], [{limit, 2}, {reverse, true}]) end,
+    ?assertEqual(committed, Outcome(Backward, [k, 25])),
+    ?assertEqual(conflict, Outcome(Backward, [k, 30])),
+    ?assertEqual(conflict, Outcome(Backward, [k, 50])),
+    %% A limit that the result does not reach: the whole range.
+    Whole = fun(Tx) -> 4 = length(redwall:get_range(Tx, [k, 0], [k, 99], [{limit, 9}])) end,
+    ?assertEqual(conflict, Outcome(Whole, [k, 60])),
+    %% The option `snapshot': no conflict.
+    Snapshot = fun(Tx) -> 4 = length(redwall:get_range(Tx, [k, 0], [k, 99], [{snapshot, true}])) end,
+    ?assertEqual(committed, Outcome(Snapshot, [k, 61])),
+    %% A key selector: the keys between the key of the selector and the
+    %% result, with both.
+    After = fun(Tx) -> [k, 30] = redwall:get_key(Tx, {[k, 20], gt}) end,
+    ?assertEqual(conflict, Outcome(After, [k, 22])),
+    ?assertEqual(conflict, Outcome(After, [k, 30])),
+    ?assertEqual(committed, Outcome(After, [k, 35])),
+    ?assertEqual(committed, Outcome(After, [k, 12])),
+    Before = fun(Tx) -> [k, 10] = redwall:get_key(Tx, {[k, 15], lt}) end,
+    ?assertEqual(conflict, Outcome(Before, [k, 13])),
+    ?assertEqual(conflict, Outcome(Before, [k, 10])),
+    ?assertEqual(committed, Outcome(Before, [k, 16])),
+    %% A selector after the last key: the keys up to the bound of the kind.
+    Beyond = fun(Tx) -> <<>> = redwall:get_key(Tx, {[k, 99], gt}) end,
+    ?assertEqual(conflict, Outcome(Beyond, [z])),
+    %% A snapshot has no read conflict range.
+    Quiet = fun(Tx) -> _ = redwall:get_key(redwall:snapshot(Tx), {[k, 0], gt}) end,
+    ?assertEqual(committed, Outcome(Quiet, [k, 1])).

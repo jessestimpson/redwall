@@ -83,6 +83,9 @@ end).
   order of Erlang terms. The tuple layer of erlfdb is included.
 - **Reads without a message.** A client on the node of a StorageServer
   reads the ETS tables of the StorageServer in its own process.
+- **Range reads.** `redwall:get_range/4` has the options `limit` and
+  `reverse` of erlfdb, and `redwall:get_key/2` resolves a key selector.
+  The StorageServer reads only the keys of the result.
 - **Select.** `redwall:select/4` evaluates an ETS match spec on a key
   range in the StorageServer. FoundationDB has no such read.
 - **Mapped range read.** `redwall:get_mapped_range/4` reads the rows of
@@ -142,12 +145,12 @@ Each module also has its design in its module documentation.
 
 | Level | What it checks | Command | Time |
 |---|---|---|---|
-| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 119 tests | `make test` | 30 seconds |
+| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 123 tests | `make test` | 30 seconds |
 | Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 47 tests with about 1,700 seeds and 22 planted defects | `make dst` | about 4 minutes |
 | Model checking | Two TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer, and the Resolver. 10 planted bugs | `make tlc` | about 5 minutes |
 | Model checking | The recovery with 3 epochs | `make tlc-long` | about 4 hours |
 
-The simulation checks 18 invariants after every step, for example: no
+The simulation checks 19 invariants after every step, for example: no
 acknowledged transaction is lost by a recovery, no two acknowledged
 transactions conflict, and a read returns the last acknowledged write at
 or below its read version. See
@@ -199,8 +202,8 @@ The most important limitations are:
 - Each StorageServer has every key. The key space has no shards.
 - One process performs the conflict checks of an epoch. redwall cannot
   add Proxies or Resolvers.
-- The client has the basic functions of erlfdb. It has no key selectors,
-  no options of `get_range`, no atomic operations, no versionstamps, no
+- The client has a part of the functions of erlfdb. It has no atomic
+  operations, no versionstamps, no
   watches, no transaction options and no tenants.
 - redwall does not send a message again. A lost message to a LogServer
   stops the commits of the epoch until the next recovery.

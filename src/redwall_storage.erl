@@ -149,6 +149,27 @@
 %% handle has the feature `select'. FoundationDB has no such read. This
 %% part is not in the paper.
 %%
+%% == Scan ==
+%%
+%% `scan/6' and the query `{scan, From, To, Options}' of `read_direct/3'
+%% read the keys between two bounds at a read version, in the order of the
+%% keys or in the reverse order, with a limit of rows. The client uses
+%% the scan for `get_range/4' with the options `limit' and `reverse' and
+%% for key selectors (see {@link redwall}).
+%%
+%% <ul>
+%% <li>`From' is the lower bound and `To' is the upper bound. A bound is
+%%   `{incl, Key}' or `{excl, Key}': the key is in the range or is not.</li>
+%% <li>With `reverse => true', the scan starts at the upper bound and reads
+%%   towards the lower bound (`ets:prev_lookup/2'). The result has the
+%%   highest key first.</li>
+%% <li>With `limit => N', the scan stops after `N' keys that have a value
+%%   at the read version. The scan reads only the rows up to that key,
+%%   and the row after it.</li>
+%% </ul>
+%%
+%% The handle has the feature `scan'.
+%%
 %% == Copy from another StorageServer ==
 %%
 %% A StorageServer with the option `peers' that starts without data copies
@@ -380,7 +401,8 @@
 -export([read/3, read/4, read_with_version/4, info/1, stored/2]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([handle/1, read_direct/3, versions/1]).
--export([select/7, select_rows/2, mapped_range/7]).
+-export([select/7, select_rows/2, mapped_range/7, scan/6]).
+-export_type([bound/0, scan_options/0]).
 -export_type([mapped_row/0]).
 -export_type([handle/0, query/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, handle_continue/2]).
@@ -430,12 +452,17 @@
     history := ets:tid(),
     published := atomics:atomics_ref(),
     wait => boolean(),
-    features => [select | mapped_range]
+    features => [select | mapped_range | scan]
 }.
+
+%% A bound of a scan: the key is in the range (`incl') or is not (`excl').
+-type bound() :: {incl, term()} | {excl, term()}.
+-type scan_options() :: #{limit => pos_integer() | infinity, reverse => boolean()}.
 
 -type query() ::
     {key, term()}
     | {range, term(), term()}
+    | {scan, From :: bound(), To :: bound(), scan_options()}
     | {select, Begin :: term(), End :: term(), ets:match_spec(), Limit :: pos_integer() | infinity}
     | {mapped, Begin :: term(), End :: term(), redwall_mapper:mapper(), Limit :: pos_integer() | infinity}.
 
@@ -628,6 +655,21 @@ read_range(Storage, Begin, End, Version, Timeout) ->
 read_range_with_version(Storage, Begin, End, Version, Timeout) ->
     try
         gen_server:call(Storage, {read_range, Begin, End, Version}, Timeout)
+    catch
+        exit:Reason -> {error, Reason}
+    end.
+
+%% @doc Reads the keys between the bounds `From' and `To' at the read
+%% version `Version'. See "Scan" in the module documentation. The result
+%% has `{Key, Value, Written}' for each key with a value at `Version', in
+%% the order of the keys, or in the reverse order with `reverse => true'.
+%% With `limit => N', the result has the first `N' of them. The errors are
+%% the errors of `read/4'.
+-spec scan(gen_server:server_ref(), bound(), bound(), scan_options(), version(), timeout()) ->
+    {ok, [{term(), term(), version()}]} | {error, term()}.
+scan(Storage, From, To, Options, Version, Timeout) ->
+    try
+        gen_server:call(Storage, {scan, From, To, Options, Version}, Timeout)
     catch
         exit:Reason -> {error, Reason}
     end.
@@ -932,6 +974,8 @@ handle_call({read, Key, Version}, From, State) ->
     read_at({key, Key}, Version, From, State);
 handle_call({read_range, Begin, End, Version}, From, State) ->
     read_at({range, Begin, End}, Version, From, State);
+handle_call({scan, Lower, Upper, Options, Version}, From, State) ->
+    read_at({scan, Lower, Upper, Options}, Version, From, State);
 handle_call({select, Begin, End, MatchSpec, Limit, Version}, From, State) ->
     read_at({select, Begin, End, MatchSpec, Limit}, Version, From, State);
 handle_call({mapped, Begin, End, Mapper, Limit, Version}, From, State) ->
@@ -1556,7 +1600,7 @@ copy_rows({Key, [Row]}, Left, Version, Tables = {Data, History}, Acc, _Last) ->
 %% The handle for direct reads. `features' has the kinds of read that this
 %% StorageServer supports in addition to keys and ranges.
 handle_of(#state{data = Data, history = History, published = Published, wait = Wait}) ->
-    #{data => Data, history => History, published => Published, wait => Wait, features => [select, mapped_range]}.
+    #{data => Data, history => History, published => Published, wait => Wait, features => [select, mapped_range, scan]}.
 
 lookup({key, Key}, Version, {Data, History}) ->
     case ets:lookup(Data, Key) of
@@ -1568,6 +1612,36 @@ lookup({range, Begin, End}, Version, {Data, History}) ->
         {Key, Value, Written}
      || Row = {Key, _Newest, _Change} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Row, Version, Data, History)]
     ]};
+lookup({scan, From, To, Options}, Version, Tables = {Data, _History}) ->
+    Limit = maps:get(limit, Options, infinity),
+    case maps:get(reverse, Options, false) of
+        false ->
+            First =
+                case From of
+                    {incl, Key} ->
+                        %% The key of the row can be equal to `Key' and
+                        %% not identical. The result has the stored key.
+                        case ets:lookup(Data, Key) of
+                            [Row] -> {element(1, Row), [Row]};
+                            [] -> ets:next_lookup(Data, Key)
+                        end;
+                    {excl, Key} ->
+                        ets:next_lookup(Data, Key)
+                end,
+            {ok, scan_walk(First, next_lookup, To, Version, Tables, Limit, [])};
+        true ->
+            Last =
+                case To of
+                    {incl, Key} ->
+                        case ets:lookup(Data, Key) of
+                            [Row] -> {element(1, Row), [Row]};
+                            [] -> ets:prev_lookup(Data, Key)
+                        end;
+                    {excl, Key} ->
+                        ets:prev_lookup(Data, Key)
+                end,
+            {ok, scan_walk(Last, prev_lookup, From, Version, Tables, Limit, [])}
+    end;
 lookup({select, Begin, End, MatchSpec, Limit}, Version, {Data, History}) ->
     Compiled = ets:match_spec_compile(with_key(MatchSpec)),
     First =
@@ -1589,6 +1663,36 @@ lookup({mapped, Begin, End, Mapper, Limit}, Version, Tables = {Data, _History}) 
         {error, Reason} ->
             {error, {mapper, Reason}}
     end.
+
+%% Reads the rows from `{Key, [Row]}' on with the function `Step' of
+%% `ets', which is `next_lookup' or `prev_lookup', until the bound `Stop'
+%% or until the result has `Left' keys with a value at `Version'.
+scan_walk({Key, [Row]}, Step, Stop, Version, Tables = {Data, History}, Left, Acc) when Left =/= 0 ->
+    case within(Key, Step, Stop) of
+        true ->
+            Next = ets:Step(Data, Key),
+            case visible(Row, Version, Data, History) of
+                {ok, Value, Written} ->
+                    Left1 =
+                        case Left of
+                            infinity -> infinity;
+                            _ -> Left - 1
+                        end,
+                    scan_walk(Next, Step, Stop, Version, Tables, Left1, [{Key, Value, Written} | Acc]);
+                not_found ->
+                    scan_walk(Next, Step, Stop, Version, Tables, Left, Acc)
+            end;
+        false ->
+            lists:reverse(Acc)
+    end;
+scan_walk(_EndOfTableOrNoneLeft, _Step, _Stop, _Version, _Tables, _Left, Acc) ->
+    lists:reverse(Acc).
+
+%% Whether the key is on the side of the bound that the walk comes from.
+within(Key, next_lookup, {excl, To}) -> Key < To;
+within(Key, next_lookup, {incl, To}) -> Key =< To;
+within(Key, prev_lookup, {excl, From}) -> Key > From;
+within(Key, prev_lookup, {incl, From}) -> Key >= From.
 
 %% Reads the rows of the range in the order of the keys, and performs the
 %% second read for each row that has a value at `Version'. `Left' is the
