@@ -252,10 +252,15 @@ The most important limitations are:
 ## Requirements
 
 - Erlang/OTP 28 and rebar3.
-- peace. `rebar.config` declares it as a git dependency. For local
-  development, link a checkout at `_checkouts/peace`.
+- peace. `rebar.config` declares it as a git dependency, and `rebar.lock`
+  records its commit. `rebar3 upgrade peace` moves the lock to the newest
+  commit of the branch `main`. For local development, link a checkout at
+  `_checkouts/peace`.
 - eta, for `make dst` only. The `dst` profile of `rebar.config` declares
-  it. For local development, link a checkout at `_checkouts/eta`.
+  it and fixes its commit, because `rebar.lock` does not hold the
+  dependencies of a profile. For local development, link a checkout at
+  `_checkouts/eta`.
+- A checkout in `_checkouts` replaces the recorded commit.
 - Java 11 or later for the TLC targets. The TLC jar is in `formal/vendor`.
 
 ## Source layout

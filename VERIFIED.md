@@ -76,7 +76,7 @@ Dependencies with a `VERIFIED.md`:
 
 | Dependency | Version | Entries relied on | Used for | Treatment |
 |---|---|---|---|---|
-| [peace](https://github.com/jessestimpson/peace/blob/main/VERIFIED.md) | The `main` branch. `rebar.config` fixes no version, and `rebar.lock` is empty. | `C1`, `C2`, `C3`, `K1`, `K2`, `K4`, `K5`, `D1`, `D2`, `L1`, `L2`, `L3` | The coordinated state, which is assumption `A1`. The coordinators are a peace cluster with majority quorums, the write-ahead log backend, no read leases, no sessions and no membership change. A value is proposed with `peace:propose/3` and read with `peace:consistent_query/3`. | `TLC`: assumed. `Recovery.tla` has one register with the atomic operations `LockCState` and `WriteCState`. `SIM`: replaced by one `redwall_cstate_local` process in 43 tests, and included in the 9 tests with the name `peace_`. `UNIT`: included in the tests of the coordinated state, the coordinator and the recovery, and replaced in others. |
+| [peace](https://github.com/jessestimpson/peace/blob/main/VERIFIED.md) | The commit that `rebar.lock` records. | `C1`, `C2`, `C3`, `K1`, `K2`, `K4`, `K5`, `D1`, `D2`, `L1`, `L2`, `L3` | The coordinated state, which is assumption `A1`. The coordinators are a peace cluster with majority quorums, the write-ahead log backend, no read leases, no sessions and no membership change. A value is proposed with `peace:propose/3` and read with `peace:consistent_query/3`. | `TLC`: assumed. `Recovery.tla` has one register with the atomic operations `LockCState` and `WriteCState`. `SIM`: replaced by one `redwall_cstate_local` process in 43 tests, and included in the 9 tests with the name `peace_`. `UNIT`: included in the tests of the coordinated state, the coordinator and the recovery, and replaced in others. |
 
 Comparison of the use with the bounds of the entries relied on:
 
@@ -101,7 +101,7 @@ behaviour assumed.
 | Dependency | Version | Used for | Behaviour assumed |
 |---|---|---|---|
 | Erlang/OTP: the emulator, `kernel` and `stdlib`, with ETS | 28.3 in GitHub Actions | Processes, distribution, ETS tables and timers | A message between two processes is not altered. An ETS table returns the objects that were written to it. |
-| [eta](https://github.com/jessestimpson/eta) | The `main` branch. No version is fixed. | `SIM` | A run is determined by its seed. The simulated network, clock and disk produce only faults that a real system can produce. |
+| [eta](https://github.com/jessestimpson/eta) | The commit that the `dst` profile of `rebar.config` fixes. `rebar.lock` does not hold the dependencies of a profile. | `SIM` | A run is determined by its seed. The simulated network, clock and disk produce only faults that a real system can produce. |
 | TLC | The jar in `formal/vendor` | `TLC` | TLC visits every reachable state of a model and reports every violation, except for a state that a fingerprint collision hides. |
 | EUnit | The version in Erlang/OTP | `UNIT`, and the runner of `SIM` | A test that fails is reported as failed. |
 
