@@ -69,8 +69,9 @@ Sequencers recover at the same time, at most one of them writes.
 - The coordinated state of redwall records an owner for the recovery
   count, so that a lock or a write that is proposed a second time after a
   timeout has no second effect. This part is not in the paper.
-- A LogServer of redwall keeps the records in memory. FoundationDB writes
-  the records to disk. This part is not in the paper.
+- A LogServer of redwall keeps the records in memory, with every
+  storage engine. FoundationDB writes the records to disk. This part is
+  not in the paper.
 - The recovery copies each record to every new LogServer. FoundationDB
   copies a record to the new LogServers that replicate the tags of the
   record.
@@ -84,9 +85,12 @@ Sequencers recover at the same time, at most one of them writes.
 - The Sequencer of redwall sends the recovery transaction itself, after
   the write of the coordinated state. The master of FoundationDB sends it
   through a proxy, before the write of the coordinated state.
-- The StorageServer keeps the data in memory. A StorageServer of
-  FoundationDB keeps the versions of the MVCC window in memory and writes
-  older data to disk. This part is not in the paper.
+- With the storage engine `ets`, the StorageServer keeps the data in
+  memory. A StorageServer of FoundationDB keeps the versions of the MVCC
+  window in memory and writes older data to its storage engine on a
+  disk. redwall has the interface of a storage engine
+  ([redwall_storage_engine](../src/redwall_storage_engine.erl)) and no
+  engine on a disk. This part is not in the paper.
 - The rule for the oldest version of the StorageServer is not taken from
   the FoundationDB source.
 - Each StorageServer has every key. FoundationDB divides the key space

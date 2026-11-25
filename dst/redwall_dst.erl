@@ -1064,10 +1064,26 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
         end,
         storages(Tab)
     ),
+    %% A ClusterController, a worker and a StorageServer start temporary
+    %% processes with a monitor and without a link: a read of the
+    %% coordinated state, a pop, a recruitment, a question to the peers.
+    %% Such a process does not end with the process that started it. The
+    %% harness kills it too. Otherwise it runs after the end of the run,
+    %% in real time, and can act during the next run of the same Erlang
+    %% node.
+    Parents =
+        [Pid || [Pid] <- ets:match(Tab, {{controller, '_'}, '$1'})] ++
+            [Pid || [Pid] <- ets:match(Tab, {{worker, '_'}, '$1', '_'})] ++
+            [Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})],
+    Temporary = lists:usort([
+        Child
+     || Parent <- Parents, {monitors, Monitors} <- [erlang:process_info(Parent, monitors)], {process, Child} <- Monitors, is_pid(Child)
+    ]),
     %% The ClusterControllers and the workers are killed first, so that
     %% no ClusterController recruits after this point.
     ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{controller, '_'}, '$1'})]),
     ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{worker, '_'}, '$1', '_'})]),
+    ok = kill_all(Temporary),
     Started =
         [Pid || [Pid] <- ets:match(Tab, {{sequencer, '_'}, '$1'})] ++
             [Pid || [Pid] <- ets:match(Tab, {{resolver, '_'}, '$1'})] ++
@@ -1567,14 +1583,16 @@ storage_rollback(Tab, Storages, CState) ->
             end
     end.
 
-%% The published state of a StorageServer, with the rows of the table of
-%% the data. The table does not exist after the kill of the
-%% StorageServer.
+%% The published state of a StorageServer, with every version of every
+%% key of its storage engine in the key `data'. The StorageServer
+%% publishes the view of its store, which has no private table. See
+%% `view/1' of `redwall_storage_ets'. The store of the engine
+%% `ets' does not exist after the kill of the StorageServer.
 observe(Storage) ->
     case eta_observe:read(Storage) of
-        Published = #{data := _Table, history := _History} ->
+        Published = #{engine := Engine, view := View} ->
             try
-                Published#{data := redwall_storage:versions(Published)}
+                Published#{data => redwall_storage:versions(#{engine => Engine, store => View})}
             catch
                 error:badarg -> no_table
             end;

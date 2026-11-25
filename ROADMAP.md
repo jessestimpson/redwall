@@ -6,7 +6,7 @@ the design.
 
 ## Current status
 
-State on 2026-11-24.
+State on 2026-11-25.
 
 | Part | Status |
 |---|---|
@@ -14,7 +14,7 @@ State on 2026-11-24.
 | Coordinated state on peace | Done. A coordinator keeps its data on a disk (`redwall_coordinator`) |
 | LogServer | Done in memory. A LogServer discards the records that every StorageServer of the cluster has stored |
 | Process of an epoch: Sequencer, Resolver and Proxy | Done, as one process |
-| StorageServer | Done in memory, in ETS tables, with a copy from another StorageServer |
+| StorageServer | Done, with a copy from another StorageServer. A cluster is configured with a storage engine. The one engine, `ets`, keeps the data in ETS tables in memory |
 | ClusterController and workers | Done: election, recruitment, one LogServer for each worker |
 | Client with the function names of erlfdb | The basic functions, `select`, `get_mapped_range`, the tuple layer, idempotency ids, list keys and binary keys, range options, key selectors and watches |
 | Status | Done: the health of a cluster and its fault tolerance in Erlang nodes (`redwall_status`) |
@@ -269,9 +269,9 @@ has the basic functions. The remaining parts, in the planned order:
       while the cluster has no epoch.
 - [x] Start a cluster again after the stop of every node: a recovery
       that finds `replication` LogServers of the previous epoch lost
-      resets the database. The cluster starts without data. The reset is
-      the default for LogServers in memory, which the log system records
-      in the key `durability`. The log, the event `reset` of the
+      resets the database. A cluster with the storage engine `ets`
+      then starts without data. The reset is the default for LogServers
+      in memory, which the log system records in the key `durability`. The log, the event `reset` of the
       ClusterController and the key `generation` of the status report a
       reset.
 - [ ] Recover from a StorageServer after the loss of LogServers. A
@@ -281,6 +281,33 @@ has the basic functions. The remaining parts, in the planned order:
       version are lost, so the recovery must report them.
 - [ ] Keep the data over the stop of every node. This needs LogServers
       or StorageServers on disk.
+  - [x] Configure a cluster with a storage engine: the behaviour
+        `redwall_storage_engine`, the engine `ets` with the present
+        properties, the setting `storage_engine`, and the engine in the
+        status.
+  - [ ] Divide the StorageServer as FoundationDB does: the versions of
+        the MVCC window in memory, and older versions in the engine. The
+        interface of an engine changes for this.
+  - [ ] Read the data of an engine at the start of a StorageServer.
+  - [ ] Write a storage engine on a disk, for data that does not fit in
+        memory.
+  - [ ] Record the storage engine in the coordinated state, and refuse
+        a StorageServer with another engine.
+- [ ] Remove the dependence of the simulation on the order of pids. The
+      harness lists the StorageServers in the order of their pids
+      (`lists:sort(ets:match(Tab, {{storage, '_'}, '$1', '_', '$2'}))` in
+      `dst/redwall_dst.erl`, in 2 places), and the node of a client
+      follows that list. The Erlang VM reuses pid values after it has
+      created about 1,048,576 processes, and the order of pids is then
+      not the order of creation. Found on 2026-11-25:
+      `pop_determinism_test_` with 45 seeds fails near its end, and
+      passes with its 6 seeds. The correction is an order by the place
+      of the StorageServer. It changes the trace of every seed, so the
+      statistics of [docs/verification.md](docs/verification.md) must
+      be measured again. Other sorts of pids in `src/` and `dst/` must
+      be searched for. eta reports the condition as `sched.pid_reuse`.
+      `make dst-serial` runs every test in one VM and can reach the
+      limit; this was not checked.
 - [ ] Model the election and the recruitment in TLA+, or state why the
       recovery count makes a model unnecessary.
 - [ ] Shard the key space over StorageServers, with tags on log records:
@@ -338,13 +365,14 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
       of type `ordered_set`.
 - [x] Read from the ETS table of the StorageServer in the process of the
       client, without a message to the StorageServer.
-- [x] Keep the data of the StorageServer in memory, in ETS tables.
+- [x] Keep the data of the StorageServer in memory, in ETS tables. This
+      is the storage engine `ets`.
 - [x] Write an interface that follows the functions of `ets`: the
       application etx, in its own repository. Its unit tests compare it
       with an ETS table of the type `ordered_set`.
-- [x] State what a restart of every node loses: the data of every table.
-      The coordinators write to disk, and the LogServers and the
-      StorageServers do not.
+- [x] State what a restart of every node loses with the storage engine
+      `ets`: the data of every table. The coordinators write to disk,
+      and the LogServers and the StorageServers do not.
 - [ ] Decide whether this configuration gets LogServers on disk, or a
       rule for the start after the stop of every node.
 - [ ] Measure the latency and the throughput of reads and of commits

@@ -39,6 +39,9 @@ init([]) ->
                     end
                 ]}
         }
-     || {ok, Options} <- [application:get_env(redwall, storage)]
+     || {ok, Options0} <- [application:get_env(redwall, storage)],
+        %% The storage engine of the cluster. See
+        %% `redwall_storage_engine'.
+        Options <- [maps:merge(#{engine => application:get_env(redwall, storage_engine, ets)}, Options0)]
     ],
     {ok, {#{strategy => one_for_one}, Coordinator ++ Worker ++ Storage}}.

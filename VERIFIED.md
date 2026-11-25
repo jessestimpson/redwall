@@ -59,9 +59,10 @@ contains two of the three subjects.
   acknowledged transactions holds while at most 1 of the 3 LogServers of
   each epoch has stopped. When the LogServers of an epoch are lost, the
   recovery resets the database.
-- **A5. At least one node keeps running.** The LogServers and the
-  StorageServers keep their data in memory. After the stop of every node,
-  the cluster starts without data.
+- **A5. At least one node keeps running.** The LogServers keep their data
+  in memory. A StorageServer with the storage engine `ets` keeps its data
+  in memory, and every check uses the engine `ets`. After the stop of
+  every node, the cluster starts without data.
 - **A6. A read uses a read version from a Proxy.** A read at another
   version can return a write that a recovery discards.
 - **A7. The two MVCC windows are equal.** The window of the StorageServer
@@ -287,6 +288,13 @@ Entries without a planted defect that is specific to them:
 - **The loss of 2 LogServers of one epoch, and the reset of the
   database.** The simulation kills at most 1 LogServer of each epoch.
 - **The stop of every node.**
+- **A storage engine other than `ets`.** A cluster is configured with a
+  storage engine, a module with the behaviour `redwall_storage_engine`.
+  redwall has one engine, `ets`, and every entry is a statement about a
+  cluster with that engine. One unit test, `engine` in
+  `test/redwall_storage_tests.erl`, runs a StorageServer with an engine
+  of the test. No simulation test and no model has another engine, and
+  no check covers an engine that keeps data after a stop.
 - **The replacement of a coordinator whose data is lost, and a change of
   the coordinators.** redwall has no function for them.
 - **A value of the coordinated state that is applied twice.** The module

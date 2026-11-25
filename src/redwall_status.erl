@@ -103,6 +103,12 @@
 
 -type status() :: #{
     healthy := boolean(),
+    %% The storage engine of the StorageServers that answer: its name,
+    %% `undefined' if none answers, or `{differ, Names}'. See
+    %% `redwall_storage_engine'. `storage_durability' is `memory' if a
+    %% StorageServer that stops loses its data, and `disk' otherwise.
+    storage_engine := redwall_storage_engine:engine() | undefined | {differ, [redwall_storage_engine:engine()]},
+    storage_durability := memory | disk | undefined,
     epoch := redwall_cstate:epoch() | undefined,
     %% The number of resets of the database after the loss of LogServers,
     %% or `undefined' if the coordinated state does not answer. See
@@ -189,9 +195,24 @@ status(Options = #{coordinators := Coordinators}) ->
         storages => Storages,
         epoch => Epoch
     },
-    Problems = problems(View, CState, Controller, Given),
+    %% The storage engines of the StorageServers that answer.
+    Engines = lists:usort([redwall_storage_engine:name(Engine) || {_Node, #{engine := Engine}} <- Storages]),
+    Problems = problems(View, CState, Controller, Given) ++ [{storage_engines_differ, Engines} || length(Engines) > 1],
     #{
         healthy => Problems =:= [],
+        storage_engine =>
+            case Engines of
+                [] -> undefined;
+                [Engine] -> Engine;
+                _ -> {differ, Engines}
+            end,
+        %% Whether the data of the storage engine is there after a stop of
+        %% a StorageServer: `memory' or `disk'.
+        storage_durability =>
+            case lists:usort([Durability || {_Node, #{durability := Durability}} <- Storages]) of
+                [Durability] -> Durability;
+                _ -> undefined
+            end,
         epoch => Epoch,
         %% The number of resets of the database.
         generation =>
@@ -328,7 +349,7 @@ node_of(Name) when is_atom(Name) -> node().
 %% The version of a StorageServer and whether it copies, or `down'.
 storage(Storage) ->
     try redwall_storage:info(Storage) of
-        Info -> maps:with([version, copying], Info)
+        Info -> maps:with([version, copying, engine, durability], Info)
     catch
         exit:_ -> down
     end.

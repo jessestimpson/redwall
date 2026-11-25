@@ -95,30 +95,27 @@
 %%   write.</li>
 %% </ul>
 %%
-%% == Store ==
+%% == Storage engine ==
 %%
-%% FoundationDB has an ordered keyspace. The StorageServer keeps the keys
-%% in their order, so that a read or a clear of a key range examines only
-%% the keys of the range. The order of the keys is the order of Erlang
-%% terms.
+%% The StorageServer keeps the keys and the values in a storage engine
+%% ({@link redwall_storage_engine}). The option `engine' selects the
+%% engine, and a cluster has one engine.
 %%
 %% <ul>
-%% <li>The data is an ETS table of type `ordered_set' with one row for each
-%%   key: `{Key, Version, Change}', the newest version of the key.
-%%   `Change' is `{set, Value}', or `clear' for a version without a
-%%   value. The table is `protected', so another process can read it.
-%%   `info/1' returns the table.</li>
-%% <li>A second ETS table of type `ordered_set' has one row
-%%   `{{Key, -Version}, Change}' for each older version of a key. The
-%%   rows of a key are in the order from the highest version to the
-%%   lowest one, so the first row at or after `{Key, -V}' is the last
-%%   version of the key at or below `V'. A read or a write of a key
-%%   therefore does not depend on the number of versions of the key.</li>
-%% <li>A second ETS table of type `ordered_set' has one row
-%%   `{{Version, Key}}' for each version above the oldest version. With
-%%   this table, a rollback examines only the versions that it removes,
-%%   and a rise of the oldest version examines only the versions that
-%%   leave the MVCC window.</li>
+%% <li>The engine `ets' is the default and the only engine of redwall
+%%   ({@link redwall_storage_ets}). It keeps the data in ETS tables in
+%%   memory, and a StorageServer with it loses its data when it
+%%   stops.</li>
+%% <li>FoundationDB has an ordered keyspace. An engine keeps the keys in
+%%   their order, so that a read or a clear of a key range examines only
+%%   the keys of the range. The order of the keys is the order of Erlang
+%%   terms.</li>
+%% <li>`info/1' returns the module of the engine, the view of its store
+%%   for another process, and the durability of the engine.</li>
+%% <li>A process other than the StorageServer has the view of the store
+%%   (`view/1' of the engine) and not the store: a client with a handle,
+%%   the process of a page of a copy, and the harness of the simulation.
+%%   The view of the engine `ets' has no private table.</li>
 %% </ul>
 %%
 %% == Select ==
@@ -319,8 +316,8 @@
 %%
 %% == Equal keys ==
 %%
-%% The tables of the store are of the type `ordered_set', which compares
-%% two keys with `=='. Two keys that are equal and not identical are one
+%% The tables of the engine `ets' are of the type `ordered_set', which
+%% compares two keys with `=='. Two keys that are equal and not identical are one
 %% key, as in an ETS table of that type: an integer and a float with the
 %% same value, also as a part of a key, for example `[users, 1]' and
 %% `[users, 1.0]'. A write of one of them replaces the other, and a read
@@ -369,8 +366,9 @@
 %%
 %% == Direct reads ==
 %%
-%% A client can read the table of the data in its own process, without a
-%% message to the StorageServer (`handle/1' and `read_direct/3'). The
+%% A client can read the store of the storage engine in its own process,
+%% without a message to the StorageServer (`handle/1' and
+%% `read_direct/3'). The rules below are those of the engine `ets'. The
 %% StorageServer publishes its version and its oldest version in an
 %% `atomics' array for this purpose:
 %%
@@ -392,10 +390,6 @@
 %%   uses the table of the older versions reads the row of the key again
 %%   afterwards, and starts again if that row has changed.</li>
 %% </ul>
-%%
-%% Two benchmarks compared layouts of the store. The benchmarks are not
-%% part of this repository. See "The store of the StorageServer" in
-%% `docs/storage-server.md'.
 %%
 %% == Replicas ==
 %%
@@ -459,10 +453,10 @@
 %% == Departures from the paper ==
 %%
 %% <ul>
-%% <li>The StorageServer keeps the data in memory, and loses the data
-%%   below the MVCC window. A StorageServer of FoundationDB keeps the
-%%   versions of the MVCC window in memory and writes older data to disk.
-%%   This part is not in the paper.</li>
+%% <li>With the storage engine `ets', the StorageServer keeps the data
+%%   in memory. A StorageServer of FoundationDB keeps the versions of the
+%%   MVCC window in memory and writes older data to its storage engine
+%%   on a disk. This part is not in the paper.</li>
 %% <li>Each StorageServer has every key. FoundationDB divides the key
 %%   space into shards. Each shard has a team of StorageServers, and a
 %%   StorageServer reads the records with its tag.</li>
@@ -480,12 +474,13 @@
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
--eta_observe({state, [version, oldest, data, history, rollbacks, copies, resets, popped, watching, watches_fired, watches_timed_out]}).
+-eta_observe({state, [version, oldest, engine, view, rollbacks, copies, resets, popped, watching, watches_fired, watches_timed_out]}).
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1, stored/2]).
 -export([read_range/4, read_range/5, read_range_with_version/5]).
 -export([handle/1, read_direct/3, versions/1]).
+-export_type([version/0]).
 -export([select/7, select_rows/2, mapped_range/7, scan/6, watch_value/5, watch_request/4]).
 -export_type([watched/0]).
 -export_type([bound/0, scan_options/0]).
@@ -525,6 +520,11 @@
     %% ended epoch is not a Known Committed Version. See "Known Committed
     %% Version" in the module documentation.
     committed_at_epoch_end => boolean(),
+    %% The storage engine: `ets' (the default), or a module with the
+    %% behaviour `redwall_storage_engine'. Every StorageServer of a
+    %% cluster has the same engine. See "Storage engine" in the module
+    %% documentation.
+    engine => redwall_storage_engine:engine(),
     %% A registered name for the StorageServer, so that a StorageServer of
     %% another node can name it as a peer: `{Name, Node}'.
     name => atom(),
@@ -540,12 +540,12 @@
     peers => [gen_server:server_ref()] | fun(() -> [gen_server:server_ref()] | undefined)
 }.
 
-%% The table of the data and the published versions of a StorageServer.
-%% Element 1 of `published' is the version, and element 2 is the oldest
+%% The storage engine, the view of its store and the published versions
+%% of a StorageServer. Element 1 of `published' is the version, and element 2 is the oldest
 %% version. `wait' is `false' only with the planted defect `wait => false'.
 -type handle() :: #{
-    data := ets:tid(),
-    history := ets:tid(),
+    engine := module(),
+    store := redwall_storage_engine:store(),
     published := atomics:atomics_ref(),
     wait => boolean(),
     features => [select | mapped_range | scan]
@@ -570,9 +570,6 @@
 %% the second read, and the rows that the second read found.
 -type mapped_row() :: {{term(), term()}, {binary(), binary()}, [{term(), term()}]}.
 
-%% The number of rows that a select reads before it runs the match spec
-%% on them.
--define(SELECT_BATCH, 100).
 
 %% The number of keys of a page of a copy, the time limit for the answer
 %% of a peer to the start of a copy, the time before a new start of a
@@ -602,13 +599,13 @@
     oldest = 0 :: version(),
     %% The highest Known Committed Version that a LogServer has sent.
     kcv = 0 :: version(),
-    %% The ETS table of the data, with the rows `{Key, Versions}'. See
-    %% "Store" above.
-    data :: ets:tid(),
-    history :: ets:tid(),
-    %% The ETS table with a row `{{Version, Key}}' for each version above
-    %% the oldest version.
-    changes :: ets:tid(),
+    %% The module of the storage engine, and its store. See "Storage
+    %% engine" in the module documentation.
+    engine :: module(),
+    store :: redwall_storage_engine:store(),
+    %% The part of the store for a process other than the StorageServer:
+    %% a direct read, a page of a copy, and the simulation.
+    view :: redwall_storage_engine:store(),
     %% The version and the oldest version for direct reads.
     published :: atomics:atomics_ref(),
     %% The log systems of all epochs, from the last read of the coordinated
@@ -866,7 +863,7 @@ mapped_range(Storage, Begin, End, Mapper, Limit, Version, Timeout) ->
 %% function for the writes of a transaction that is not committed.
 -spec select_rows([{term(), term()}], ets:match_spec()) -> [{term(), term()}].
 select_rows(Rows, MatchSpec) ->
-    ets:match_spec_run(Rows, ets:match_spec_compile(with_key(MatchSpec))).
+    redwall_storage_engine:select_rows(Rows, MatchSpec).
 
 %% @doc Returns the handle for direct reads, or an error if the
 %% StorageServer does not answer.
@@ -890,8 +887,7 @@ handle(Storage) ->
 %% <li>`gone': the table does not exist. The StorageServer has stopped.</li>
 %% </ul>
 -spec read_direct(handle(), query(), version()) -> {ok, term()} | behind | too_old | gone.
-read_direct(Handle = #{data := Data0, history := History, published := Published}, Query, Version) ->
-    Data = {Data0, History},
+read_direct(Handle = #{engine := Engine, store := Store, published := Published}, Query, Version) ->
     %% Element 3 changes when the StorageServer removes its data after a
     %% reset of the database. A read that started before that is not
     %% answered from the tables.
@@ -900,7 +896,7 @@ read_direct(Handle = #{data := Data0, history := History, published := Published
         false ->
             behind;
         true ->
-            try lookup(Query, Version, Data) of
+            try Engine:read(Store, Query, Version) of
                 Result ->
                     case {Version < atomics:get(Published, 2), atomics:get(Published, 3)} of
                         {_, Other} when Other =/= Resets -> behind;
@@ -934,10 +930,13 @@ read_direct(Handle = #{data := Data0, history := History, published := Published
         watches := non_neg_integer(),
         watches_fired := non_neg_integer(),
         watches_timed_out := non_neg_integer(),
-        %% The ETS table of the data. See "Store" in the module
-        %% documentation.
-        data := ets:tid(),
-        history := ets:tid()
+        %% The module of the storage engine, the view of its store for
+        %% another process, and whether the data of the engine is there
+        %% after a stop of the StorageServer.
+        %% See "Storage engine" in the module documentation.
+        engine := module(),
+        store := redwall_storage_engine:store(),
+        durability := memory | disk
     }.
 info(Storage) ->
     gen_server:call(Storage, info).
@@ -959,6 +958,8 @@ stored(Storage, Timeout) ->
 
 %% @private
 init(Options = #{coordinators := Coordinators}) ->
+    Engine = redwall_storage_engine:module(maps:get(engine, Options, ets)),
+    Store = Engine:new(Options),
     State = #state{
         coordinators = Coordinators,
         poll_ms = maps:get(poll_ms, Options, ?POLL_MS),
@@ -968,9 +969,9 @@ init(Options = #{coordinators := Coordinators}) ->
         check_window = maps:get(check_window, Options, true),
         clear = maps:get(clear, Options, true),
         wait = maps:get(wait, Options, true),
-        data = ets:new(redwall_storage_data, [ordered_set, protected, {read_concurrency, true}]),
-        history = ets:new(redwall_storage_history, [ordered_set, protected, {read_concurrency, true}]),
-        changes = ets:new(redwall_storage_changes, [ordered_set, private]),
+        engine = Engine,
+        store = Store,
+        view = Engine:view(Store),
         watches = ets:new(redwall_storage_watches, [ordered_set, private]),
         watch_timeout_ms = maps:get(watch_timeout_ms, Options, ?WATCH_TIMEOUT_MS),
         max_watches = maps:get(max_watches, Options, ?MAX_WATCHES),
@@ -1046,9 +1047,7 @@ handle_continue({probed, Answer, Probe}, State) ->
             %% `too_old'.
             ok = atomics:put(State#state.published, 2, Version),
             ok = atomics:put(State#state.published, 1, 0),
-            true = ets:delete_all_objects(State#state.data),
-            true = ets:delete_all_objects(State#state.history),
-            true = ets:delete_all_objects(State#state.changes),
+            ok = (State#state.engine):clear(State#state.store),
             State1 = (watch_drop(State))#state{
                 copy = #{peer => Peer, ref => Ref, version => Version, next => first},
                 version = 0,
@@ -1071,10 +1070,10 @@ handle_continue({probed, Answer, Probe}, State) ->
         {_NoPeerIsAhead, reprobe} ->
             {noreply, State#state{copy = undefined}}
     end;
-handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, version := Version, next := Next}, data = Data}) ->
+handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, version := Version, next := Next}, engine = Engine, store = Store}) ->
     try gen_server:call(Peer, {copy_page, Ref, Next, ?COPY_PAGE}, ?TIMEOUT_MS) of
         {ok, Rows, done} ->
-            true = ets:insert(Data, [{Key, Written, {set, Value}} || {Key, Written, Value} <- Rows]),
+            ok = Engine:load(Store, Rows),
             ok = gen_server:cast(Peer, {copy_done, Ref}),
             ok = atomics:put(State#state.published, 2, Version),
             ok = atomics:put(State#state.published, 1, Version),
@@ -1096,7 +1095,7 @@ handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, v
                     })
                 )};
         {ok, Rows, {next, Last}} ->
-            true = ets:insert(Data, [{Key, Written, {set, Value}} || {Key, Written, Value} <- Rows]),
+            ok = Engine:load(Store, Rows),
             {noreply, State#state{copy = Copy#{next := {after_key, Last}}}, {continue, copy}};
         {error, _Reason} ->
             copy_again(State)
@@ -1105,8 +1104,8 @@ handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, v
     end.
 
 %% Removes the copied keys, and starts the copy again later.
-copy_again(State = #state{data = Data}) ->
-    true = ets:delete_all_objects(Data),
+copy_again(State = #state{engine = Engine, store = Store}) ->
+    ok = Engine:clear(Store),
     _ = erlang:send_after(?COPY_RETRY_MS, self(), copy),
     {noreply, State#state{copy = probe}}.
 
@@ -1180,8 +1179,8 @@ handle_call({copy_page, Ref, Next, Limit}, From, State = #state{pins = Pins}) ->
             Timer1 = erlang:send_after(?COPY_PIN_MS, self(), {unpin, Ref}),
             %% A temporary process reads the page, and the StorageServer
             %% applies records in that time.
-            Tables = {State#state.data, State#state.history},
-            _ = spawn(fun() -> gen_server:reply(From, copy_page(Next, Limit, Version, Tables)) end),
+            #state{engine = Engine, view = View} = State,
+            _ = spawn(fun() -> gen_server:reply(From, Engine:page(View, Next, Limit, Version)) end),
             {noreply, State#state{pins = Pins#{Ref := {Version, Timer1}}}};
         _ ->
             {reply, {error, expired}, State}
@@ -1211,8 +1210,9 @@ handle_call(info, _From, State = #state{version = Version, system = System, roll
         watches => State#state.watching + length(State#state.watch_waiting),
         watches_fired => State#state.watches_fired,
         watches_timed_out => State#state.watches_timed_out,
-        data => State#state.data,
-        history => State#state.history
+        engine => State#state.engine,
+        store => State#state.view,
+        durability => (State#state.engine):durability()
     },
     {reply, Info, State};
 handle_call(stop, _From, State) ->
@@ -1364,9 +1364,7 @@ generation(#{generation := Generation}, State = #state{generation = Mine, copy =
     %% of resets.
     ok = atomics:put(State#state.published, 1, 0),
     ok = atomics:add(State#state.published, 3, 1),
-    true = ets:delete_all_objects(State#state.data),
-    true = ets:delete_all_objects(State#state.history),
-    true = ets:delete_all_objects(State#state.changes),
+    ok = (State#state.engine):clear(State#state.store),
     ok = atomics:put(State#state.published, 2, 0),
     lists:foreach(fun({From, _Query, _Version}) -> gen_server:reply(From, {error, transaction_too_old}) end, State#state.waiting),
     (watch_drop(State))#state{
@@ -1434,39 +1432,13 @@ start(System, State) ->
 rollback(End, State = #state{rollback = false}) ->
     %% The planted defect `rollback => false'.
     State#state{version = End, buffer = gb_trees:empty()};
-rollback(End, State = #state{changes = Changes, rollbacks = Rollbacks}) ->
+rollback(End, State = #state{engine = Engine, store = Store, rollbacks = Rollbacks}) ->
     ok = atomics:put(State#state.published, 1, End),
-    ok = remove_above(End, ets:last(Changes), State),
+    ok = Engine:rollback(Store, End),
     %% A removed write can be the reason that the value of a watch did not
     %% differ, so the StorageServer reads the key of every watch again.
     watch_ready(watch_requeue(State#state{version = End, buffer = gb_trees:empty(), rollbacks = Rollbacks + 1})).
 
-%% Removes the versions above `End', from the highest version down. The
-%% oldest version is at or below `End', so the table of the versions has a
-%% row for each of them. The highest version of a key is in the row of the
-%% key. After its removal, the next version of the key moves from the
-%% table of the older versions to the row of the key.
-remove_above(End, {Version, Key} = Row, State = #state{data = Data, history = History, changes = Changes}) when Version > End ->
-    Previous = ets:prev(Changes, Row),
-    true = ets:delete(Changes, Row),
-    case ets:lookup(Data, Key) of
-        [{_Stored, Version, _Change}] ->
-            case ets:next_lookup(History, {Key, -Version}) of
-                {{Same, Negative} = Older, [{Older, Change}]} when Same == Key ->
-                    %% The row of the key changes before the older version
-                    %% leaves its table, so a direct read finds the
-                    %% version in one of the two.
-                    true = ets:insert(Data, {Key, -Negative, Change}),
-                    true = ets:delete(History, Older);
-                _NoOlderVersionOfTheKey ->
-                    true = ets:delete(Data, Key)
-            end;
-        _ ->
-            true
-    end,
-    remove_above(End, Previous, State);
-remove_above(_End, _RowAtOrBelowEndOrNoRow, _State) ->
-    ok.
 
 %% ---------------------------------------------------------------------------
 %% Records
@@ -1586,66 +1558,13 @@ without_clears({batch, Entries}, #state{clear = false}) ->
 without_clears(Body, _State) ->
     Body.
 
-write({batch, Entries}, LSN, State) ->
-    lists:foreach(fun(Entry) -> write_entry(Entry, LSN, State) end, Entries);
+%% Applies the mutations of each transaction of a record, in their order.
+%% An entry that is not a list has no transaction.
+write({batch, Entries}, LSN, #state{engine = Engine, store = Store}) ->
+    lists:foreach(fun(Entry) -> ok = Engine:write(Store, LSN, Entry) end, [Entry || Entry <- Entries, is_list(Entry)]);
 write(_NoTransaction, _LSN, _State) ->
     ok.
 
-%% Applies the mutations of one transaction, in their order.
-write_entry(Entry, LSN, State = #state{data = Data}) when is_list(Entry) ->
-    lists:foreach(
-        fun
-            ({set, Key, Value}) ->
-                put_version(Key, LSN, {set, Value}, ets:lookup(Data, Key), State);
-            ({clear, Key}) ->
-                clear_key(Key, LSN, ets:lookup(Data, Key), State);
-            ({clear_range, Begin, End}) ->
-                %% The rows of the range are read before the first change.
-                lists:foreach(fun(Row = {Key, _Version, _Change}) -> clear_key(Key, LSN, [Row], State) end, rows(Begin, End, Data));
-            (_Other) ->
-                ok
-        end,
-        Entry
-    );
-write_entry(_NoTransaction, _LSN, _State) ->
-    ok.
-
-%% Adds the version `LSN' of `Key'. `Change' is `{set, Value}' or `clear'.
-%% `Row' is the result of the lookup of the key. If a mutation of the same
-%% record changed the key before, the new change replaces that one.
-%% Otherwise the version of the row moves to the table of the older
-%% versions. That table gets its row first, so a direct read finds the
-%% version in one of the two tables.
-put_version(Key, LSN, Change, Row, #state{data = Data, history = History, changes = Changes}) ->
-    case Row of
-        [{_Stored, Version, Earlier}] when Version < LSN -> true = ets:insert(History, {{Key, -Version}, Earlier});
-        _SameRecordOrNoRow -> true
-    end,
-    true = ets:insert(Data, {Key, LSN, Change}),
-    true = ets:insert(Changes, {{LSN, Key}}),
-    ok.
-
-%% A clear of a key without a value adds no version.
-clear_key(Key, LSN, Row = [{_Stored, _Version, {set, _Value}}], State) ->
-    put_version(Key, LSN, clear, Row, State);
-clear_key(_Key, _LSN, _NoRowOrNoValue, _State) ->
-    ok.
-
-%% The rows of the keys `K' with `Begin =< K' and `K < End', in the order
-%% of the keys. The function reads only these rows and the row after
-%% them.
-rows(Begin, End, Data) ->
-    First =
-        case ets:lookup(Data, Begin) of
-            [Row] -> {Begin, [Row]};
-            [] -> ets:next_lookup(Data, Begin)
-        end,
-    rows_until(First, End, Data).
-
-rows_until({Key, [Row]}, End, Data) when Key < End ->
-    [Row | rows_until(ets:next_lookup(Data, Key), End, Data)];
-rows_until(_RowAtOrAfterEndOrEndOfTable, _End, _Data) ->
-    [].
 
 %% ---------------------------------------------------------------------------
 %% MVCC window
@@ -1664,48 +1583,12 @@ advance_oldest(State = #state{version = Version, kcv = KCV, oldest = Oldest, win
             %% it are removed. With the planted defect
             %% `check_window => false' it is not published.
             _ = State#state.check_window andalso atomics:put(State#state.published, 2, New),
-            ok = remove_old(New, ets:first(State#state.changes), State),
+            ok = (State#state.engine):advance(State#state.store, New),
             State#state{oldest = New};
         _ ->
             State
     end.
 
-%% Handles the versions at or below `Oldest', from the lowest version up.
-%% For the key of each such version, the function removes the versions
-%% that no read at or above `Oldest' returns. The row of the version leaves
-%% the table of the versions. The last version of a key at or below
-%% `Oldest' stays in the data without such a row, until a later version of
-%% the key is at or below a later oldest version.
-remove_old(Oldest, {Version, Key} = Row, State = #state{data = Data, history = History, changes = Changes}) when Version =< Oldest ->
-    Next = ets:next(Changes, Row),
-    true = ets:delete(Changes, Row),
-    %% No read at or above `Oldest' returns a version of the key below
-    %% `Version'.
-    ok = delete_older(ets:next(History, {Key, -Version}), Key, History),
-    %% `Version' is the last version of the key at or below `Oldest', or a
-    %% later row of this pass removes it. If it is a clear, the key has no
-    %% value at `Version', and the row is not needed.
-    case ets:lookup(Data, Key) of
-        [{_Stored, Version, clear}] ->
-            true = ets:delete(Data, Key);
-        [{_Stored, Newest, _Change}] when Newest > Version ->
-            case ets:lookup(History, {Key, -Version}) of
-                [{Older, clear}] -> true = ets:delete(History, Older);
-                _ -> true
-            end;
-        _ ->
-            true
-    end,
-    remove_old(Oldest, Next, State);
-remove_old(_Oldest, _RowAboveOldestOrNoRow, _State) ->
-    ok.
-
-delete_older({Same, _Negative} = Older, Key, History) when Same == Key ->
-    Next = ets:next(History, Older),
-    true = ets:delete(History, Older),
-    delete_older(Next, Key, History);
-delete_older(_RowOfAnotherKeyOrEndOfTable, _Key, _History) ->
-    ok.
 
 %% ---------------------------------------------------------------------------
 %% Reads
@@ -1745,7 +1628,7 @@ answer(From, Query, Version, State) when element(1, Query) =:= select; element(1
     end),
     ok;
 answer(From, Query, Version, State) ->
-    gen_server:reply(From, lookup(Query, Version, {State#state.data, State#state.history})),
+    gen_server:reply(From, (State#state.engine):read(State#state.store, Query, Version)),
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -1799,9 +1682,9 @@ watch_timer(Key, Ref, #state{watch_timeout_ms = Ms}) ->
 
 %% Whether the value of the key at the version of the StorageServer
 %% differs from the value of a watch.
-watch_differs(Key, Value, #state{version = Version, data = Data, history = History}) ->
+watch_differs(Key, Value, #state{version = Version, engine = Engine, store = Store}) ->
     Now =
-        case lookup({key, Key}, Version, {Data, History}) of
+        case Engine:read(Store, {key, Key}, Version) of
             {ok, Stored, _Written} -> {ok, Stored};
             not_found -> not_found
         end,
@@ -1932,251 +1815,16 @@ unpin(Ref, State = #state{pins = Pins}) ->
             State
     end.
 
-%% One page of a copy: up to `Limit' keys after `Next' with their values
-%% at `Version', as `{Key, Written, Value}'. `Written' is the version of
-%% the write. The result also has `{next, LastKey}', or `done' after the
-%% last key.
-copy_page(Next, Limit, Version, {Data, History}) ->
-    First =
-        case Next of
-            first -> ets:first_lookup(Data);
-            {after_key, Key} -> ets:next_lookup(Data, Key)
-        end,
-    try
-        copy_rows(First, Limit, Version, {Data, History}, [], none)
-    catch
-        %% The StorageServer has stopped.
-        error:badarg -> {error, gone}
-    end.
-
-copy_rows('$end_of_table', _Left, _Version, _Tables, Acc, _Last) ->
-    {ok, lists:reverse(Acc), done};
-copy_rows(_Row, 0, _Version, _Tables, Acc, Last) ->
-    {ok, lists:reverse(Acc), {next, Last}};
-copy_rows({Key, [Row]}, Left, Version, Tables = {Data, History}, Acc, _Last) ->
-    Acc1 =
-        case visible(Row, Version, Data, History) of
-            {ok, Value, Written} -> [{Key, Written, Value} | Acc];
-            not_found -> Acc
-        end,
-    copy_rows(ets:next_lookup(Data, Key), Left - 1, Version, Tables, Acc1, Key).
 
 %% The handle for direct reads. `features' has the kinds of read that this
 %% StorageServer supports in addition to keys and ranges.
-handle_of(#state{data = Data, history = History, published = Published, wait = Wait}) ->
-    #{data => Data, history => History, published => Published, wait => Wait, features => [select, mapped_range, scan]}.
+handle_of(#state{engine = Engine, view = View, published = Published, wait = Wait}) ->
+    #{engine => Engine, store => View, published => Published, wait => Wait, features => Engine:features()}.
 
-lookup({key, Key}, Version, {Data, History}) ->
-    case ets:lookup(Data, Key) of
-        [Row] -> visible(Row, Version, Data, History);
-        [] -> not_found
-    end;
-lookup({range, Begin, End}, Version, {Data, History}) ->
-    {ok, [
-        {Key, Value, Written}
-     || Row = {Key, _Newest, _Change} <- rows(Begin, End, Data), {ok, Value, Written} <- [visible(Row, Version, Data, History)]
-    ]};
-lookup({scan, From, To, Options}, Version, Tables = {Data, _History}) ->
-    Limit = maps:get(limit, Options, infinity),
-    case maps:get(reverse, Options, false) of
-        false ->
-            First =
-                case From of
-                    {incl, Key} ->
-                        %% The key of the row can be equal to `Key' and
-                        %% not identical. The result has the stored key.
-                        case ets:lookup(Data, Key) of
-                            [Row] -> {element(1, Row), [Row]};
-                            [] -> ets:next_lookup(Data, Key)
-                        end;
-                    {excl, Key} ->
-                        ets:next_lookup(Data, Key)
-                end,
-            {ok, scan_walk(First, next_lookup, To, Version, Tables, Limit, [])};
-        true ->
-            Last =
-                case To of
-                    {incl, Key} ->
-                        case ets:lookup(Data, Key) of
-                            [Row] -> {element(1, Row), [Row]};
-                            [] -> ets:prev_lookup(Data, Key)
-                        end;
-                    {excl, Key} ->
-                        ets:prev_lookup(Data, Key)
-                end,
-            {ok, scan_walk(Last, prev_lookup, From, Version, Tables, Limit, [])}
-    end;
-lookup({select, Begin, End, MatchSpec, Limit}, Version, {Data, History}) ->
-    Compiled = ets:match_spec_compile(with_key(MatchSpec)),
-    First =
-        case ets:lookup(Data, Begin) of
-            [Row] -> {Begin, [Row]};
-            [] -> ets:next_lookup(Data, Begin)
-        end,
-    {ok, select_walk(First, End, Version, {Data, History}, Compiled, Limit, [], 0, [], 0)};
-
-lookup({mapped, Begin, End, Mapper, Limit}, Version, Tables = {Data, _History}) ->
-    case redwall_mapper:compile(Mapper) of
-        {ok, Compiled} ->
-            First =
-                case ets:lookup(Data, Begin) of
-                    [Row] -> {Begin, [Row]};
-                    [] -> ets:next_lookup(Data, Begin)
-                end,
-            mapped_walk(First, End, Version, Tables, Compiled, Limit, []);
-        {error, Reason} ->
-            {error, {mapper, Reason}}
-    end.
-
-%% Reads the rows from `{Key, [Row]}' on with the function `Step' of
-%% `ets', which is `next_lookup' or `prev_lookup', until the bound `Stop'
-%% or until the result has `Left' keys with a value at `Version'.
-scan_walk({Key, [Row]}, Step, Stop, Version, Tables = {Data, History}, Left, Acc) when Left =/= 0 ->
-    case within(Key, Step, Stop) of
-        true ->
-            Next = ets:Step(Data, Key),
-            case visible(Row, Version, Data, History) of
-                {ok, Value, Written} ->
-                    Left1 =
-                        case Left of
-                            infinity -> infinity;
-                            _ -> Left - 1
-                        end,
-                    scan_walk(Next, Step, Stop, Version, Tables, Left1, [{Key, Value, Written} | Acc]);
-                not_found ->
-                    scan_walk(Next, Step, Stop, Version, Tables, Left, Acc)
-            end;
-        false ->
-            lists:reverse(Acc)
-    end;
-scan_walk(_EndOfTableOrNoneLeft, _Step, _Stop, _Version, _Tables, _Left, Acc) ->
-    lists:reverse(Acc).
-
-%% Whether the key is on the side of the bound that the walk comes from.
-within(Key, next_lookup, {excl, To}) -> Key < To;
-within(Key, next_lookup, {incl, To}) -> Key =< To;
-within(Key, prev_lookup, {excl, From}) -> Key > From;
-within(Key, prev_lookup, {incl, From}) -> Key >= From.
-
-%% Reads the rows of the range in the order of the keys, and performs the
-%% second read for each row that has a value at `Version'. `Left' is the
-%% number of rows that the result can still take.
-mapped_walk({Key, [Row]}, End, Version, Tables = {Data, History}, Compiled, Left, Acc) when Key < End, Left =/= 0 ->
-    Next = ets:next_lookup(Data, Key),
-    case visible(Row, Version, Data, History) of
-        {ok, Value, _Written} ->
-            case redwall_mapper:key(Compiled, Key, Value) of
-                {ok, Mapped} ->
-                    Mode = redwall_mapper:mode(Compiled),
-                    Range = redwall_mapper:range(Mode, Mapped),
-                    Found = second_read(Mode, Range, Version, Tables),
-                    Left1 =
-                        case Left of
-                            infinity -> infinity;
-                            _ -> Left - 1
-                        end,
-                    mapped_walk(Next, End, Version, Tables, Compiled, Left1, [{{Key, Value}, Range, Found} | Acc]);
-                {error, Reason} ->
-                    {error, {mapper, Reason}}
-            end;
-        not_found ->
-            mapped_walk(Next, End, Version, Tables, Compiled, Left, Acc)
-    end;
-mapped_walk(_RowAtOrAfterEndOrEndOfTableOrNoneLeft, _End, _Version, _Tables, _Compiled, _Left, Acc) ->
-    {ok, lists:reverse(Acc)}.
-
-second_read(point, {Key, _After}, Version, Tables) ->
-    case lookup({key, Key}, Version, Tables) of
-        {ok, Value, _Written} -> [{Key, Value}];
-        not_found -> []
-    end;
-second_read(range, {Begin, End}, Version, Tables) ->
-    {ok, Rows} = lookup({range, Begin, End}, Version, Tables),
-    [{Key, Value} || {Key, Value, _Written} <- Rows].
-
-%% Reads the rows of the range in the order of the keys, and runs the
-%% match spec on batches of `{Key, Value}' with the value of each key at
-%% `Version'. The function reads only the rows of the range, and stops
-%% when it has `Limit' results. `Batch' has the rows of the open batch,
-%% and `Acc' has the results of the earlier batches, both with the last
-%% one first.
-select_walk({Key, [Row]}, End, Version, Tables = {Data, History}, Compiled, Limit, Batch, Size, Acc, Count) when Key < End ->
-    Batch1 =
-        case visible(Row, Version, Data, History) of
-            {ok, Value, _Written} -> [{Key, Value} | Batch];
-            not_found -> Batch
-        end,
-    Next = ets:next_lookup(Data, Key),
-    case Size + 1 of
-        ?SELECT_BATCH ->
-            Results = ets:match_spec_run(lists:reverse(Batch1), Compiled),
-            case Count + length(Results) of
-                Enough when Enough >= Limit -> select_results([Results | Acc], Limit);
-                Count1 -> select_walk(Next, End, Version, Tables, Compiled, Limit, [], 0, [Results | Acc], Count1)
-            end;
-        Size1 ->
-            select_walk(Next, End, Version, Tables, Compiled, Limit, Batch1, Size1, Acc, Count)
-    end;
-select_walk(_RowAtOrAfterEndOrEndOfTable, _End, _Version, _Tables, Compiled, Limit, Batch, _Size, Acc, _Count) ->
-    select_results([ets:match_spec_run(lists:reverse(Batch), Compiled) | Acc], Limit).
-
-select_results(Acc, infinity) -> lists:append(lists:reverse(Acc));
-select_results(Acc, Limit) -> lists:sublist(lists:append(lists:reverse(Acc)), Limit).
-
-%% The match spec with the key of the row in each result: the result of a
-%% clause is `{Key, Result}', where `Result' is the result of the body of
-%% the caller. The row of the match spec is `{Key, Value}', so the key is
-%% the first element of `$_'.
-with_key(MatchSpec) when is_list(MatchSpec) ->
-    [
-        {Head, Guards, lists:droplast(Body) ++ [{{{element, 1, '$_'}, lists:last(Body)}}]}
-     || {Head, Guards, Body = [_ | _]} <- MatchSpec
-    ];
-with_key(_NoList) ->
-    error(badarg).
-
-%% The value of the last version of the key at or below `Version'. `Row'
-%% is the row of the key, which has the newest version. An older version
-%% is in the table of the older versions, with the key `{Key, -Version}',
-%% so the first row at or after `{Key, -Version}' is the last version at
-%% or below `Version'.
-%%
-%% A direct read runs in another process while the StorageServer changes
-%% the tables. A rollback moves a version from the table of the older
-%% versions to the row of the key. The read therefore reads the row of the
-%% key again after the table of the older versions, and starts again if
-%% the row has changed.
-visible({_Key, Written, Change}, Version, _Data, _History) when Written =< Version ->
-    value(Written, Change);
-visible(Row = {Key, _Newest, _Change}, Version, Data, History) ->
-    Older =
-        case ets:lookup(History, {Key, -Version}) of
-            [{_, Change}] ->
-                value(Version, Change);
-            [] ->
-                case ets:next_lookup(History, {Key, -Version}) of
-                    {{Same, Negative}, [{_, Change}]} when Same == Key -> value(-Negative, Change);
-                    _NoVersionAtOrBelow -> not_found
-                end
-        end,
-    case ets:lookup(Data, Key) of
-        [Row] -> Older;
-        [Changed] -> visible(Changed, Version, Data, History);
-        [] -> not_found
-    end.
-
-value(Written, {set, Value}) -> {ok, Value, Written};
-value(_Written, clear) -> not_found.
-
-%% @doc Returns every version of every key, from the tables of `info/1' or
-%% of `handle/1': a map from the key to the list of `{Version, Change}'
+%% @doc Returns every version of every key, from the result of `info/1'
+%% or of `handle/1': a map from the key to the list of `{Version, Change}'
 %% with the highest version first. `Change' is `{set, Value}' or `clear'.
 %% The function is for tests and for the simulation. It reads every row.
--spec versions(#{data := ets:tid(), history := ets:tid(), _ => _}) -> #{term() => [{version(), {set, term()} | clear}]}.
-versions(#{data := Data, history := History}) ->
-    Older = lists:foldr(
-        fun({{Key, Negative}, Change}, Acc) -> maps:update_with(Key, fun(List) -> [{-Negative, Change} | List] end, [{-Negative, Change}], Acc) end,
-        #{},
-        ets:tab2list(History)
-    ),
-    maps:from_list([{Key, [{Version, Change} | maps:get(Key, Older, [])]} || {Key, Version, Change} <- ets:tab2list(Data)]).
+-spec versions(#{engine := module(), store := redwall_storage_engine:store(), _ => _}) -> #{term() => [{version(), {set, term()} | clear}]}.
+versions(#{engine := Engine, store := Store}) ->
+    Engine:versions(Store).

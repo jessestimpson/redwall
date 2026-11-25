@@ -76,6 +76,7 @@ their options.
 |---|---|---|
 | `worker` | The options of `redwall_worker:start_link/1`: `coordinators`, `class`, `candidate` for a candidate for the ClusterController on the node, and `name` for a node that runs the workers of several clusters | The worker of the node. With `candidate`, the worker starts the candidate, and the two processes stop together |
 | `storage` | The options of `redwall_storage:start_link/1`: `coordinators` | The StorageServer of the node |
+| `storage_engine` | `ets` (the default), or a module with the behaviour `redwall_storage_engine`. Every node of a cluster has the same value. See [The storage engine](storage-server.md#the-storage-engine) | None. The supervisor gives the value to the StorageServer of the node |
 | `coordinator` | The options of `redwall_coordinator:start_link/1`: `id` and `dir`, both required | The coordinator of the node: one server of the peace cluster with the coordinated state. The supervisor starts it before the worker and the StorageServer |
 
 Example, in `sys.config`, for a node that runs every role:
@@ -172,6 +173,8 @@ redwall_status:status(#{
 | Key of the result | Meaning |
 |---|---|
 | `generation` | The number of resets of the database after the loss of LogServers |
+| `storage_engine` | The storage engine of the StorageServers that answer: `ets`, `undefined` if none answers, or `{differ, Names}` |
+| `storage_durability` | `memory` if a StorageServer that stops loses its data, which holds for the engine `ets`. `disk` otherwise |
 | `healthy` | The cluster has an epoch that the ClusterController has given to the workers, and every coordinator, every LogServer of the epoch and every StorageServer runs and is current |
 | `fault_tolerance` | `max_node_failures_without_losing_data` and `max_node_failures_without_losing_availability`: the numbers of nodes that can stop at the same time. `safe_to_stop`: the nodes whose stop alone leaves the cluster available |
 | `nodes` | The coordinator, the worker, the LogServers of the epoch and the StorageServer of each node |

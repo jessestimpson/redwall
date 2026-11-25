@@ -17,8 +17,8 @@ transaction system of FoundationDB, and follows this paper:
   client of FoundationDB.
 - A [peace](https://github.com/jessestimpson/peace) cluster has the role
   of the Coordinators.
-- Every part except the Coordinators keeps its data in memory. See
-  "Limitations".
+- A cluster is configured with a storage engine. redwall has one
+  engine, `ets`, which keeps the data in memory. See "Limitations".
 
 [etx](https://github.com/jessestimpson/etx) is an application on redwall
 with the interface of `ets`.
@@ -45,8 +45,9 @@ redwall is experimental. It is not ready for data that must not be lost.
 | Recovery after the failure of a role | Done |
 | Election of a ClusterController, and recruitment of the roles on the nodes | Done |
 | Replication of the log on several nodes | Done, in memory |
-| Replication of the data on several nodes | Done, in memory. Each StorageServer has every key |
-| Data on disk | Not done. Only the Coordinators write to disk |
+| Replication of the data on several nodes | Done. Each StorageServer has every key |
+| Selection of a storage engine for a cluster | Done: the interface of an engine, and the setting `storage_engine`. redwall has one engine, `ets`, with the data in memory |
+| Data on disk | Not done. No storage engine writes to disk, and the LogServers do not. Only the Coordinators write to disk |
 | Shards of the key space | Not done |
 | The whole API of erlfdb | In progress. See "Limitations" |
 
@@ -93,8 +94,9 @@ end).
   window of 5 seconds.
 - **Ordered keys.** A key is an Erlang term, and the keys are in the
   order of Erlang terms. The tuple layer of erlfdb is included.
-- **Reads without a message.** A client on the node of a StorageServer
-  reads the ETS tables of the StorageServer in its own process.
+- **Reads without a message.** With the storage engine `ets`, a client
+  on the node of a StorageServer reads the ETS tables of the
+  StorageServer in its own process.
 - **Range reads.** `redwall:get_range/4` has the options `limit` and
   `reverse` of erlfdb, and `redwall:get_key/2` resolves a key selector.
   The StorageServer reads only the keys of the result.
@@ -111,6 +113,10 @@ end).
   LogServers on different nodes. The cluster starts a new epoch after
   the failure of a role. A new StorageServer copies the data from
   another StorageServer.
+- **Storage engine.** A cluster is configured with a storage engine,
+  as a cluster of FoundationDB is. The engine `ets` keeps the data in
+  ETS tables in memory. A module with the behaviour
+  `redwall_storage_engine` is another engine.
 - **Status.** `redwall_status:status/1` returns the health of a cluster,
   the number of nodes that can fail, and the nodes that are safe to
   stop.
@@ -130,7 +136,7 @@ design.
 | Proxy | Gives read versions and commits transactions | [redwall_epoch](src/redwall_epoch.erl) |
 | Resolver | Checks a transaction for conflicts | [redwall_epoch](src/redwall_epoch.erl), [redwall_resolver](src/redwall_resolver.erl) |
 | LogServer | Stores the log records of an epoch | [redwall_log](src/redwall_log.erl) |
-| StorageServer | Stores data and answers reads at a version | [redwall_storage](src/redwall_storage.erl) |
+| StorageServer | Stores data and answers reads at a version | [redwall_storage](src/redwall_storage.erl), with a storage engine: [redwall_storage_engine](src/redwall_storage_engine.erl), [redwall_storage_ets](src/redwall_storage_ets.erl) |
 
 The largest departure from the paper: the Sequencer, the Proxy and the
 Resolver of an epoch are one Erlang process. A commit then has one round
@@ -146,7 +152,7 @@ The design is in [docs](docs/README.md):
 | [docs/log-server.md](docs/log-server.md) | The LogServer and the pop |
 | [docs/recovery.md](docs/recovery.md) | The recovery, the versions, and the reset after the loss of LogServers |
 | [docs/transactions.md](docs/transactions.md) | The Proxy, the batches, the read versions and the Resolver |
-| [docs/storage-server.md](docs/storage-server.md) | The StorageServer, its store, select, the mapped range read and the watches |
+| [docs/storage-server.md](docs/storage-server.md) | The StorageServer, the storage engine, select, the mapped range read and the watches |
 | [docs/client.md](docs/client.md) | The client, the kinds of key, the watches and the idempotency ids |
 | [docs/cluster.md](docs/cluster.md) | The ClusterController, the start of a node, the coordinators and the status |
 | [docs/verification.md](docs/verification.md) | The simulation, its invariants and its results |
@@ -159,7 +165,7 @@ Each module also has its design in its module documentation.
 
 | Level | What it checks | Command | Time |
 |---|---|---|---|
-| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 129 tests | `make test` | 30 seconds |
+| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 130 tests | `make test` | 30 seconds |
 | Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 52 tests with about 1,900 seeds and 24 planted defects | `make dst` | about 4 minutes |
 | Model checking | Three TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer; the Resolver; and the watch. 13 planted bugs | `make tlc` | about 6 minutes |
 | Model checking | The recovery with 3 epochs | `make tlc-long` | about 4 hours |
@@ -195,8 +201,8 @@ in `formal/` changes.
 
 `make bench` runs a cluster of 7 Erlang nodes on one computer
 ([bench/redwall_bench.erl](bench/redwall_bench.erl)). Results of one run
-on 2026-11-23 on a computer with 10 cores. Every node keeps its data in
-memory, and a message between two nodes has no network delay.
+on 2026-11-23 on a computer with 10 cores. The cluster has the storage engine `ets`, so every node keeps its data
+in memory, and a message between two nodes has no network delay.
 
 | Operation | Clients | Operations per second | p50 |
 |---|---|---|---|
@@ -210,11 +216,16 @@ memory, and a message between two nodes has no network delay.
 
 The most important limitations are:
 
-- The LogServers and the StorageServers keep their data in memory. After
-  the stop of every node, the cluster starts without data.
-- When the LogServers of an epoch are lost, the recovery resets the
-  database, and the cluster continues without data. The log and the
-  status report a reset.
+- redwall has one storage engine, `ets`. The following holds for a
+  cluster with this engine:
+  - The LogServers and the StorageServers keep their data in memory.
+    After the stop of every node, the cluster starts without data.
+  - When the LogServers of an epoch are lost, the recovery resets the
+    database, and the cluster continues without data. The log and the
+    status report a reset.
+- A storage engine that keeps the data over the stop of every node does
+  not exist. It also needs LogServers on disk, or a recovery from the
+  StorageServers.
 - Each StorageServer has every key. The key space has no shards.
 - One process performs the conflict checks of an epoch. redwall cannot
   add Proxies or Resolvers.

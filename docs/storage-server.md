@@ -21,6 +21,8 @@ way (`fetchKeys` of `fdbserver/storageserver.actor.cpp`).
 4. If every peer that answers has no data, the new StorageServer reads
    the log from the start, as at the start of a new cluster.
 
+- A StorageServer with the storage engine `ets` starts without data,
+  because the engine keeps the data in memory.
 - Without the copy, a new StorageServer reads every record from the
   LogServers of every epoch. A LogServer keeps its records in memory, so
   after the stops of several nodes a record of an earlier epoch can be on
@@ -122,24 +124,64 @@ StorageServers, and each mutation has the tags of the team of its key
 The team is the list of StorageServers that the caller of
 `redwall:open/1` names.
 
-## The store of the StorageServer
+## The storage engine
+
+A StorageServer keeps the keys and the values in a storage engine. A
+cluster of FoundationDB is configured with one storage engine
+(`configure ssd`, `configure memory`). redwall follows this.
+
+| Engine | Module | Data | Data of a StorageServer after its stop |
+|---|---|---|---|
+| `ets` (default) | [redwall_storage_ets](../src/redwall_storage_ets.erl) | ETS tables in memory | Lost |
+
+- The key `storage_engine` of the environment of the application sets
+  the engine of a node. Every node of a cluster has the same value. See
+  [Start](cluster.md#start).
+- [redwall_storage_engine](../src/redwall_storage_engine.erl) is the
+  behaviour of an engine. Its functions are: write the mutations of a
+  transaction at a version, remove the writes above a version (the
+  rollback), set the oldest version, read at a version, read and store
+  the rows of a copy, and remove every key. `view/1` returns the part
+  of the store for a process other than the StorageServer: a client that
+  reads in its own process, the process of a page of a copy, and the
+  harness of the simulation.
+- A value of `storage_engine` that is not `ets` is the name of a module
+  with this behaviour.
+- `redwall_status:status/1` has the engine in the key `storage_engine`,
+  and the problem `storage_engines_differ` if two StorageServers have
+  two engines.
+
+Limitations:
+
+- redwall has no engine that writes to disk.
+- The interface is that of the engine `ets`: the engine keeps the
+  versions of the MVCC window. A StorageServer of FoundationDB keeps
+  these versions in memory for every engine, and writes only older
+  versions to the engine. An engine on a disk will need that division,
+  and the interface will change for it.
+- A StorageServer does not read the data of an engine at its start.
+- The LogServers keep their records in memory with every engine, so an
+  engine on a disk alone does not keep the data of a cluster over the
+  stop of every node.
+
+### The engine `ets`
 
 FoundationDB has an ordered keyspace. Every structure of redwall that
 holds keys keeps the keys in their order.
 
-- The data of the StorageServer is an ETS table of type `ordered_set`
+- The data of the engine is an ETS table of type `ordered_set`
   with one row for each key. The row has the newest version of the key.
 - A second ETS table of type `ordered_set` has one row for each older
   version of a key, with the key and the version as its key. A read at a
   version below the newest version of a key reads one row of this
   table.
-- A second ETS table of type `ordered_set` has one row for each version
+- A third ETS table of type `ordered_set` has one row for each version
   above the oldest version. A rollback examines only the versions that it
   removes. A rise of the oldest version examines only the versions that
   leave the MVCC window.
-- The table of the data is readable by other processes.
-  `redwall_storage:info/1` returns it. No part of redwall reads it
-  directly yet.
+- The table of the data is readable by other processes. A client on the
+  node of the StorageServer reads it in its own process. See
+  [The client](client.md).
 
 The owner of the project chose this layout from two benchmarks of
 2026-11-22 and 2026-11-23, which are not part of this repository:

@@ -99,9 +99,10 @@ of a LogServer in the keys `popped` and `records`.
 
 Limitations:
 
-- After a pop, the discarded records are on the StorageServers only, and
-  a StorageServer keeps its data in memory. If every StorageServer with
-  these records stops while LogServers run, the data is lost. A new
+- After a pop, the discarded records are on the StorageServers only.
+  With the storage engine `ets`, a StorageServer keeps its data in
+  memory. If every StorageServer with these records stops while
+  LogServers run, the data is then lost. A new
   StorageServer then applies no record, and the database is not reset.
   Before the pop, a new StorageServer read every record from the
   LogServers in this case.

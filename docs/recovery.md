@@ -72,8 +72,9 @@ source.
 
 ## Reset after the loss of LogServers
 
-A LogServer keeps its records in memory. When `replication` LogServers of
-an epoch do not run, a record of that epoch can be on no LogServer, and
+This section holds for a cluster with the storage engine `ets`, which
+is the only engine of redwall. A LogServer of such a cluster keeps its
+records in memory. When `replication` LogServers of an epoch do not run, a record of that epoch can be on no LogServer, and
 no recovery can end the epoch. This is the state of a cluster after the
 stop of every node, and after the stop of a second node before the
 cluster has recovered from the stop of the first.
@@ -115,7 +116,11 @@ The option `reset_after_log_loss => false` of the process of an epoch
 turns the reset off. The recovery then fails with `too_few_replies`, and
 the cluster has no epoch.
 
-- The data of the database is lost by a reset.
+- The data of the database is lost by a reset. With the storage engine
+  `ets`, each StorageServer has its data in memory and removes it. A
+  storage engine on a disk would have data at the time of a reset, and
+  a recovery from that data is not built. See
+  [ROADMAP.md](../ROADMAP.md).
 - The default is `false`: the recovery fails, and the cluster has no
   epoch. FoundationDB has no reset, because its LogServers write to disk.
 - The Resolver rejects a transaction with a read version at or above its

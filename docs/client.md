@@ -65,7 +65,7 @@ end).
   | Profile | For | `retry_delay_ms` | `max_retry_delay_ms` | `direct` |
   |---|---|---|---|---|
   | `default` | The values of FoundationDB | 10 | 1,000 | `true` |
-  | `ets` | The StorageServer of redwall, with the data in ETS tables in memory | 1 | 100 | `true` |
+  | `ets` | A StorageServer with the storage engine `ets`, which has the data in ETS tables in memory | 1 | 100 | `true` |
   `transactional/2` then runs the function again.
 
 ## Keys

@@ -51,8 +51,9 @@
 - Two processes that use one transaction at the same time get no error.
 - The simulation does not use `transactional/2` and `on_error/2`. Unit
   tests cover them.
-- The StorageServer keeps the data in memory, and loses the data when it
-  stops. A new StorageServer copies the data from another StorageServer.
+- redwall has one storage engine, `ets`. With it, the StorageServer
+  keeps the data in memory, and loses the data when it stops. A new
+  StorageServer copies the data from another StorageServer.
   Without another StorageServer with data, it reads every record again
   from the LogServers, which is possible only while the LogServers of
   every epoch run and have discarded no record.
@@ -66,6 +67,11 @@
   from the StorageServer to the client.
 - In the simulation, a read that returns no value is accepted when a
   transaction without a known result cleared the key at any version.
+- The harness of the simulation orders the StorageServers by pid. After
+  about 1,048,576 processes in one Erlang VM, the VM reuses pid values,
+  and a seed then does not reproduce a run. `dst/run.sh` runs each test
+  in a VM of its own, which stays below that number. See
+  [ROADMAP.md](../ROADMAP.md).
 - The MVCC window of the StorageServer and the MVCC window of the Resolver
   are two options. No part of redwall checks that they are equal.
 - In the simulation, a new StorageServer starts without data after a
@@ -124,8 +130,18 @@
   LogServer that does not answer.
 - The tests of the recovery stop LogServers between steps. No test stops a
   process during a step.
-- A LogServer keeps the records in memory. A LogServer that stops loses
-  the records.
+- A LogServer keeps the records in memory, with every storage engine. A
+  LogServer that stops loses the records. A cluster with the storage
+  engine `ets` therefore starts without data after the stop of every
+  node.
+- The interface of a storage engine is that of the engine `ets`: the
+  engine keeps the versions of the MVCC window. An engine on a disk
+  needs a StorageServer that keeps these versions in memory and reads
+  the engine at its start. Both are not built.
+- The coordinated state does not record the storage engine. A
+  StorageServer with another engine than the other StorageServers of
+  its cluster starts. The status reports the problem
+  `storage_engines_differ`.
 - A LogServer discards a record only after every StorageServer of the
   list of the coordinated state has stored it, and only if the list has
   `pop_storages` StorageServers. Otherwise the memory of a LogServer

@@ -21,7 +21,8 @@ storage_test_() ->
         fun(Ids) -> {timeout, 60, fun() -> reset(Ids) end} end,
         fun(Ids) -> {timeout, 30, fun() -> committed_at_epoch_end(Ids) end} end,
         fun(Ids) -> {timeout, 60, fun() -> watches(Ids) end} end,
-        fun(Ids) -> {timeout, 60, fun() -> watch_limits(Ids) end} end
+        fun(Ids) -> {timeout, 60, fun() -> watch_limits(Ids) end} end,
+        fun(Ids) -> {timeout, 60, fun() -> engine(Ids) end} end
     ]}.
 
 setup() ->
@@ -158,7 +159,8 @@ many_versions(Ids) ->
     ),
     ?assertEqual(302, Last),
     ok = await_version(Storage, 302),
-    Info = #{data := Data, history := History} = redwall_storage:info(Storage),
+    %% The store of the engine `ets' is a record with its three tables.
+    Info = #{engine := redwall_storage_ets, durability := memory, store := {store, Data, History, _Changes}} = redwall_storage:info(Storage),
     ?assertEqual([{a, 2, {set, first}}, {x, 302, {set, 302}}], ets:tab2list(Data)),
     ?assertEqual(299, ets:info(History, size)),
     ?assertEqual([{V, case V rem 10 of 0 -> clear; _ -> {set, V} end} || V <- lists:seq(302, 3, -1)], maps:get(x, redwall_storage:versions(Info))),
@@ -645,3 +647,41 @@ reset(Ids) ->
     ok = await_version(Second, V5),
     ?assertEqual({ok, [{a, new}, {c, 4}]}, redwall_storage:read_range(Second, 0, <<"z">>, V5)),
     [exit(Pid, kill) || Pid <- [Storage, Second, Proxy3, Proxy4]].
+
+%% The option `engine' selects the storage engine. The default is the
+%% engine `ets'. A module with the behaviour `redwall_storage_engine' is
+%% another engine, and the StorageServer calls it for its writes, its
+%% reads and its copy.
+engine(Ids) ->
+    {Proxy, _Logs} = epoch(Ids),
+    Default = storage(Ids),
+    {ok, Named} = redwall_storage:start(#{coordinators => Ids, poll_ms => 5, engine => ets}),
+    {ok, Other} = redwall_storage:start(#{coordinators => Ids, poll_ms => 5, engine => redwall_storage_test_engine, mvcc_window => 2}),
+    {ok, 2} = redwall_epoch:commit(Proxy, #{writes => [{a, 1}, {b, 1}]}),
+    {ok, 3} = redwall_epoch:commit(Proxy, #{mutations => [{clear, a}, {set, c, 3}]}),
+    [{ok, _} = redwall_epoch:commit(Proxy, #{writes => [{b, N}]}) || N <- lists:seq(4, 8)],
+    [ok = await_version(Storage, 8) || Storage <- [Default, Named, Other]],
+    ?assertMatch(#{engine := redwall_storage_ets, durability := memory}, redwall_storage:info(Default)),
+    ?assertMatch(#{engine := redwall_storage_ets, durability := memory}, redwall_storage:info(Named)),
+    #{engine := redwall_storage_test_engine, durability := disk, store := Store, oldest := 6} = redwall_storage:info(Other),
+    %% One call of `write/3' for each transaction.
+    ?assertEqual(7, redwall_storage_test_engine:writes(Store)),
+    [?assertEqual({ok, [{b, 8}, {c, 3}]}, redwall_storage:read_range(Storage, a, z, 8)) || Storage <- [Default, Named, Other]],
+    ?assertEqual(redwall_storage:versions(redwall_storage:info(Default)), redwall_storage:versions(redwall_storage:info(Named))),
+    %% A read in the process of the caller uses the engine of the handle.
+    {ok, Handle = #{engine := redwall_storage_test_engine, features := []}} = redwall_storage:handle(Other),
+    ?assertEqual({ok, {ok, 8, 8}}, redwall_storage:read_direct(Handle, {key, b}, 8)),
+    ?assertEqual(too_old, redwall_storage:read_direct(Handle, {key, b}, 5)),
+    %% A copy from a StorageServer with one engine to a StorageServer with
+    %% another engine.
+    {ok, Copy} = redwall_storage:start(#{coordinators => Ids, poll_ms => 5, engine => redwall_storage_test_engine, peers => [Default]}),
+    ok = await_copy(Copy, 500),
+    ok = await_version(Copy, 8),
+    ?assertMatch(#{copies := 1}, redwall_storage:info(Copy)),
+    ?assertEqual({ok, [{b, 8}, {c, 3}]}, redwall_storage:read_range(Copy, a, z, 8)),
+    %% The status has the engine of the StorageServers.
+    ?assertMatch(#{storage_engine := ets, storage_durability := memory}, redwall_status:status(#{coordinators => Ids, storages => [Default, Named]})),
+    #{storage_engine := Engines, problems := Problems} = redwall_status:status(#{coordinators => Ids, storages => [Default, Other]}),
+    ?assertEqual({differ, [ets, redwall_storage_test_engine]}, Engines),
+    ?assert(lists:member({storage_engines_differ, [ets, redwall_storage_test_engine]}, Problems), Problems),
+    [exit(Pid, kill) || Pid <- [Default, Named, Other, Copy, Proxy]].

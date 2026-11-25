@@ -35,6 +35,8 @@ documents state where redwall departs from the two sources.
 | [src/redwall_resolver.erl](../src/redwall_resolver.erl) | The conflict check of the Resolver, as functions on two ETS tables |
 | [src/redwall_epoch.erl](../src/redwall_epoch.erl) | The process of an epoch: the Sequencer, the Resolver and the Proxy |
 | [src/redwall_storage.erl](../src/redwall_storage.erl) | The StorageServer |
+| [src/redwall_storage_engine.erl](../src/redwall_storage_engine.erl) | The behaviour of a storage engine, and the names of the engines |
+| [src/redwall_storage_ets.erl](../src/redwall_storage_ets.erl) | The storage engine `ets`: the data in ETS tables in memory |
 | [src/redwall.erl](../src/redwall.erl) | The client, with the function names of erlfdb |
 | [src/redwall_status.erl](../src/redwall_status.erl) | The health of a cluster and its fault tolerance in Erlang nodes |
 | [src/redwall_key.erl](../src/redwall_key.erl) | The kinds of key, and the key range of a prefix |
