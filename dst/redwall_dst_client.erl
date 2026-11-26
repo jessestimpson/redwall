@@ -326,6 +326,10 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
                 {ok, Values, Generation, Down} ->
                     true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation, down => Down, direct => Direct, local => node() =/= clients}}),
                     ok = count_forms(Tab, read, Reads, Space),
+                    %% What the client observed, for the external checker.
+                    %% See `redwall_dst_history'.
+                    ReadEnd = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
+                    true = ets:insert(Tab, {{history, C}, #{start => Start, read_end => ReadEnd, reads => Values, outcome => read}}),
                     commit(Tab, C, Tx, Read, {Reads, Ranges}, Writes, Chosen, R, Space);
                 {error, transaction_too_old} ->
                     %% The read version is below the MVCC window of the
@@ -967,11 +971,15 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
     lists:foreach(fun({Begin, End}) -> ok = redwall:clear_range(Tx, Begin, End) end, Cleared),
     lists:foreach(fun(Key) -> ok = redwall:set(Tx, Key, {client, C}) end, Writes),
     ok = own_writes(Tab, C, Tx, ReadVersion, Writes, Clears, Space),
+    %% From here, the client does not know whether the transaction is
+    %% committed, until the commit returns.
+    ok = history(Tab, C, #{writes => canon(Writes), clears => canon(Clears), outcome => unknown}),
     try redwall:wait(redwall:commit(Tx)) of
         ok ->
             LSN = redwall:get_committed_version(Tx),
             <<LSN:64, Index:16>> = redwall:get_versionstamp(Tx),
             End = ets:update_counter(Tab, stamp, 1, {stamp, 0}),
+            ok = history(Tab, C, #{outcome => committed, 'end' => End}),
             true = ets:insert(Tab, {{txn, C}, #{
                 read_version => ReadVersion,
                 reader_epoch => ReaderEpoch,
@@ -995,12 +1003,21 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
             true = ets:insert(Tab, {{unknown, C}, Epoch}),
             after_error(Tab, Tx, 1021);
         error:{erlfdb_error, 1020} ->
+            ok = history(Tab, C, #{outcome => not_committed}),
             true = ets:insert(Tab, {{rejected, C}, not_committed}),
             after_error(Tab, Tx, 1020);
         error:{erlfdb_error, 1007} ->
+            ok = history(Tab, C, #{outcome => not_committed}),
             true = ets:insert(Tab, {{rejected, C}, transaction_too_old}),
             after_error(Tab, Tx, 1007)
     end.
+
+%% Adds `Fields' to the row of the client `C' for the external checker.
+%% See `redwall_dst_history'.
+history(Tab, C, Fields) ->
+    [{_, Row}] = ets:lookup(Tab, {history, C}),
+    true = ets:insert(Tab, {{history, C}, maps:merge(Row, Fields)}),
+    ok.
 
 %% Calls `redwall:on_error/2' after a failed commit, as
 %% `redwall:transactional/2' does. The call waits for the backoff on the

@@ -135,7 +135,9 @@ commits and recoveries, and no run violates an invariant.
 - [x] Keep only the versions of the MVCC window in the StorageServer.
 - [x] Write a client: get a read version, read, commit, retry on conflict.
       The client has the function names of erlfdb.
-- [ ] Check strict serializability of client histories with Elle.
+- [ ] Check strict serializability of client histories with Elle. The
+      simulation checks its client histories with Porcupine (`make
+      porcupine`). No check examines a history of real nodes.
 
 Done when: a Jepsen test with a transactional workload passes under kills
 and partitions.
@@ -424,6 +426,9 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
       specific to `batch_depth` above 1: the simulation finds it at the
       same seed with a `batch_depth` of 1, because a Proxy also closes a
       batch at the end of the time of the batch.
+- [x] Check the client histories of simulation runs for strict
+      serializability with Porcupine, an external checker: 250 runs, and
+      9 planted defects that Porcupine rejects.
 - [x] Make the statistics of two runs of the suite equal. Two runs
       differed by 1 in a few counters. The harness kills the temporary
       processes of a worker, of a ClusterController and of a

@@ -364,9 +364,60 @@ Limitations of the simulation:
 - No planted defect is specific to `batch_depth` above 1.
 - Temporary processes of a worker and of a ClusterController can run
   after the end of a run, until the tables of eta are deleted. They
-  write an error report. Two runs of the suite with the same source
-  differed by 1 in two counters of the statistics. The traces of the
-  runs are the same: the determinism tests compare them.
+  write an error report.
+
+### Strict serializability with Porcupine
+
+`make porcupine` checks the client histories of simulation runs with
+[Porcupine](https://github.com/anishathalye/porcupine). The check is
+independent of the invariants of the harness: it uses only what the
+clients observed, and the checker shares no code with redwall.
+
+| Part | File |
+|---|---|
+| The record of a client | `redwall_dst_client:transaction/5` writes one row for each transaction. |
+| The export of a history as JSON | [dst/redwall_dst_history.erl](../dst/redwall_dst_history.erl) |
+| The model and the checker | [dst/porcupine/main.go](../dst/porcupine/main.go) |
+| The tests | [dst/redwall_dst_porcupine_tests.erl](../dst/redwall_dst_porcupine_tests.erl) |
+
+One operation of the model is one transaction. The state is the value of
+each of the 4 keys. A transaction of the client `C` sets a key to the
+value `{client, C}`, so each value is written at most once.
+
+Results of 2026-11-26, 14 tests in 2 min 36 s:
+
+| Runs | Seeds | Operations | Verdict |
+|---|---|---|---|
+| No faults | 40 | 2,663 | ok |
+| Faults | 100 | 2,771 | ok |
+| ClusterControllers and faults | 40 | 966 | ok |
+| The pop and kills of StorageServers | 30 | 1,769 | ok |
+| Mixed keys and faults | 40 | 1,197 | ok |
+
+| Planted defect | First seed that Porcupine rejects | Invariants of the simulation at that seed |
+|---|---|---|
+| `no_check` | 1 | violation |
+| `no_range_check` | 12 | violation |
+| `no_batch_check` | 1 | violation |
+| `no_write_range` | 8 | violation |
+| `no_equal_keys`, with mixed keys | 1 | violation |
+| `no_confirm` | 58 | violation |
+| `no_report` | 2 | violation |
+| `no_clear` | 2 | violation |
+| `no_copy_rows` | 10 | ok |
+
+Limitations of this check:
+
+- Porcupine rejected no history with `no_rollback` in 300 seeds, and none
+  with `no_copy` or `ack_replicas` in 120 seeds. A client that read the
+  value of a transaction without a known result makes that transaction
+  committed in the model.
+- A transaction without a known result is in the model only if a client
+  read its value or if it cleared a key. `dst/porcupine/main.go` states
+  why this loses nothing. With every such transaction in the model, the
+  check of one history with 23 of them did not end in 17 minutes of
+  processor time.
+- No history of a run with a peace cluster or with watches was checked.
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](../dst/run.sh)). The runs without faults

@@ -34,9 +34,10 @@ It follows the [verified_md](https://github.com/jessestimpson/verified_md) conve
 | `TLC` | TLC visits every reachable state of a TLA+ model. For the temporal property `Fires`, TLC checks every behaviour under the fairness conditions of the model. | The property holds in the model, for the constants of the config. | Anything about other constants, or about the code. No check connects the code to a model. |
 | `SIM` | The processes of redwall run under [eta](https://github.com/jessestimpson/eta) with a seeded scheduler, a virtual clock and a simulated network. The harness kills nodes, cuts connections, and loses and delays messages. The harness checks invariants after every step, and further statements at the end of a run. | The invariant held at every step of every run. | Anything about a schedule that no seed produced. |
 | `UNIT` | EUnit tests in [test/](test/). | The named case behaves as stated. | Anything about other cases. |
+| `PORC` | The clients of a simulated run record what they observe: the values that a transaction read, the keys that it set and cleared, and whether its commit returned. [Porcupine](https://github.com/anishathalye/porcupine), a checker that shares no code with redwall, searches for an order of the transactions that explains every read and that agrees with the order of the transactions in time. See [dst/porcupine/main.go](dst/porcupine/main.go). | The client history of each checked run is strictly serializable. | Anything about other runs. A read of a record that a recovery discards later is accepted, unless a later read shows that the value is gone. |
 
-`TLC` is exhaustive within its bounds. `SIM` and `UNIT` are tests: each one
-checks a finite set of runs.
+`TLC` is exhaustive within its bounds. `SIM`, `PORC` and `UNIT` are tests:
+each one checks a finite set of runs.
 
 The three models are [formal/Recovery.tla](formal/Recovery.tla),
 [formal/Resolver.tla](formal/Resolver.tla) and
@@ -104,6 +105,7 @@ behaviour assumed.
 | [eta](https://github.com/jessestimpson/eta) | The commit that the `dst` profile of `rebar.config` fixes. `rebar.lock` does not hold the dependencies of a profile. | `SIM` | A run is determined by its seed. The simulated network, clock and disk produce only faults that a real system can produce. |
 | TLC | The jar in `formal/vendor` | `TLC` | TLC visits every reachable state of a model and reports every violation, except for a state that a fingerprint collision hides. |
 | EUnit | The version in Erlang/OTP | `UNIT`, and the runner of `SIM` | A test that fails is reported as failed. |
+| [Porcupine](https://github.com/anishathalye/porcupine), with Go | 1.3.1, in `dst/porcupine/go.mod`. Go 1.19 in the last recorded run. | `PORC` | Porcupine reports a history as legal only if the model of [dst/porcupine/main.go](dst/porcupine/main.go) has an order of the operations that explains the history. |
 
 ## Verified properties
 
@@ -167,6 +169,7 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `X3` | `read_value`. A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer. | `SIM` | Every run. |
 | `X4` | `own_writes`. Before the commit, the reads of a transaction return its sets and its clears. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation. | `SIM` | Every run. |
 | `X5` | `X1` to `X4`, `G1`, `G2`, `C1` and the options `reverse` and `limit` of `C2` hold with keys of 4 types: a number, an atom, a tuple and a binary. They hold when two clients use two forms of one key that are equal and not identical: `1` and `1.0`, and `{k, 3}` and `{k, 3.0}`. | `SIM` | 110 runs with mixed keys: 40 without faults and 70 with faults. These runs have no mapped range read, no `redwall:get_key/2` and no watch. No run has mixed keys with ClusterControllers, the pop or a peace cluster. No key is a list or a map. |
+| `X6` | The client history of a run is strictly serializable: the transactions have an order in which each transaction reads the values of the transactions before it, and a transaction that ended before another one started is before it. The check uses only what the clients observed, and not the commit versions. | `PORC` | 250 runs in 5 tests of [dst/redwall_dst_porcupine_tests.erl](dst/redwall_dst_porcupine_tests.erl), with 9,366 operations: 40 seeds without faults, 100 with faults, 40 with ClusterControllers and faults, 30 with the pop and kills of StorageServers, and 40 with mixed keys and faults. The history has the transactions on the 4 keys of the workload. A transaction without a known result is in the order only if a client read its value or if it cleared a key. |
 
 ### StorageServers: the code
 
@@ -263,6 +266,7 @@ Every run has:
 | `TLC` | Reachability configs. Each config reaches a state that the properties depend on. | 16 |
 | `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. `watch_no_trigger` and `watch_no_verify` are also found in the runs with clears, and `watch_no_trigger` in the runs of `H6`. | 27 |
 | `SIM` | Defects that were planted in the source on 2026-11-23 and are not in the repository | 6 |
+| `PORC` | Planted defects of the simulation whose history Porcupine rejects: `no_check`, `no_range_check`, `no_batch_check`, `no_write_range`, `no_equal_keys`, `no_confirm`, `no_report`, `no_clear` and `no_copy_rows`. For each one, Porcupine accepts the history of the same seed without the defect. Porcupine rejects `no_copy_rows` at seed 10, where no invariant of the simulation is violated. | 9 |
 
 Entries without a planted defect that is specific to them:
 
@@ -276,9 +280,13 @@ Entries without a planted defect that is specific to them:
 
 ## Not verified
 
-- **Strict serializability as one property.** `X1`, `X2` and `X3` are
-  three invariants. No check examines a whole history of transactions
-  with an independent checker.
+- **Strict serializability outside the bounds of `X6`.** No history of a
+  run with a peace cluster or with watches was checked, and the
+  transactions of the watches are in no history. Porcupine rejected no
+  history with the planted defect `no_rollback` in 300 seeds, and none
+  with `no_copy` or `ack_replicas` in 120 seeds. The invariants of the
+  simulation find these three defects. No check examines a history of
+  real nodes.
 - **The code against the models.** redwall has no trace validation. A
   property of a model is not a property of the code.
 - **The composition of the models.** Resolver assumes that a recovery
@@ -353,12 +361,10 @@ Entries without a planted defect that is specific to them:
   ordered set of bounds of the code with one version for each key.
 - In the simulation, a read that returns no value is accepted when a
   transaction without a known result cleared the key at any version.
-- 43 of the 52 simulation tests replace the peace cluster with one
+- 57 of the 66 simulation tests replace the peace cluster with one
   process.
 - In the runs with a peace cluster, a recovery waits until the first read
   of the cluster has succeeded. This wait is in the harness.
-- Two runs of the simulation suite with the same source differed by 1 in
-  two counters of the statistics. The traces of the runs are the same.
 
 ## Reproduction
 
@@ -366,6 +372,7 @@ Entries without a planted defect that is specific to them:
 |---|---|---|---|---|
 | `UNIT` | `make test` | 40 seconds | Yes, on each push | |
 | `SIM` | `make dst` | about 6 minutes | Yes, on each push | |
+| `PORC` | `make porcupine`. The command needs Go. | about 3 minutes | No | 2026-11-26: 14 tests passed in 2 min 36 s. |
 | `TLC`, quick configs | `make tlc` | about 6 minutes | Yes, on each change in `formal/` | 2026-11-22 for Recovery and Resolver, 2026-11-24 for Watch |
 | `TLC`, Recovery with 3 epochs | `make tlc-long` | about 4 hours | On a manual start | Commit `1b56582` of 2026-11-22. `Recovery.tla` has changed only in comments since that commit. |
 

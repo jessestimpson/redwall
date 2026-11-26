@@ -745,6 +745,9 @@ init(Seed, Config) ->
         partitions => maps:get(partitions, Config, true),
         %% The number of the last operation of the run, or `undefined'.
         last_op => maps:get(last_op, Config, undefined),
+        %% An ETS table of the caller for the client history of the run,
+        %% or `undefined'. See `redwall_dst_history'.
+        history => maps:get(history, Config, undefined),
         coordinators_started => false,
         %% Every process that an operation started, oldest first.
         ops => [],
@@ -1582,6 +1585,7 @@ record_run_stats(Tab, CState) ->
 
 terminate(State = #{tab := Tab, cstate := CState, ops := Ops}) ->
     ok = record_run_stats(State),
+    ok = redwall_dst_history:copy(Tab, maps:get(history, State)),
     %% A ClusterController, a worker and a StorageServer start temporary
     %% processes with a monitor and without a link: a read of the
     %% coordinated state, a pop, a recruitment, a question to the peers.

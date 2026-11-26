@@ -1,4 +1,4 @@
-.PHONY: all compile test dst dst-serial bench tlc tlc-long
+.PHONY: all compile test dst dst-serial porcupine bench tlc tlc-long
 
 all: compile
 
@@ -19,6 +19,12 @@ dst:
 
 dst-serial:
 	ERL_FLAGS="+S 1" rebar3 as dst eunit
+
+# The check of strict serializability with Porcupine, an external checker,
+# on the client histories of simulated runs. See
+# dst/redwall_dst_porcupine_tests.erl. This target needs eta and Go.
+porcupine:
+	ERL_FLAGS="+S 1" rebar3 as dst eunit --module=redwall_dst_porcupine_tests
 
 # The benchmark of a cluster of 8 Erlang nodes on this computer. See
 # bench/redwall_bench.erl.
