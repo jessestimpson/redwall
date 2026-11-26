@@ -166,6 +166,7 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `X2` | `read_version_order`. A read version is at or above the commit version of every transaction that was acknowledged before the client asked for it, in any epoch. | `SIM` | Every run. |
 | `X3` | `read_value`. A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer. | `SIM` | Every run. |
 | `X4` | `own_writes`. Before the commit, the reads of a transaction return its sets and its clears. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation. | `SIM` | Every run. |
+| `X5` | `X1` to `X4`, `G1`, `G2`, `C1` and the options `reverse` and `limit` of `C2` hold with keys of 4 types: a number, an atom, a tuple and a binary. They hold when two clients use two forms of one key that are equal and not identical: `1` and `1.0`, and `{k, 3}` and `{k, 3.0}`. | `SIM` | 110 runs with mixed keys: 40 without faults and 70 with faults. These runs have no mapped range read, no `redwall:get_key/2` and no watch. No run has mixed keys with ClusterControllers, the pop or a peace cluster. No key is a list or a map. |
 
 ### StorageServers: the code
 
@@ -191,6 +192,9 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `H1` | `watch_change`. The read of a client after a ready future returns another value than the value of the watch. | `SIM` | 210 runs with watches: 60 without faults and 150 with faults. 2 keys. No client clears a key of a watch, and the value of a key never changes back. |
 | `H2` | `watch_error`. The future of a watch whose commit failed has the error of the commit, and the future of a watch whose commit succeeded has no error. | `SIM` | The same. |
 | `H3` | `watch_fires`. At the end of a run, the future of every watch is ready if an acknowledged transaction set the key of the watch at a commit version above the version of the watch. | `SIM` | The 60 runs without faults and without a time limit of a watch. |
+| `H4` | `watch_change` with clears of the keys of the watches. When the future of a watch is ready, the read after it returns another value than the value of the watch, or the key has another value than the value of the watch at a version between the version of the watch and the read version of the read. The value at a version is the value after the last change at or below the version that no recovery discarded. | `SIM` | 220 runs in which 1 watch client in 3 clears the key: 50 without faults, 70 with faults, and the 100 runs of `H6`. The value of a key changed back in each of the 4 tests. `H2` holds in these runs. |
+| `H5` | `watch_fires` with clears. At the end of a run, each StorageServer that runs has applied the changes of the watch clients, and the future of each watch is ready if the value of the key in a StorageServer that runs differs from the value of the watch. | `SIM` | The 50 runs with clears, without faults and without a time limit of a watch. In these 50 runs no watch stayed not ready after a change and a change back. |
+| `H6` | After the faults stop, a watch becomes ready. The harness starts 4 watch clients and 2 clients that set the keys after the last operation. Each of the 6 clients commits (`late_commit`), and `H5` holds for the 4 late watches. | `SIM` | 100 runs with ClusterControllers and faults: 50 without the pop and 50 with the pop, for at most 20,000 steps after the last operation. A StorageServer of these runs has no time limit of a watch. The late changes are sets. |
 
 ### ClusterController: the code
 
@@ -212,7 +216,7 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 
 | Id | Property | Method | Bound |
 |---|---|---|---|
-| `N1` | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing. | `SIM` | 74 seeds in 5 tests, 3 runs each: 20 seeds of the basic runs, 18 with ClusterControllers, 12 with a peace cluster, 12 with the pop and 12 with watches. |
+| `N1` | The same seed gives the same trace, the trace replays, and the audit of eta reports nothing. | `SIM` | 94 seeds in 7 tests, 3 runs each: 20 seeds of the basic runs, 18 with ClusterControllers, 12 with a peace cluster, 12 with the pop, 12 with watches, 12 with mixed keys and 8 with clears of the keys of the watches and with late watches. |
 
 ### Other unit tests
 
@@ -221,11 +225,12 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `U1` | The application starts, and `redwall:open/0` returns a database, on two Erlang nodes. | `UNIT` | Two tests in `test/redwall_nodes_tests.erl`. No test cuts the connection between the two nodes. |
 | `U2` | One LogServer keeps the order of the LSNs, the Known Committed Version, repeated records and the lock. | `UNIT` | |
 | `U3` | The Proxy handles commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down. | `UNIT` | |
+| `U4` | `redwall_status:status/1` reports the epoch, the ClusterController, the storage engine, the counts of coordinators, LogServers, workers and StorageServers, and these problems: no coordinated state, a coordinator down, no epoch, no ClusterController, too few workers, a StorageServer down and a LogServer down. With 2 nodes, the fault tolerance in nodes follows from the replication degree, the StorageServers and `min_workers`. | `UNIT` | Two tests in `test/redwall_status_tests.erl`: one Erlang node, and two Erlang nodes on one computer. No test has the problems `epoch_not_recruited`, `storage_copying` or `storage_behind`, and no test has more than 2 nodes. The test `engine` of `test/redwall_storage_tests.erl` has the problem `storage_engines_differ`. |
 
 ## Simulation runs
 
 The entries with the method `SIM` and the bound "every run" refer to the
-28 tests of [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) without
+36 tests of [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) without
 a planted defect.
 
 | Runs | Seeds |
@@ -235,8 +240,11 @@ a planted defect.
 | ClusterControllers: no faults, faults, and cuts between ClusterController nodes | 50, 200 and 100 |
 | The pop: no faults, faults, and kills of StorageServers only | 30, 100 and 60 |
 | Watches: no faults, and faults | 60 and 150 |
+| Watches with clears: no faults, and faults | 50 and 70 |
+| Late watches with ClusterControllers and faults: without the pop, and with the pop | 50 and 50 |
+| Mixed keys: no faults, and faults | 40 and 70 |
 | A peace cluster: no faults, faults, and ClusterControllers | 50, 200 and 200 |
-| Determinism | 74 |
+| Determinism | 94 |
 
 Every run has:
 
@@ -253,15 +261,14 @@ Every run has:
 |---|---|---|
 | `TLC` | Configs with a planted bug. Each config produces a counterexample. | 13: 7 of Recovery, 3 of Resolver, 3 of Watch |
 | `TLC` | Reachability configs. Each config reaches a state that the properties depend on. | 16 |
-| `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. | 24 |
+| `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. `watch_no_trigger` and `watch_no_verify` are also found in the runs with clears, and `watch_no_trigger` in the runs of `H6`. | 27 |
 | `SIM` | Defects that were planted in the source on 2026-11-23 and are not in the repository | 6 |
 
 Entries without a planted defect that is specific to them:
 
 - `P2`. No planted defect violates `coordinators_agree`.
-- `K2`, `K3`, `K4`, `K7` and `K8`. No planted defect is recorded as found
-  by `unique_versions`, `no_loss`, `body_available`, `chain` or
-  `popped_stored`.
+- `K2`, `K3`, `K4` and `K8`. No planted defect is recorded as found by
+  `unique_versions`, `no_loss`, `body_available` or `popped_stored`.
 - `C2`, `C3`, `X4` and `H2`. The planted defects of `mapped_range_agrees`
   and `own_writes` are the 6 defects that are not in the repository. No
   planted defect is recorded for `range_options_agree` or `watch_error`.
@@ -302,12 +309,29 @@ Entries without a planted defect that is specific to them:
   does not change the state. No check plants it.
 - **`redwall:transactional/2` in the simulation.** Unit tests cover it.
 - **The errors of a mapper in the simulation.** Unit tests cover them.
-- **A watch that becomes ready under faults.** `H3` has no faults. In the
+- **A watch that becomes ready while faults occur.** `H3` and `H5` have
+  no faults, and `H6` starts its watches after the faults stop. In the
   runs with faults, the simulation checks only a future that is ready.
-- **A clear of a key of a watch, and a value that changes back**, in the
-  simulation. `W2` covers a value that changes back, in the model.
-- **`batch_depth` above 1.** The runs use it. No planted defect is
-  specific to it.
+- **A late change that is a clear, and late watches with a time limit of
+  a watch in the StorageServer.** See `H6`.
+- **A record that `H4` treats as kept and that a recovery discarded.**
+  The harness can accept such a record for an ended epoch with an end
+  version of 0, when the recovery lost its write of the coordinated
+  state. No run was constructed for this case.
+- **Mixed keys with ClusterControllers, the pop, a peace cluster or
+  watches, and keys that are lists or maps.** See `X5`.
+- **The original form of the Resolver defect with equal keys.** The
+  defect of commit `7b1ee91` stopped the process of an epoch. The planted
+  defect `no_equal_keys` misses a conflict and does not stop the process.
+  With the original form, 30 runs with mixed keys violated no invariant,
+  and the number of acknowledged transactions fell from about 1,130 to
+  290.
+- **`batch_depth` above 1, with a planted defect of its own.** The runs
+  use it. The planted defect `no_push_order` covers the order of two
+  records of one Proxy that are on the way at the same time. The defect
+  is not specific to `batch_depth` above 1: with `batch_depth` of 1 for
+  every Proxy, the simulation finds it at the same seed, because a Proxy
+  also closes a batch at the end of the time of the batch.
 - **A process that stops during a step of the recovery**, in the unit
   tests. The simulation kills the process of an epoch during its recovery.
 - **Real nodes under faults.** redwall has no Jepsen test. Two unit tests
@@ -340,8 +364,8 @@ Entries without a planted defect that is specific to them:
 
 | Method | Command | Time | Runs in GitHub Actions | Last recorded run |
 |---|---|---|---|---|
-| `UNIT` | `make test` | 30 seconds | Yes, on each push | |
-| `SIM` | `make dst` | about 4 minutes | Yes, on each push | |
+| `UNIT` | `make test` | 40 seconds | Yes, on each push | |
+| `SIM` | `make dst` | about 6 minutes | Yes, on each push | |
 | `TLC`, quick configs | `make tlc` | about 6 minutes | Yes, on each change in `formal/` | 2026-11-22 for Recovery and Resolver, 2026-11-24 for Watch |
 | `TLC`, Recovery with 3 epochs | `make tlc-long` | about 4 hours | On a manual start | Commit `1b56582` of 2026-11-22. `Recovery.tla` has changed only in comments since that commit. |
 

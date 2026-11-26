@@ -7,6 +7,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -export([opts/2, calm/1, run/1]).
+-export([watch_clear_live/2, watch_clear_faults/2, watch_late/2, watch_late_pop/2]).
 
 %% The limit for one test, in seconds.
 -define(TIMEOUT, 600).
@@ -417,6 +418,273 @@ watch_no_verify_is_found_test_() ->
         ?assertEqual(ok, maps:get(outcome, run(watch_faults(Seed, correct))), {seed, Seed})
     end}.
 
+%% The runs with clears of the keys of the watches. See "Runs with
+%% clears of the keys of the watches" in `redwall_dst'. 1 client in 3 with
+%% a watch clears the key, so the value of a key changes back to no
+%% value. The harness decides `watch_change' from the records of the
+%% LogServers, and `watch_fires' from the values of the StorageServers.
+%%
+%% Runs without faults, in which a StorageServer and a request of a watch
+%% have no time limit. 50 seeds.
+watch_clear_calm_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 50), fun(Seed) -> watch_clear_live(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("watch clear calm: ~p", [Stats]),
+        ok = write_stats({watch_clear_calm, 1}, Stats),
+        ?assert(maps:get(watches, Stats, 0) > 500, Stats),
+        %% Watches of each kind of transaction became ready.
+        ?assert(maps:get(watches_ready_set, Stats, 0) > 150, Stats),
+        ?assert(maps:get(watches_ready_read, Stats, 0) > 130, Stats),
+        ?assert(maps:get(watches_ready_clear, Stats, 0) > 110, Stats),
+        ?assert(maps:get(watch_rereads, Stats, 0) > 400, Stats),
+        %% The value of a key changed back.
+        ?assert(maps:get(watch_keys_changed_back, Stats, 0) > 40, Stats),
+        ?assertEqual(0, maps:get(storage_watches_timed_out, Stats, 0), Stats)
+    end}.
+
+watch_clear_live(Seed, Mode) ->
+    (opts(Seed, #{faults => false, watches => live, watch_clears => true, mode => Mode}))#{net => true, settle_steps => 20000}.
+
+%% Runs with kills, partitions, and lost and delayed messages. A
+%% StorageServer answers `timed_out' after 300 ms. 70 seeds.
+watch_clear_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 70), fun(Seed) -> watch_clear_faults(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("watch clear faults: ~p", [Stats]),
+        ok = write_stats({watch_clear_faults, 1}, Stats),
+        ?assert(maps:get(watches, Stats, 0) > 400, Stats),
+        ?assert(maps:get(watches_ready_set, Stats, 0) > 60, Stats),
+        ?assert(maps:get(watches_ready_read, Stats, 0) > 60, Stats),
+        ?assert(maps:get(watches_ready_clear, Stats, 0) > 50, Stats),
+        ?assert(maps:get(watch_keys_changed_back, Stats, 0) > 30, Stats),
+        %% The read after a ready future returned the value of the watch,
+        %% and the records of the LogServers had a change of the key.
+        ?assert(maps:get(watches_changed_back, Stats, 0) > 2, Stats),
+        ?assert(maps:get(storage_watches_timed_out, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 50, Stats)
+    end}.
+
+watch_clear_faults(Seed, Mode) ->
+    opts(Seed, #{watches => true, watch_clears => true, mode => Mode}).
+
+%% The runs with late watches. See "Runs with late watches" in
+%% `redwall_dst'. A run has ClusterControllers, watches with clears, and
+%% kills, partitions, and lost and delayed messages. After the last
+%% operation the harness stops the faults, and starts 4 late watches and 2
+%% late changes of the keys of the watches. At the end of a run, the late
+%% clients have committed (`late_commit'), and the futures of the late
+%% watches are ready (`watch_fires'). 50 seeds.
+watch_late_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 50), fun(Seed) -> watch_late(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("watch late faults: ~p", [Stats]),
+        ok = write_stats({watch_late_faults, 1}, Stats),
+        ok = late_stats(50, Stats),
+        ?assert(maps:get(kills_worker, Stats, 0) > 50, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 30, Stats)
+    end}.
+
+watch_late(Seed, Mode) ->
+    (opts(Seed, #{controller => true, last_op => 80, watches => true, watch_clears => true, late_watches => true, mode => Mode}))#{settle_steps => 20000}.
+
+%% The same runs with the pop: the LogServers discard records. The
+%% harness keeps the changes of the keys of the watches from the records
+%% of the LogServers at each check. 50 seeds.
+watch_late_pop_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 50), fun(Seed) -> watch_late_pop(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("watch late pop: ~p", [Stats]),
+        ok = write_stats({watch_late_pop, 1}, Stats),
+        ok = late_stats(50, Stats),
+        ?assert(maps:get(popped_logs, Stats, 0) > 30, Stats),
+        ?assert(maps:get(kills_storage, Stats, 0) > 3, Stats)
+    end}.
+
+watch_late_pop(Seed, Mode) ->
+    (opts(Seed, #{controller => true, pop => true, last_op => 80, watches => true, watch_clears => true, late_watches => true, mode => Mode}))#{settle_steps => 20000}.
+
+%% The statistics of `Runs' runs with late watches. They show that the
+%% check of the late watches had watches to check.
+late_stats(Runs, Stats) ->
+    %% Each run had 4 late watches and 2 late changes with a committed
+    %% transaction.
+    ?assertEqual(4 * Runs, maps:get(late_watches, Stats, 0), Stats),
+    ?assertEqual(2 * Runs, maps:get(late_changes, Stats, 0), Stats),
+    %% Each late change has a commit version above the version of every
+    %% late watch of its key.
+    ?assertEqual(2 * Runs, maps:get(late_changes_above, Stats, 0), Stats),
+    %% The futures of the late watches became ready. A late watch can
+    %% stay not ready when a client from the time of the faults clears
+    %% the key after the late change.
+    ?assert(maps:get(late_watches_ready, Stats, 0) >= 4 * Runs - Runs div 10, Stats),
+    %% The run also had watches from the time of the faults, of each kind
+    %% of transaction.
+    ?assert(maps:get(watches_ready_set, Stats, 0) > Runs, Stats),
+    ?assert(maps:get(watches_ready_read, Stats, 0) > Runs, Stats),
+    ?assert(maps:get(watches_ready_clear, Stats, 0) > Runs, Stats),
+    ?assert(maps:get(watch_keys_changed_back, Stats, 0) > Runs div 3, Stats),
+    ok.
+
+%% The same seed gives the same trace, the trace replays, and the audit
+%% of eta reports nothing, for the 4 kinds of runs with clears of the keys
+%% of the watches: without faults, with faults, with late watches, and
+%% with late watches and the pop. 2 seeds each, 3 runs for each seed.
+watch_clear_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Kinds = [
+            fun(Seed) -> watch_clear_live(Seed, correct) end,
+            fun(Seed) -> watch_clear_faults(Seed, correct) end,
+            fun(Seed) -> watch_late(Seed, correct) end,
+            fun(Seed) -> watch_late_pop(Seed, correct) end
+        ],
+        lists:foreach(
+            fun({Kind, Seed}) ->
+                Opts = Kind(Seed),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                Replayed = eta_run:replay(redwall_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [{Kind, Seed} || Kind <- Kinds, Seed <- lists:seq(1, 2)]
+        )
+    end}.
+
+%% The planted defect `watch_no_trigger' in a run with clears and without
+%% faults. A StorageServer that runs then has another value of the key
+%% than the value of a watch whose future is not ready.
+watch_clear_no_trigger_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 60), fun(Seed) -> watch_clear_live(Seed, watch_no_trigger) end),
+        ?debugFmt("watch_no_trigger with clears: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := watch_fires, stored := _}, Violation),
+        ?assertEqual(ok, maps:get(outcome, run(watch_clear_live(Seed, correct))), {seed, Seed})
+    end}.
+
+%% The planted defect `watch_no_verify' in a run with clears and with
+%% faults. A future is ready after the answer of a StorageServer for a
+%% record that is not committed. The read after the ready future returns
+%% the value of the watch, and no record at or below the read version
+%% gives the key another value.
+watch_clear_no_verify_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> watch_clear_faults(Seed, watch_no_verify) end),
+        ?debugFmt("watch_no_verify with clears: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := watch_change, read_version := _}, Violation),
+        ?assertEqual(ok, maps:get(outcome, run(watch_clear_faults(Seed, correct))), {seed, Seed})
+    end}.
+
+%% The planted defect `watch_no_trigger' in a run with late watches, and
+%% in a run with late watches and the pop. The check of the late watches
+%% finds a late watch whose future is not ready.
+watch_late_no_trigger_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        lists:foreach(
+            fun({Name, Kind}) ->
+                {Seed, Violation} = first_violation(lists:seq(1, 60), fun(Seed) -> Kind(Seed, watch_no_trigger) end),
+                ?debugFmt("watch_no_trigger with late watches, ~p: seed ~p, ~p", [Name, Seed, Violation]),
+                ?assertMatch(#{property := watch_fires, watch := #{late := true}}, Violation),
+                ?assertEqual(ok, maps:get(outcome, run(Kind(Seed, correct))), {seed, Seed})
+            end,
+            [{controllers, fun watch_late/2}, {pop, fun watch_late_pop/2}]
+        )
+    end}.
+
+%% The runs with mixed keys. See "Runs with mixed keys" in `redwall_dst'.
+%% The 4 keys of the workload are a number, an atom, a tuple and a binary.
+%% The number key has the forms `1' and `1.0', which are equal and not
+%% identical.
+%%
+%% Runs without faults. 40 seeds.
+mixed_calm_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 40), fun(Seed) -> mixed_calm(Seed) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("mixed calm: ~p", [Stats]),
+        ok = write_stats({mixed_calm, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(range_acks, Stats, 0) > 100, Stats),
+        ?assert(maps:get(clears, Stats, 0) > 50, Stats),
+        %% The Resolver rejected transactions for a conflict.
+        ?assert(maps:get(not_committed, Stats, 0) > 100, Stats),
+        %% Transactions read the number key with `get/2' in each of its
+        %% two forms, and acknowledged transactions set it in each form.
+        ?assert(maps:get(integer_key_reads, Stats, 0) > 200, Stats),
+        ?assert(maps:get(float_key_reads, Stats, 0) > 200, Stats),
+        ?assert(maps:get(integer_key_writes, Stats, 0) > 100, Stats),
+        ?assert(maps:get(float_key_writes, Stats, 0) > 100, Stats),
+        %% Range reads returned a key in another form than the form of
+        %% the client.
+        ?assert(maps:get(other_form_rows, Stats, 0) > 100, Stats),
+        %% No client read a mapped range.
+        ?assertEqual(0, maps:get(mapped_reads, Stats, 0), Stats)
+    end}.
+
+mixed_calm(Seed) ->
+    (opts(Seed, #{faults => false, keys => mixed}))#{net => true}.
+
+%% Runs with kills, partitions, and lost and delayed messages. 70 seeds.
+mixed_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 70), fun(Seed) -> mixed(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("mixed faults: ~p", [Stats]),
+        ok = write_stats({mixed_faults, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 150, Stats),
+        ?assert(maps:get(not_committed, Stats, 0) > 100, Stats),
+        ?assert(maps:get(kills_storage, Stats, 0) > 10, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 2, Stats),
+        ?assert(maps:get(integer_key_reads, Stats, 0) > 100, Stats),
+        ?assert(maps:get(float_key_reads, Stats, 0) > 100, Stats),
+        ?assert(maps:get(integer_key_writes, Stats, 0) > 20, Stats),
+        ?assert(maps:get(float_key_writes, Stats, 0) > 20, Stats),
+        ?assert(maps:get(other_form_rows, Stats, 0) > 50, Stats)
+    end}.
+
+mixed(Seed, Mode) ->
+    opts(Seed, #{keys => mixed, mode => Mode}).
+
+%% The same seed gives the same trace, the trace replays, and the audit
+%% of eta reports nothing, for the two kinds of runs with mixed keys. 6
+%% seeds each, 3 runs for each seed.
+mixed_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        Kinds = [fun(Seed) -> mixed_calm(Seed) end, fun(Seed) -> mixed(Seed, correct) end],
+        lists:foreach(
+            fun({Kind, Seed}) ->
+                Opts = Kind(Seed),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                Replayed = eta_run:replay(redwall_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [{Kind, Seed} || Kind <- Kinds, Seed <- lists:seq(1, 6)]
+        )
+    end}.
+
+%% A planted defect: the Resolver does not treat two keys that are equal
+%% and not identical as one key. A transaction that read one form of a key
+%% is acknowledged after a write of the other form of the key. The same
+%% seed passes without the defect.
+no_equal_keys_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> mixed(Seed, no_equal_keys) end),
+        ?debugFmt("no_equal_keys: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := no_conflict}, Violation),
+        ?assertEqual(ok, maps:get(outcome, run(mixed(Seed, correct))), {seed, Seed})
+    end}.
+
 %% A planted defect: the coordinated state accepts the proposal of a
 %% candidate with any term. Two candidates are the leader of one term.
 no_elect_cas_is_found_test_() ->
@@ -621,6 +889,26 @@ no_copy_is_found_test_() ->
         %% later recovery, which needs a record that the new LogServers did
         %% not receive.
         ?assert(lists:member(maps:get(property, Violation), [copied, no_loss]), Violation)
+    end}.
+
+%% A planted defect: a LogServer stores a record whose previous record has
+%% not arrived. Two records of one Proxy are on the way at the same time
+%% only when the Proxy has more than one batch in progress.
+no_push_order_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_push_order}) end),
+        ?debugFmt("no_push_order: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := chain}, Violation)
+    end}.
+
+%% A planted defect: a StorageServer that copies from another
+%% StorageServer stores no row of the copy. A client then reads a key from
+%% it that an earlier transaction wrote.
+no_copy_rows_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> opts(Seed, #{mode => no_copy_rows}) end),
+        ?debugFmt("no_copy_rows: seed ~p, ~p", [Seed, Violation]),
+        ?assertMatch(#{property := read_value}, Violation)
     end}.
 
 %% A planted defect: the Resolver admits every transaction.

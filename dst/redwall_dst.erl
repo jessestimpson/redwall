@@ -85,12 +85,30 @@
 %% <li>The ClusterController recruits again after the failure of a role,
 %%   and a candidate wins an election after the failure of the
 %%   leader.</li>
+%% <li>After the last operation, the harness removes every cut, replaces
+%%   every killed worker node, and stops the loss of messages
+%%   (`repair/2'). The run continues until the checks of `check_final/2'
+%%   hold, for at most the settle steps of the run. The suite uses 20,000
+%%   settle steps.</li>
+%% <li>With the config `watches', the workload of the run has watches.
+%%   With the config `late_watches', the harness also starts watches
+%%   after the last operation. See "Runs with late watches".</li>
 %% </ul>
 %%
-%% <li>After the last operation, the harness removes every cut, replaces
-%%   every killed worker node, and stops the loss of messages. The run
-%%   continues until the checks of `check_final/2' hold, for at most
-%%   20,000 steps.</li>
+%% The invariants of the other runs hold in these runs. These runs have
+%% one more invariant, `one_leader': no two ClusterController processes
+%% are the leader of one term. `check_final/2' checks at the end of a run:
+%%
+%% <ul>
+%% <li>`leader' - the ClusterController of the coordinated state runs and
+%%   is the leader.</li>
+%% <li>`stale_leader' - no other process is a leader.</li>
+%% <li>`epoch' - the leader has the current epoch of the coordinated
+%%   state, and the process of the epoch runs.</li>
+%% <li>`worker_db_info' - each worker that runs has the information of
+%%   the leader about the database.</li>
+%% <li>`late_commit' and `watch_fires' - in a run with the config
+%%   `late_watches'. See "Runs with late watches".</li>
 %% </ul>
 %%
 %% == Runs with the pop ==
@@ -120,6 +138,10 @@
 %% <li>The harness keeps the LSN of the record of each client from the
 %%   records of the LogServers at each check, because a LogServer does
 %%   not keep a discarded record.</li>
+%% <li>In a run with the config `watch_clears', the harness also keeps
+%%   the changes of the keys of the watches from the records of the
+%%   LogServers at each check. See "Runs with clears of the keys of the
+%%   watches".</li>
 %% </ul>
 %%
 %% == Runs with watches ==
@@ -132,13 +154,14 @@
 %%   transaction. A client creates a watch on one of 2 keys, which are
 %%   not the keys of the transactions. 2 clients in 3 set the key to the
 %%   value `{watch, C}' in the transaction of the watch. The other
-%%   clients read the key. No client clears a key of a watch, and each
-%%   client writes its own value, so the value of a key never changes
-%%   back.</li>
+%%   clients read the key. Without the config `watch_clears', no client
+%%   clears a key of a watch, and each client writes its own value, so
+%%   the value of a key never changes back.</li>
 %% <li>The client waits for the future of its watch. When the future is
 %%   ready, the client reads the key in a new transaction.</li>
 %% <li>The invariant `watch_change': the read after a ready future
-%%   returns another value than the value of the watch.</li>
+%%   returns another value than the value of the watch. A run with the
+%%   config `watch_clears' has another statement of `watch_change'.</li>
 %% <li>The invariant `watch_error': the future of a watch whose commit
 %%   failed has the error of the commit, and the future of a watch whose
 %%   commit succeeded has no error.</li>
@@ -150,10 +173,11 @@
 %%   becomes ready only after the answer of a StorageServer that the
 %%   value differs. `check_final/2' checks `watch_fires': the future of
 %%   every watch is ready, if an acknowledged transaction set the key of
-%%   the watch at a commit version above the version of the watch. The
-%%   run continues until the check holds, for at most the settle steps of
-%%   the run. This config is for runs without faults: a lost message is
-%%   not sent again.</li>
+%%   the watch at a commit version above the version of the watch. A run
+%%   with the config `watch_clears' has another statement of
+%%   `watch_fires'. The run continues until the check holds, for at most
+%%   the settle steps of the run. This config is for runs without faults:
+%%   a lost message is not sent again.</li>
 %% <li>The planted defect `watch_no_trigger': a StorageServer does not
 %%   read the key of a watch when it applies a record. `watch_fires'
 %%   finds it.</li>
@@ -163,18 +187,206 @@
 %%   ready future.</li>
 %% </ul>
 %%
-%% The invariants of the other runs hold in these runs. These runs have
-%% one more invariant, `one_leader': no two ClusterController processes
-%% are the leader of one term. `check_final/2' checks at the end of a run:
+%% == Runs with clears of the keys of the watches ==
+%%
+%% With the config `watch_clears => true', in a run with the config
+%% `watches', clients clear the keys of the watches:
 %%
 %% <ul>
-%% <li>`leader' - the ClusterController of the coordinated state runs and
-%%   is the leader.</li>
-%% <li>`stale_leader' - no other process is a leader.</li>
-%% <li>`epoch' - the leader has the current epoch of the coordinated
-%%   state, and the process of the epoch runs.</li>
-%% <li>`worker_db_info' - each worker that runs has the information of
-%%   the leader about the database.</li>
+%% <li>1 client in 3 with a watch sets the key to the value `{watch, C}',
+%%   1 client in 3 reads the key, and 1 client in 3 clears the key. Each
+%%   client creates the watch in the same transaction. The value of the
+%%   watch of a client that clears the key is `not_found'.</li>
+%% <li>The value of a key changes back to `not_found': one client sets
+%%   the key, and another client clears the key. A client whose watch has
+%%   the value `not_found' can therefore read `not_found' after the
+%%   future of the watch is ready. The future of such a watch can also
+%%   stay not ready after a set of the key, if another transaction clears
+%%   the key before the client has read the key. See the guarantees in
+%%   "Watches" in `redwall'.</li>
+%% <li>The harness keeps the changes of the 2 keys of the watches from
+%%   the records of the LogServers at each check
+%%   (`remember_watch_records/2'). A kept change has the LSN of the
+%%   record, the epoch of the LogServer, and the value of the key after
+%%   the record. The value of the key after a record is the result of the
+%%   mutations of the transactions of the record, in their order.</li>
+%% <li>The harness does not use a kept change of a record that a recovery
+%%   discarded (`watch_history/3'). The harness treats a record as
+%%   discarded in two cases. In the first case, the record is on a
+%%   LogServer of an ended epoch, and its LSN is above the end version of
+%%   that epoch. In the second case, the LSN is above the end version of
+%%   an ended epoch and below the first version of the next epoch.</li>
+%% <li>The value of a key at a version `X' is the value after the kept
+%%   change with the highest LSN at or below `X' that the harness uses.
+%%   Without such a change, the value is `not_found'.</li>
+%% <li>The invariant `watch_change' in these runs: when the future of a
+%%   watch is ready, the read after it returns another value than the
+%%   value of the watch, or the key has another value than the value of
+%%   the watch at a version `X' with `Version =< X' and
+%%   `X =< ReadVersion'. `Version' is the version of the watch, and
+%%   `ReadVersion' is the read version of the read. The client records the
+%%   value and the read version of the read, and the harness decides
+%%   (`watch_rereads/2').</li>
+%% <li>`watch_fires' in these runs with `watches => live': at the end of
+%%   the run, two statements hold. First, each StorageServer that runs
+%%   has a version at or above the commit version of every watch whose
+%%   transaction set or cleared the key. Second, the future of a watch is
+%%   ready, if a StorageServer that runs has a version at or above the
+%%   version of the watch, and the value of the key at the version of that
+%%   StorageServer differs from the value of the watch
+%%   (`watch_fires/2').</li>
+%% <li>The second statement follows the StorageServer and the client. A
+%%   StorageServer answers a watch when the value of the key after an
+%%   applied record differs from the value of the watch. The client then
+%%   reads the key. If the read returns the value of the watch, the
+%%   client sends the watch again. A watch whose future is not ready is
+%%   therefore a request in a StorageServer whose value of the key is the
+%%   value of the watch. The first statement prevents a run that ends
+%%   before the StorageServers have applied the changes.</li>
+%% <li>The statement of `watch_fires' of the runs without clears does not
+%%   hold in these runs. The future of a watch with the value `not_found'
+%%   can stay not ready after an acknowledged set of the key.</li>
+%% <li>`watch_fires' finds the planted defect `watch_no_trigger' in these
+%%   runs: a StorageServer has another value of the key than the value of
+%%   a watch whose future is not ready. `watch_change' finds the planted
+%%   defect `watch_no_verify' in these runs with faults: the read returns
+%%   the value of the watch, and the key has no other value up to the
+%%   read version.</li>
+%% <li>The statistics `watches_ready_set', `watches_ready_read' and
+%%   `watches_ready_clear' count the ready futures of each kind of
+%%   transaction. `watch_keys_changed_back' counts the changes that gave a
+%%   key the value that it had before the previous change.
+%%   `watches_changed_back' counts the reads after a ready future that
+%%   returned the value of the watch. `watches_waiting_after_change'
+%%   counts the watches whose future is not ready at the end of the run
+%%   after a change of the key to another value.</li>
+%% </ul>
+%%
+%% == Runs with late watches ==
+%%
+%% With the config `late_watches => true', the harness starts watches
+%% after it has stopped the faults. The config needs the configs
+%% `controller', `last_op', `watches => true' and `watch_clears => true'.
+%% A run with late watches can have the config `pop'.
+%%
+%% <ul>
+%% <li>Until the last operation, the run is a run with ClusterControllers
+%%   and with the workload of `watches => true' and of `watch_clears': a
+%%   request of a watch has a time limit of 1,000 ms, and a client waits
+%%   for its future for 3,000 ms.</li>
+%% <li>A StorageServer of these runs has no time limit for a watch, and
+%%   does not answer `timed_out'. A StorageServer takes the time limit at
+%%   its start. With a time limit, the client reads the key after each
+%%   answer `timed_out', and the future of a late watch becomes ready
+%%   without an answer of a StorageServer that the value differs. No
+%%   check then finds the planted defect `watch_no_trigger'.</li>
+%% <li>After the last operation, `repair/2' also asks the
+%%   ClusterControllers for a recovery. The epoch of the time of the
+%%   faults can have a LogServer without a record that the network lost.
+%%   Such an epoch gives read versions and commits no transaction.</li>
+%% <li>`repair/2' then starts 4 clients with a late watch
+%%   (`redwall_dst_client:late_watch/3'). 2 of them use the first key of
+%%   the watches, and 2 use the second key. The seed selects the kind of
+%%   each transaction: a set, a read or a clear of the key. A late client
+%%   has no time limit for a request of a watch and for its future. It
+%%   runs its transaction again after an error, until the commit
+%%   succeeds.</li>
+%% <li>`repair/2' also starts 2 clients with a late change
+%%   (`redwall_dst_client:late_change/4'), one for each key. A client
+%%   with a late change waits until the 4 late watches have a committed
+%%   transaction. It then sets its key to its own value `{watch, C}',
+%%   and runs the transaction again after an error. A late change
+%%   therefore has a commit version above the version of each late watch
+%%   of its key, and another value than the value of each late watch.</li>
+%% <li>`check_final/2' checks `late_commit': each of the 6 late clients
+%%   has a committed transaction.</li>
+%% <li>`check_final/2' checks `watch_fires' for the late watches, with
+%%   the two statements of "Runs with clears of the keys of the watches".
+%%   First, each StorageServer that runs has a version at or above the
+%%   commit version of every late change, and of every late watch whose
+%%   transaction set or cleared the key. Second, the future of a late
+%%   watch is ready, if a StorageServer that runs has a version at or
+%%   above the version of the watch, and the value of the key at the
+%%   version of that StorageServer differs from the value of the
+%%   watch.</li>
+%% <li>The run continues until the checks of `check_final/2' hold, for at
+%%   most the settle steps of the run.</li>
+%% <li>`watch_fires' does not check a watch from the time of the faults.
+%%   A client of that time stops to wait after 3,000 ms.</li>
+%% <li>`watch_change' and `watch_error' hold for every watch of the run,
+%%   also for the late watches.</li>
+%% <li>`watch_fires' finds the planted defect `watch_no_trigger' in these
+%%   runs: the future of a late watch is not ready after a late
+%%   change.</li>
+%% <li>The statistics `late_watches', `late_changes' and
+%%   `late_watches_ready' count the late watches and the late changes
+%%   with a committed transaction, and the ready futures of the late
+%%   watches. `late_changes_above' counts the late changes with a commit
+%%   version above the version of every late watch of their key.
+%%   `late_retries' counts the failed attempts of the late clients.</li>
+%% </ul>
+%%
+%% == Runs with mixed keys ==
+%%
+%% With the config `keys => mixed', the 4 keys of the workload are terms
+%% of 4 types. The default is `keys => packed': the 4 keys are packed
+%% tuples, which are binaries.
+%%
+%% <ul>
+%% <li>The 4 keys are, in the order of Erlang terms: the number `1', the
+%%   atom `k', the tuple `{k, 3}' and the binary `<<"k4">>'. The upper
+%%   bound of the read ranges and of the cleared ranges is the binary
+%%   `<<"k5">>'.</li>
+%% <li>The number key has the 2 forms `1' and `1.0', and the tuple key
+%%   has the 2 forms `{k, 3}' and `{k, 3.0}'. The 2 forms of a key are
+%%   equal (`==') and not identical (`=:='). redwall treats them as one
+%%   key (see "Equal keys" in `redwall_storage'). The random number of a
+%%   client selects one form of each of the 2 keys. The client uses these
+%%   forms for its reads, its writes and the bounds of its ranges. Two
+%%   clients then use 2 forms of one key.</li>
+%% <li>A StorageServer returns the key of the last write that it has
+%%   applied. A read of a range can therefore return a key in another
+%%   form than the form of the client, and 2 reads at one read version
+%%   can return one key in 2 forms.</li>
+%% <li>The harness and the client compare the canonical forms of keys
+%%   (`redwall_dst_client:canon/1'): the canonical form of `1.0' is `1'.
+%%   A client records the canonical forms of its read keys, of its
+%%   written keys and of its cleared keys in the table of the run, and
+%%   the canonical forms of the keys of the rows that it read. The
+%%   harness uses the canonical form of each key of a StorageServer. The
+%%   invariants `no_conflict', `read_value', `replicas_agree' and
+%%   `storage_rollback' therefore treat `1' and `1.0' as one key. A client
+%%   compares the canonical forms of two results for `select_agrees',
+%%   `range_options_agree' and `own_writes'.</li>
+%% <li>For `own_writes', a client also reads each key that it set or
+%%   cleared in the other form of the key.</li>
+%% <li>A run with mixed keys does not have the parts of the workload that
+%%   need packed keys or binary keys:
+%%   <ul>
+%%   <li>No client calls `redwall:get_mapped_range/4', because a mapper
+%%     reads packed keys. A client reads every read range with
+%%     `get_range/3'. The invariant `mapped_range_agrees' has no read to
+%%     check, and `own_writes' does not check the error 2039.</li>
+%%   <li>No client calls `redwall:get_key/2', because key selectors need
+%%     a database with the kind `list' or `binary'. `range_options_agree'
+%%     checks the options `reverse' and `limit' of `get_range/4' in a
+%%     database with the kind `any'.</li>
+%%   <li>The run has no watches. The config `watches' with
+%%     `keys => mixed' is an error.</li>
+%%   </ul></li>
+%% <li>The statistics `integer_key_reads', `float_key_reads',
+%%   `integer_key_writes' and `float_key_writes' count the transactions
+%%   that read the number key with `get/2', and the acknowledged
+%%   transactions that set it, for each form. `other_form_rows' counts
+%%   the rows of the range reads with a key in another form than the form
+%%   of the client.</li>
+%% <li>The planted defect `no_equal_keys': the Resolver uses the row of a
+%%   bound only if the bound of the row and the bound are identical
+%%   (`equal_keys => false' of `redwall_resolver:resolve/4'). A read of
+%%   one form of a key then has no conflict with a write of the other
+%%   form. `no_conflict' finds the defect in a run with mixed keys. A run
+%%   with packed keys has no two keys that are equal and not identical,
+%%   so no invariant finds the defect in such a run.</li>
 %% </ul>
 %%
 %% == Workload ==
@@ -192,7 +404,9 @@
 %%   cases, and any Proxy that runs in the others. A Proxy can belong to an
 %%   epoch that has ended. The transaction reads and writes some of 4
 %%   keys. 2 transactions in 7 also read a key range. 2 transactions in
-%%   11 clear a key range before they write their keys.</li>
+%%   11 clear a key range before they write their keys. The 4 keys are
+%%   packed tuples (`redwall_tuple:pack/1'), or terms of 4 types with the
+%%   config `keys => mixed' (see "Runs with mixed keys").</li>
 %% <li>`{kill_log, R}': kill one LogServer of the current epoch. The
 %%   harness kills at most 1 LogServer of each epoch, because the design
 %%   tolerates the loss of k - 1 LogServers of an epoch, and a LogServer of
@@ -309,7 +523,9 @@
 %%   failed commit, `on_error/2' leaves a transaction without a read
 %%   version and without a mutation.</li>
 %% <li>`watch_change' and `watch_error' - in a run with watches. See
-%%   "Runs with watches".</li>
+%%   "Runs with watches". A run with the config `watch_clears' has
+%%   another statement of `watch_change'. See "Runs with clears of the
+%%   keys of the watches".</li>
 %% <li>`kcv_below_dv' - in each epoch, the Known Committed Version of
 %%   every LogServer that runs is at or below the Durable Version of every
 %%   LogServer that runs.</li>
@@ -359,8 +575,20 @@
 %% <li>`no_clear' - the StorageServer does not apply a clear.</li>
 %% <li>`no_window_check' - the StorageServer answers a read below its
 %%   oldest version, after it has removed older versions.</li>
+%% <li>`no_push_order' - a LogServer stores a record whose previous
+%%   record has not arrived. A Proxy has two records on the way at the
+%%   same time when it closes a batch while an earlier batch is in
+%%   progress: with `batch_depth' above 1, or when the time of the batch
+%%   ends. `chain' finds the record.</li>
+%% <li>`no_copy_rows' - a StorageServer that copies from another
+%%   StorageServer stores no row of the copy. It then has the version of
+%%   the copy without its data.</li>
 %% <li>`watch_no_trigger' and `watch_no_verify' - see "Runs with
-%%   watches".</li>
+%%   watches", "Runs with clears of the keys of the watches" and "Runs
+%%   with late watches".</li>
+%% <li>`no_equal_keys' - the Resolver does not treat two keys that are
+%%   equal and not identical as one key. See "Runs with mixed
+%%   keys".</li>
 %% <li>`pop_no_limit' - the pop version of the ClusterController is the
 %%   highest version of a StorageServer, and a LogServer discards the
 %%   records without the limit of its Known Committed Version. A recovery
@@ -385,6 +613,28 @@
 %%   of the process.</li>
 %% <li>The virtual clock advances only when no process can run. The
 %%   time-outs of calls and the time limit of the lock fire only then.</li>
+%% <li>A run with mixed keys has no mapped range read, no key selector
+%%   and no watch. See "Runs with mixed keys".</li>
+%% <li>In a run with mixed keys, the keys with 2 forms are the number
+%%   `1' and the tuple `{k, 3}'. The workload has no list key and no map
+%%   key with 2 forms.</li>
+%% <li>A run with late watches has no answer `timed_out' of a
+%%   StorageServer to a watch, because its StorageServers have no time
+%%   limit for a watch.</li>
+%% <li>In a run with faults, `watch_fires' checks the late watches only.
+%%   No check requires the future of a watch from the time of the faults
+%%   to become ready.</li>
+%% <li>The late watches and the late changes are on the node `clients'.
+%%   A run has 4 late watches and 2 late changes. A late change is a set
+%%   of the key. No late change is a clear.</li>
+%% <li>In a run with clears of the keys of the watches, the harness does
+%%   not decide `watch_change' for a ready future whose client could not
+%%   read the key in 10 attempts.</li>
+%% <li>`watch_change' with clears can use a record that a recovery
+%%   discarded, in one case: the ended epoch has the end version 0, and a
+%%   LogServer of a recovery that did not write the coordinated state has
+%%   the record. The check then accepts a read that it should not accept.
+%%   The check reports no violation for this reason.</li>
 %% </ul>
 -module(redwall_dst).
 
@@ -398,6 +648,11 @@
 %% The gap between the Recovery Version and the first commit version of an
 %% epoch: the default of `max_versions_in_flight'.
 -define(EPOCH_GAP, 100000000).
+
+%% The numbers of the late watches and of the late changes of a run with
+%% the config `late_watches'. See "Runs with late watches".
+-define(LATE_WATCHES, 4).
+-define(LATE_CHANGES, 2).
 
 %% ---------------------------------------------------------------------------
 %% eta_harness
@@ -423,6 +678,22 @@ init(Seed, Config) ->
     %% "Runs with watches".
     Watches = maps:get(watches, Config, false),
     _ = Watches =/= false andalso ets:insert(Tab, [{watches, Watches}, {mode, Mode}]),
+    %% Whether clients with a watch clear the key of the watch. See "Runs
+    %% with clears of the keys of the watches".
+    WatchClears = maps:get(watch_clears, Config, false),
+    true = not WatchClears orelse Watches =/= false,
+    _ = WatchClears andalso ets:insert(Tab, {watch_clears, true}),
+    %% Whether the harness starts late watches after the last operation.
+    %% See "Runs with late watches".
+    Late = maps:get(late_watches, Config, false),
+    true = not Late orelse (Watches =:= true andalso WatchClears andalso maps:get(controller, Config, false) andalso is_integer(maps:get(last_op, Config, undefined))),
+    _ = Late andalso ets:insert(Tab, {late_watches, true}),
+    %% The keys of the workload: `packed' or `mixed'. See "Runs with mixed
+    %% keys". A run with mixed keys has no watches, because a read range
+    %% of mixed keys contains the keys of the watches.
+    Keys = maps:get(keys, Config, packed),
+    true = Keys =:= packed orelse (Keys =:= mixed andalso Watches =:= false),
+    _ = Keys =:= mixed andalso ets:insert(Tab, {keys, mixed}),
     Cas = #{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas},
     %% The topology is declared before any process creates a monitor.
     CState =
@@ -463,6 +734,9 @@ init(Seed, Config) ->
         window => Window,
         faults => maps:get(faults, Config, true),
         watches => Watches,
+        watch_clears => WatchClears,
+        late_watches => Late,
+        seed => Seed,
         %% Whether ClusterControllers recruit the Sequencers of the run.
         controller => maps:get(controller, Config, false),
         %% Whether the workload cuts connections. With `controllers', it
@@ -526,13 +800,16 @@ start_storage(Tab, CState, {Mode, Window}, {Slot, N}, Generation) ->
         check_window => Mode =/= no_window_check,
         clear => Mode =/= no_clear andalso not (Mode =:= one_no_clear andalso Slot =:= 2),
         wait => Mode =/= no_wait,
+        copy_rows => Mode =/= no_copy_rows,
         watch_trigger => Mode =/= watch_no_trigger,
-        %% The time limit of a watch. See "Runs with watches".
+        %% The time limit of a watch. See "Runs with watches" and "Runs
+        %% with late watches".
         watch_timeout_ms =>
-            case ets:lookup(Tab, watches) of
-                [{watches, live}] -> infinity;
-                [{watches, true}] -> 300;
-                [] -> 30000
+            case {ets:lookup(Tab, watches), ets:member(Tab, late_watches)} of
+                {[{watches, live}], _} -> infinity;
+                {[{watches, true}], true} -> infinity;
+                {[{watches, true}], false} -> 300;
+                {[], _} -> 30000
             end
     }),
     Node = redwall_dst_client:storage_node({Slot, N}),
@@ -611,7 +888,8 @@ execute(Op, S0 = #{n := N0}) ->
 %% point the network loses no message, because redwall does not send a
 %% message again and a lost message costs the time limit of a call. The
 %% system then has the nodes for an epoch, and `check_final/2' checks that
-%% it has one.
+%% it has one. In a run with the config `late_watches', the harness also
+%% starts the late watches (`late_watches/2').
 repair(N, S00 = #{tab := Tab, cstate := CState, mode := Mode, window := Window}) ->
     ok = eta_net:heal_all(),
     S0 = restart_coordinators(S00),
@@ -624,7 +902,36 @@ repair(N, S00 = #{tab := Tab, cstate := CState, mode := Mode, window := Window})
         S0,
         lists:sort(ets:match(Tab, {{storage_down, '$1'}, '$2'}))
     ),
-    replace_workers(N * 100, S1).
+    late_watches(N, replace_workers(N * 100, S1)).
+
+%% Asks the ClusterControllers for a recovery, and starts the clients of
+%% the late watches and of the late changes, on the node `clients'. See
+%% "Runs with late watches". The late watch `I' has the client number
+%% `N * 100 + I', and the late change of the key `I' has the client
+%% number `N * 100 + 10 + I'. The late watches with an odd number use the
+%% second key of the watches, and the other late watches use the first
+%% key. The seed and the number of the late watch select the kind of the
+%% transaction.
+late_watches(_N, S = #{late_watches := false}) ->
+    S;
+late_watches(N, S00 = #{tab := Tab, seed := Seed}) ->
+    %% A request for a recovery. The epoch of the time of the faults can
+    %% have a LogServer without a record that the network lost. Such an
+    %% epoch gives read versions and commits no transaction.
+    S0 = spawn_op(clients, fun() -> redwall_dst_client:force_recovery(Tab) end, S00),
+    S1 = lists:foldl(
+        fun(I, Acc) ->
+            R = erlang:phash2({Seed, I}, 1000) * 2 + I rem 2,
+            spawn_op(clients, fun() -> redwall_dst_client:late_watch(Tab, N * 100 + I, R) end, Acc)
+        end,
+        S0,
+        lists:seq(1, ?LATE_WATCHES)
+    ),
+    lists:foldl(
+        fun(I, Acc) -> spawn_op(clients, fun() -> redwall_dst_client:late_change(Tab, N * 100 + 10 + I, I, ?LATE_WATCHES) end, Acc) end,
+        S1,
+        lists:seq(1, ?LATE_CHANGES)
+    ).
 
 %% Starts a new worker node for each killed worker node, with the class of
 %% the killed node, and with a candidate if the killed node had one.
@@ -862,6 +1169,7 @@ check(#{tab := Tab, cstate := CState}) ->
     Acks = [{C, Epoch, LSN} || [C, Epoch, LSN] <- ets:match(Tab, {{ack, '$1'}, '$2', '$3'})],
     Logs = logs(Tab),
     _ = ets:member(Tab, pop) andalso remember_written(Tab, Logs),
+    _ = ets:member(Tab, watch_clears) andalso remember_watch_records(Tab, Logs),
     first_violation([
         fun() -> no_loss(Tab) end,
         fun() -> unique_versions(Tab, Acks) end,
@@ -879,7 +1187,8 @@ check(#{tab := Tab, cstate := CState}) ->
         fun() -> range_options_agree(Tab) end,
         fun() -> own_writes(Tab) end,
         fun() -> coordinators_agree(Tab) end,
-        fun() -> watches(Tab) end
+        fun() -> watches(Tab) end,
+        fun() -> watch_rereads(Tab, CState) end
     ]).
 
 %% `watch_change' and `watch_error'. A client with a watch records a
@@ -890,10 +1199,119 @@ watches(Tab) ->
         [[Detail = #{property := Property}] | _] -> violation(Property, Detail)
     end.
 
+%% `watch_change' in a run with the config `watch_clears'. See "Runs with
+%% clears of the keys of the watches". A client records the value and the
+%% read version of its read after a ready future in the row
+%% `{watch_reread, C}'. The harness decides each row once, and then
+%% records one of two rows:
+%%
+%% <ul>
+%% <li>`{watch_checked, C}' - the read returned another value than the
+%%   value of the watch.</li>
+%% <li>`{watch_changed_back, C}' - the read returned the value of the
+%%   watch, and the records of the LogServers give the key another value
+%%   at a version from the version of the watch to the read version.</li>
+%% </ul>
+watch_rereads(Tab, CState) ->
+    Open = [{C, Reread} || [C, Reread] <- lists:sort(ets:match(Tab, {{watch_reread, '$1'}, '$2'})), not ets:member(Tab, {watch_decided, C})],
+    first_violation([fun() -> watch_reread(Tab, CState, C, Reread) end || {C, Reread} <- Open]).
+
+watch_reread(Tab, CState, C, #{value := Seen, read_version := ReadVersion}) ->
+    [{_, Watch = #{key := Key, value := Value, version := Version}}] = ets:lookup(Tab, {watch, C}),
+    case Seen =/= Value of
+        true ->
+            true = ets:insert(Tab, [{{watch_decided, C}, true}, {{watch_checked, C}, true}]),
+            ok;
+        false ->
+            History = watch_history(Tab, CState, Key),
+            %% The value of the key at the version of the watch, and the
+            %% values after the later records up to the read version.
+            At = lists:last([not_found | [After || {LSN, After} <- History, LSN =< Version]]),
+            Later = [After || {LSN, After} <- History, LSN > Version, LSN =< ReadVersion],
+            case [Other || Other <- [At | Later], Other =/= Value] of
+                [_ | _] ->
+                    true = ets:insert(Tab, [{{watch_decided, C}, true}, {{watch_changed_back, C}, true}]),
+                    ok;
+                [] ->
+                    violation(watch_change, #{client => C, watch => Watch, read_version => ReadVersion, records => [Record || Record = {LSN, _After} <- History, LSN >= Version]})
+            end
+    end.
+
+%% Keeps the changes of the keys of the watches from the records of the
+%% LogServers in the table of the run, in a run with the config
+%% `watch_clears'. The row `{watch_record, Key, LSN, Epoch}' has the value
+%% of the key after the record `LSN' on a LogServer of `Epoch', or
+%% `not_found'. The harness calls this function at each check, because a
+%% LogServer can stop, and a LogServer of a run with the pop discards
+%% records. For each LogServer the function reads the records above the
+%% highest LSN of its last call.
+remember_watch_records(Tab, Logs) ->
+    Keys = [redwall_dst_client:watch_key(I) || I <- [1, 2]],
+    lists:foreach(
+        fun({{Epoch, _Index}, #{pid := Pid, records := Records}}) ->
+            Seen =
+                case ets:lookup(Tab, {watch_records_seen, Pid}) of
+                    [{_, LSN}] -> LSN;
+                    [] -> -1
+                end,
+            case gb_trees:is_empty(Records) orelse element(1, gb_trees:largest(Records)) =< Seen of
+                true ->
+                    true;
+                false ->
+                    true = ets:insert(Tab, [
+                        {{watch_record, Key, LSN, Epoch}, After}
+                     || {LSN, {_Prev, {body, {batch, Entries}}}} <- gb_trees:to_list(Records),
+                        LSN > Seen,
+                        Key <- Keys,
+                        {changed, After} <- [value_after(Key, Entries)]
+                    ]),
+                    true = ets:insert(Tab, {{watch_records_seen, Pid}, element(1, gb_trees:largest(Records))})
+            end
+        end,
+        Logs
+    ).
+
+%% The value of `Key' after the mutations of the transactions of one
+%% record, in their order: `{changed, Value}', `{changed, not_found}', or
+%% `unchanged' for a record without a mutation of the key.
+value_after(Key, Entries) ->
+    lists:foldl(
+        fun
+            ({set, Set, Value}, _Acc) when Set == Key -> {changed, Value};
+            ({clear, Cleared}, _Acc) when Cleared == Key -> {changed, not_found};
+            ({clear_range, Begin, End}, _Acc) when Begin =< Key, Key < End -> {changed, not_found};
+            (_Mutation, Acc) -> Acc
+        end,
+        unchanged,
+        lists:append([Entry || Entry <- Entries, is_list(Entry)])
+    ).
+
+%% The changes of `Key' that no recovery discarded, in the order of their
+%% versions: `{LSN, Value}' with the value of the key after the record
+%% `LSN', or `not_found'. A recovery discarded a record in two cases:
+%%
+%% <ul>
+%% <li>The record is on a LogServer of an ended epoch, above the end
+%%   version of that epoch.</li>
+%% <li>The LSN is between the end version of an ended epoch and the first
+%%   version of the next epoch. A LogServer of a recovery that did not
+%%   write the coordinated state can have such a record.</li>
+%% </ul>
+watch_history(Tab, CState, Key) ->
+    Old = maps:get(old, cstate(CState), []),
+    Ended = maps:from_list([{Epoch, End} || #{epoch := Epoch, end_version := End} <- Old]),
+    Ends = [End || End <- maps:values(Ended), End > 0],
+    lists:usort([
+        {LSN, After}
+     || [LSN, Epoch, After] <- ets:match(Tab, {{watch_record, Key, '$1', '$2'}, '$3'}),
+        not (is_map_key(Epoch, Ended) andalso LSN > maps:get(Epoch, Ended)),
+        not lists:any(fun(End) -> LSN > End andalso LSN < End + ?EPOCH_GAP end, Ends)
+    ]).
+
 %% `watch_fires': the future of a watch is ready, if an acknowledged
 %% transaction set the key of the watch at a commit version above the
 %% version of the watch. The harness checks it at the end of a run with
-%% `watches => live'.
+%% `watches => live' and without the config `watch_clears'.
 watch_fires(Tab) ->
     Watches = [{C, Watch} || [C, Watch] <- lists:sort(ets:match(Tab, {{watch, '$1'}, '$2'}))],
     Sets = [{Key, Version} || {_C, #{set := true, key := Key, version := Version}} <- Watches],
@@ -906,6 +1324,73 @@ watch_fires(Tab) ->
     case Late of
         [] -> ok;
         [{C, Watch} | _] -> violation(watch_fires, #{client => C, watch => Watch, not_ready => length(Late)})
+    end.
+
+%% `watch_fires' in a run with the config `watch_clears'. See "Runs with
+%% clears of the keys of the watches". `Late' selects the watches: every
+%% watch of the run, or the late watches only. The function checks two
+%% statements:
+%%
+%% <ul>
+%% <li>Each StorageServer that runs has a version at or above the commit
+%%   version of every selected watch whose transaction set or cleared the
+%%   key, and of every late change.</li>
+%% <li>The future of each selected watch is ready, if a StorageServer
+%%   that runs has a version at or above the version of the watch, and the
+%%   value of the key at the version of that StorageServer differs from
+%%   the value of the watch.</li>
+%% </ul>
+watch_fires(Tab, Late) ->
+    Watches = [{C, Watch} || [C, Watch] <- lists:sort(ets:match(Tab, {{watch, '$1'}, '$2'})), not Late orelse maps:get(late, Watch, false)],
+    Changes = [Version || [#{version := Version}] <- ets:match(Tab, {{late_change, '_'}, '$1'})],
+    Top = lists:max([0 | Changes] ++ [Version || {_C, #{version := Version, kind := Kind}} <- Watches, Kind =/= read]),
+    Running = [{Storage, eta_observe:read(Storage)} || Storage <- storages(Tab), is_process_alive(Storage)],
+    Behind = [Storage || {Storage, Published} <- Running, not is_map(Published) orelse maps:get(version, Published, -1) < Top],
+    NotReady = [
+        {C, Watch, Stored}
+     || {C, Watch = #{key := Key, value := Value, version := Version}} <- Watches,
+        not ets:member(Tab, {watch_fired, C}),
+        {_Storage, Published = #{version := Mine}} <- Running,
+        Mine >= Version,
+        {ok, Stored} <- [stored(Published, Key)],
+        Stored =/= Value
+    ],
+    case {Behind, NotReady} of
+        {[], []} -> ok;
+        {[_ | _], _} -> violation(watch_fires, #{reason => storage_behind, version => Top, behind => length(Behind), storages => length(Running)});
+        {[], [{C, Watch, Stored} | _]} -> violation(watch_fires, #{client => C, watch => Watch, stored => Stored, not_ready => length(lists:usort([Client || {Client, _, _} <- NotReady]))})
+    end.
+
+%% The value of `Key' in a StorageServer at the version of the
+%% StorageServer, from its published state: `{ok, Value}',
+%% `{ok, not_found}', or `error' if the StorageServer has no table.
+stored(#{engine := Engine, view := View, version := Version}, Key) ->
+    try Engine:read(View, {key, Key}, Version) of
+        {ok, Value, _Written} -> {ok, Value};
+        not_found -> {ok, not_found}
+    catch
+        error:badarg -> error
+    end;
+stored(_Published, _Key) ->
+    error.
+
+%% The checks of the late watches at the end of a run with the config
+%% `late_watches'. See "Runs with late watches".
+%%
+%% <ul>
+%% <li>`late_commit' - each client of a late watch and each client of a
+%%   late change has a committed transaction.</li>
+%% <li>`watch_fires' - the statements of `watch_fires/2' hold for the
+%%   late watches.</li>
+%% </ul>
+late_final(#{late_watches := false}) ->
+    ok;
+late_final(#{tab := Tab}) ->
+    Watches = length([C || [C, #{late := true}] <- ets:match(Tab, {{watch, '$1'}, '$2'})]),
+    Changes = length(ets:match(Tab, {{late_change, '_'}, '_'})),
+    case {Watches, Changes} of
+        {?LATE_WATCHES, ?LATE_CHANGES} -> watch_fires(Tab, true);
+        _ -> violation(late_commit, #{watches => Watches, changes => Changes, failed => lists:sort(ets:match(Tab, {{late_failed, '$1'}, '$2'}))})
     end.
 
 %% A `select/4' of a client returned the result of the match spec on the
@@ -972,9 +1457,10 @@ one_leader(Tab) ->
         {_, [[Term] | _]} -> violation(one_leader, #{term => Term})
     end.
 
-%% The checks at the end of a run with ClusterControllers. Before the end,
-%% the harness has removed every cut and has replaced every killed worker
-%% node (`repair/2').
+%% The checks at the end of a run with ClusterControllers
+%% (`controller_final/1'). Before the end, the harness has removed every
+%% cut and has replaced every killed worker node (`repair/2'). A run with
+%% the config `late_watches' also has the checks of `late_final/1'.
 %%
 %% <ul>
 %% <li>`leader' - the ClusterController of the coordinated state runs and
@@ -985,7 +1471,22 @@ one_leader(Tab) ->
 %% <li>`worker_db_info' - each worker that runs has the information of
 %%   the leader about the database.</li>
 %% </ul>
-check_final(_Settled, #{tab := Tab, cstate := CState, controller := true, last_op := Last}) when is_integer(Last) ->
+check_final(_Settled, State) ->
+    %% The statistics of the run are recorded here, while the scheduler
+    %% still holds every process. See `record_run_stats/1'.
+    ok = record_run_stats(State),
+    final_checks(State).
+
+final_checks(State = #{controller := true, last_op := Last}) when is_integer(Last) ->
+    first_violation([fun() -> controller_final(State) end, fun() -> late_final(State) end]);
+final_checks(#{tab := Tab, watches := live, watch_clears := true}) ->
+    watch_fires(Tab, false);
+final_checks(#{tab := Tab, watches := live}) ->
+    watch_fires(Tab);
+final_checks(_State) ->
+    ok.
+
+controller_final(#{tab := Tab, cstate := CState}) ->
     {Term, Controller} = maps:get(controller, cstate(CState), {0, undefined}),
     Leaders = leaders(Tab),
     Workers = [
@@ -1027,25 +1528,38 @@ check_final(_Settled, #{tab := Tab, cstate := CState, controller := true, last_o
             ]);
         _ ->
             violation(leader, #{term => Term, leaders => [T || {T, _, _} <- Leaders]})
-    end;
-check_final(_Settled, #{tab := Tab, watches := live}) ->
-    watch_fires(Tab);
-check_final(_Settled, _State) ->
-    ok.
+    end.
 
 %% Ends a run with ClusterControllers when the checks of `check_final/2'
 %% hold. Such a run has a large number of settle steps, because a call
 %% that was in progress at the last operation can wait for its time
 %% limit.
 settle_done(State = #{controller := true, last_op := Last}) when is_integer(Last) ->
-    check_final(settle_done, State) =:= ok;
-settle_done(#{tab := Tab, watches := live}) ->
-    watch_fires(Tab) =:= ok;
+    final_checks(State) =:= ok;
+settle_done(State = #{watches := live}) ->
+    final_checks(State) =:= ok;
 settle_done(_State) ->
     false.
 
-terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
+%% Records the statistics of the run, once for each run.
+%%
+%% eta calls `check_final/2' at the end of a run that has no violation,
+%% before it releases the processes of the run. eta calls `terminate/1'
+%% after the release. A released process runs in real time: a client can
+%% write one more row to the table of the run, and a StorageServer can
+%% apply one more record, before `terminate/1' reads them. The sums of two
+%% runs of one seed then differed by 1 in a counter. `check_final/2'
+%% therefore records the statistics. `terminate/1' records them only for a
+%% run that ended without a call of `check_final/2'.
+record_run_stats(#{tab := Tab, cstate := CState}) ->
+    case ets:insert_new(Tab, {stats_recorded, true}) of
+        true -> record_run_stats(Tab, CState);
+        false -> ok
+    end.
+
+record_run_stats(Tab, CState) ->
     ok = record_stats(Tab),
+    _ = ets:member(Tab, watch_clears) andalso record_watch_stats(Tab, CState),
     lists:foreach(
         fun(Storage) ->
             case eta_observe:read(Storage) of
@@ -1064,6 +1578,10 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
         end,
         storages(Tab)
     ),
+    ok.
+
+terminate(State = #{tab := Tab, cstate := CState, ops := Ops}) ->
+    ok = record_run_stats(State),
     %% A ClusterController, a worker and a StorageServer start temporary
     %% processes with a monitor and without a link: a read of the
     %% coordinated state, a pop, a recruitment, a question to the peers.
@@ -1090,7 +1608,10 @@ terminate(#{tab := Tab, cstate := CState, ops := Ops}) ->
             [Pid || [Pid, _] <- ets:match(Tab, {{proxy, '_'}, '$1', '$2'})],
     %% The Sequencers are killed first, so that no recovery recruits a
     %% LogServer after the harness has read the table of the run.
-    ok = kill_all(Started ++ Ops),
+    %% The process of a watch is not linked to its client, and it does not
+    %% end with its client while it waits for the answer to a read.
+    Watchers = [Pid || [Pid] <- ets:match(Tab, {{watcher, '_', '_'}, '$1'})],
+    ok = kill_all(Started ++ Ops ++ Watchers),
     ok = kill_all([Pid || {_Id, Pid} <- log_pids(Tab)]),
     ok = kill_all([Pid || [Pid] <- ets:match(Tab, {{storage_started, '_'}, '$1'})] ++ [Pid || {local, Pid} <- [CState]]),
     ok = redwall_dst_machine:clear(),
@@ -1140,6 +1661,15 @@ record_stats(Tab) ->
     bump(runs),
     bump(selects, case ets:lookup(Tab, selects) of [{selects, Selects}] -> Selects; [] -> 0 end),
     bump(mapped_reads, case ets:lookup(Tab, mapped_reads) of [{mapped_reads, Mapped}] -> Mapped; [] -> 0 end),
+    %% The counters of a run with mixed keys: the reads and the
+    %% acknowledged writes of the number key in each of its two forms,
+    %% and the rows of a range read with a key in another form than the
+    %% form of the client. The other runs do not have these statistics.
+    [
+        bump(Counter, case ets:lookup(Tab, Counter) of [{Counter, Count}] -> Count; [] -> 0 end)
+     || ets:member(Tab, keys),
+        Counter <- [integer_key_reads, float_key_reads, integer_key_writes, float_key_writes, other_form_rows]
+    ],
     bump(range_option_reads, case ets:lookup(Tab, range_option_reads) of [{range_option_reads, Optioned}] -> Optioned; [] -> 0 end),
     [
         bump(Counter, case ets:lookup(Tab, Counter) of [{Counter, Count}] -> Count; [] -> 0 end)
@@ -1210,6 +1740,79 @@ record_stats(Tab) ->
         ets:match(Tab, {{recovery_failed, '_'}, '$1'})
     ),
     bump(runs_with_three_epochs, length([x || lists:max([0 | Epochs]) >= 3])),
+    ok.
+
+%% The statistics of a run with the config `watch_clears':
+%%
+%% <ul>
+%% <li>`watches_set', `watches_read' and `watches_clear' - the committed
+%%   watches of each kind of transaction.</li>
+%% <li>`watches_ready_set', `watches_ready_read' and
+%%   `watches_ready_clear' - the ready futures of each kind.</li>
+%% <li>`watches_changed_back' - the reads after a ready future that
+%%   returned the value of the watch, after a change and a change back of
+%%   the key.</li>
+%% <li>`watch_keys_changed_back' - the records that no recovery
+%%   discarded and that gave a key of the watches the value that the key
+%%   had before the previous change of the key.</li>
+%% <li>`watches_waiting_after_change' - the watches whose future is not
+%%   ready at the end of the run, and whose key had another value than
+%%   the value of the watch after a record above the version of the
+%%   watch. The clients of a run with faults stop to wait after 3,000
+%%   ms.</li>
+%% <li>`late_watches', `late_watches_ready' and `late_changes' - the
+%%   committed late watches, their ready futures, and the committed late
+%%   changes.</li>
+%% <li>`late_changes_above' - the late changes with a commit version
+%%   above the version of every late watch of their key.</li>
+%% <li>`late_retries' and `late_recoveries' - the failed attempts of the
+%%   late clients, and their requests for a recovery.</li>
+%% </ul>
+record_watch_stats(Tab, CState) ->
+    bump(watches_changed_back, length(ets:match(Tab, {{watch_changed_back, '_'}, '_'}))),
+    Histories = #{Key => watch_history(Tab, CState, Key) || Key <- [redwall_dst_client:watch_key(I) || I <- [1, 2]]},
+    Back = fun
+        Back([{_, Value}, Middle = {_, Other} | Rest = [{_, Value} | _]]) when Other =/= Value -> 1 + Back([Middle | Rest]);
+        Back([_ | Rest]) -> Back(Rest);
+        Back([]) -> 0
+    end,
+    bump(watch_keys_changed_back, lists:sum([Back([{0, not_found} | History]) || History <- maps:values(Histories)])),
+    bump(
+        watches_waiting_after_change,
+        length([
+            C
+         || [C, #{key := Key, value := Value, version := Version}] <- ets:match(Tab, {{watch, '$1'}, '$2'}),
+            not ets:member(Tab, {watch_fired, C}),
+            lists:any(fun({LSN, After}) -> LSN > Version andalso After =/= Value end, maps:get(Key, Histories))
+        ])
+    ),
+    bump(late_changes, length(ets:match(Tab, {{late_change, '_'}, '_'}))),
+    Watches = [{C, Watch, ets:member(Tab, {watch_fired, C})} || [C, Watch] <- ets:match(Tab, {{watch, '$1'}, '$2'})],
+    lists:foreach(
+        fun({_C, #{kind := Kind}, Ready}) ->
+            bump(list_to_atom(lists:concat(["watches_", Kind]))),
+            _ = Ready andalso bump(list_to_atom(lists:concat(["watches_ready_", Kind])))
+        end,
+        Watches
+    ),
+    Late = [{Watch, Ready} || {_C, Watch = #{late := true}, Ready} <- Watches],
+    bump(late_watches, length(Late)),
+    bump(late_watches_ready, length([x || {_Watch, true} <- Late])),
+    %% The late changes with a commit version above the version of every
+    %% late watch of their key.
+    bump(
+        late_changes_above,
+        length([
+            x
+         || [#{key := Key, version := Version}] <- ets:match(Tab, {{late_change, '_'}, '$1'}),
+            Late =/= [],
+            lists:all(fun({#{key := Watched, version := Watch}, _Ready}) -> Watched =/= Key orelse Watch < Version end, Late)
+        ])
+    ),
+    [
+        bump(Counter, case ets:lookup(Tab, Counter) of [{Counter, Count}] -> Count; [] -> 0 end)
+     || ets:member(Tab, late_watches), Counter <- [late_retries, late_recoveries]
+    ],
     ok.
 
 %% ---------------------------------------------------------------------------
@@ -1588,11 +2191,17 @@ storage_rollback(Tab, Storages, CState) ->
 %% publishes the view of its store, which has no private table. See
 %% `view/1' of `redwall_storage_ets'. The store of the engine
 %% `ets' does not exist after the kill of the StorageServer.
+%%
+%% Each key of `data' is the canonical form of the key of the
+%% StorageServer (`redwall_dst_client:canon/1'). A StorageServer has the
+%% key of the last write that it applied, so two StorageServers can have
+%% two forms of one key.
 observe(Storage) ->
     case eta_observe:read(Storage) of
         Published = #{engine := Engine, view := View} ->
             try
-                Published#{data => redwall_storage:versions(#{engine => Engine, store => View})}
+                Data = redwall_storage:versions(#{engine => Engine, store => View}),
+                Published#{data => maps:fold(fun(Key, Versions, Acc) -> Acc#{redwall_dst_client:canon(Key) => Versions} end, #{}, Data)}
             catch
                 error:badarg -> no_table
             end;
@@ -1784,7 +2393,7 @@ log_pids(Tab) ->
 %% The published state of each LogServer that runs and has handled at least
 %% one event.
 logs(Tab) ->
-    [{Id, State#{records := Tree}} || {Id, Pid} <- log_pids(Tab), State <- [eta_observe:read(Pid)], is_map(State), is_map_key(records, State), Tree <- records(State)].
+    [{Id, State#{records := Tree, pid => Pid}} || {Id, Pid} <- log_pids(Tab), State <- [eta_observe:read(Pid)], is_map(State), is_map_key(records, State), Tree <- records(State)].
 
 %% The records of a LogServer as a tree from the LSN to the previous LSN
 %% and the body. The LogServer keeps the records in an ETS table. The

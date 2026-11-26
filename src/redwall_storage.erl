@@ -500,7 +500,9 @@
 %% answers a read below the oldest version. `clear => false' plants a third
 %% defect: the StorageServer does not apply a clear. `wait => false' plants
 %% a fourth defect: the StorageServer answers a read at a version that it
-%% has not applied.
+%% has not applied. `copy_rows => false' plants a fifth defect: the
+%% StorageServer does not store the rows of a copy from another
+%% StorageServer, and has the version of the copy without its data.
 -type options() :: #{
     coordinators := redwall_cstate:servers(),
     poll_ms => pos_integer(),
@@ -510,6 +512,7 @@
     check_window => boolean(),
     clear => boolean(),
     wait => boolean(),
+    copy_rows => boolean(),
     %% The time after which the StorageServer answers `timed_out' to a
     %% watch, and the highest number of watches. See "Watches" in the
     %% module documentation. `watch_trigger => false' plants a defect.
@@ -593,6 +596,7 @@
     check_window :: boolean(),
     clear :: boolean(),
     wait :: boolean(),
+    copy_rows :: boolean(),
     %% The LSN of the last record that the StorageServer has applied.
     version = 0 :: version(),
     %% The oldest version that a read can have.
@@ -969,6 +973,7 @@ init(Options = #{coordinators := Coordinators}) ->
         check_window = maps:get(check_window, Options, true),
         clear = maps:get(clear, Options, true),
         wait = maps:get(wait, Options, true),
+        copy_rows = maps:get(copy_rows, Options, true),
         engine = Engine,
         store = Store,
         view = Engine:view(Store),
@@ -1070,10 +1075,10 @@ handle_continue({probed, Answer, Probe}, State) ->
         {_NoPeerIsAhead, reprobe} ->
             {noreply, State#state{copy = undefined}}
     end;
-handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, version := Version, next := Next}, engine = Engine, store = Store}) ->
+handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, version := Version, next := Next}}) ->
     try gen_server:call(Peer, {copy_page, Ref, Next, ?COPY_PAGE}, ?TIMEOUT_MS) of
         {ok, Rows, done} ->
-            ok = Engine:load(Store, Rows),
+            ok = load_copy(Rows, State),
             ok = gen_server:cast(Peer, {copy_done, Ref}),
             ok = atomics:put(State#state.published, 2, Version),
             ok = atomics:put(State#state.published, 1, Version),
@@ -1095,13 +1100,20 @@ handle_continue(copy, State = #state{copy = Copy = #{peer := Peer, ref := Ref, v
                     })
                 )};
         {ok, Rows, {next, Last}} ->
-            ok = Engine:load(Store, Rows),
+            ok = load_copy(Rows, State),
             {noreply, State#state{copy = Copy#{next := {after_key, Last}}}, {continue, copy}};
         {error, _Reason} ->
             copy_again(State)
     catch
         exit:_ -> copy_again(State)
     end.
+
+%% Stores the rows of one page of a copy. With the planted defect
+%% `copy_rows => false', the StorageServer stores no row.
+load_copy(Rows, #state{engine = Engine, store = Store, copy_rows = true}) ->
+    Engine:load(Store, Rows);
+load_copy(_Rows, #state{copy_rows = false}) ->
+    ok.
 
 %% Removes the copied keys, and starts the copy again later.
 copy_again(State = #state{engine = Engine, store = Store}) ->

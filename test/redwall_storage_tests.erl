@@ -25,6 +25,26 @@ storage_test_() ->
         fun(Ids) -> {timeout, 60, fun() -> engine(Ids) end} end
     ]}.
 
+%% `versions/1' of the engine `ets' returns every version of a key whose
+%% writes have two forms of the key that are equal and not identical. The
+%% key of the result is the key of the last write.
+versions_of_equal_keys_test() ->
+    Store = redwall_storage_ets:new(#{}),
+    ok = redwall_storage_ets:write(Store, 1, [{set, 1, a}, {set, 2, x}]),
+    ok = redwall_storage_ets:write(Store, 2, [{set, 1.0, b}]),
+    ok = redwall_storage_ets:write(Store, 3, [{clear, 1}]),
+    ok = redwall_storage_ets:write(Store, 4, [{set, 1.0, c}, {set, {k, 3.0}, y}]),
+    ok = redwall_storage_ets:write(Store, 5, [{set, {k, 3}, z}]),
+    Versions = redwall_storage_ets:versions(Store),
+    ?assertEqual([{1.0, float}, {2, integer}, {{k, 3}, tuple}], [{Key, type(Key)} || Key <- lists:sort(maps:keys(Versions))]),
+    ?assertEqual([{4, {set, c}}, {3, clear}, {2, {set, b}}, {1, {set, a}}], maps:get(1.0, Versions)),
+    ?assertEqual([{1, {set, x}}], maps:get(2, Versions)),
+    ?assertEqual([{5, {set, z}}, {4, {set, y}}], maps:get({k, 3}, Versions)).
+
+type(Key) when is_float(Key) -> float;
+type(Key) when is_integer(Key) -> integer;
+type(Key) when is_tuple(Key) -> tuple.
+
 setup() ->
     {ok, _} = application:ensure_all_started(redwall),
     Tag = erlang:unique_integer([positive]),

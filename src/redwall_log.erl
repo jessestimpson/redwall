@@ -171,7 +171,12 @@
     id => id(),
     start => version(),
     kcv => version(),
-    records => [{version(), body()}]
+    records => [{version(), body()}],
+    %% Whether a push waits for the record with its previous LSN. The
+    %% default is `true'. `false' is a planted defect for the simulation:
+    %% the LogServer stores a record whose previous record it does not
+    %% have.
+    order => boolean()
 }.
 
 -type info() :: #{
@@ -199,6 +204,8 @@
     %% PreviousLSN -> {LSN, KCV, Body, Callers}: the pushes that wait for
     %% the record with the previous LSN.
     waiting = #{} :: #{version() => {version(), version(), body(), [gen_server:from()]}},
+    %% The option `order'.
+    order = true :: boolean(),
     %% Caller -> {From, After}: the tail requests that wait for a record.
     tails = #{} :: #{pid() => {gen_server:from(), version()}},
     stopped_by :: epoch() | undefined,
@@ -425,6 +432,7 @@ init(Options = #{epoch := Epoch}) ->
                 epoch = Epoch,
                 dv = Start,
                 kcv = maps:get(kcv, Options, 0),
+                order = maps:get(order, Options, true),
                 records = chain(Copied)
             }};
         Above ->
@@ -456,6 +464,11 @@ handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV})
     %% The push can have raised the Known Committed Version, which is the
     %% limit of a pop.
     {noreply, discard(answer_tails(false, release(State1)))};
+handle_call({push, _Epoch, Prev, LSN, KCV, Body}, _From, State = #state{dv = DV, order = false}) when Prev > DV, LSN > Prev ->
+    %% The planted defect `order => false': the LogServer stores the
+    %% record without the record with the previous LSN.
+    State1 = store(Prev, LSN, KCV, Body, State),
+    {reply, {ok, State1#state.dv}, State1};
 handle_call({push, _Epoch, Prev, LSN, KCV, Body}, From, State = #state{dv = DV, waiting = Waiting}) when Prev > DV, LSN > Prev ->
     %% The record with the previous LSN has not arrived.
     case Waiting of

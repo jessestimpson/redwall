@@ -197,7 +197,22 @@ resolve_test() ->
     ?assertEqual({[committed, committed, committed, committed, committed], [committed]}, Run(#{check => false})),
     ?assertEqual({[conflict, committed, committed, conflict, committed], [conflict]}, Run(#{check_ranges => false})),
     ?assertEqual({[conflict, conflict, committed, committed, committed], [conflict]}, Run(#{check_batch => false})),
-    ?assertEqual({[conflict, conflict, committed, conflict, committed], [committed]}, Run(#{check_write_ranges => false})).
+    ?assertEqual({[conflict, conflict, committed, conflict, committed], [committed]}, Run(#{check_write_ranges => false})),
+    %% The keys of the batch are atoms, so the flag `equal_keys' changes
+    %% no result.
+    ?assertEqual({[conflict, conflict, committed, conflict, committed], [conflict]}, Run(#{equal_keys => false})).
+
+%% The flag `equal_keys => false' of `resolve/4' plants a defect: a read of
+%% the key `1.0' has no conflict with a write of the key `1'. Without the
+%% flag, the read has a conflict.
+resolve_equal_keys_test() ->
+    Run = fun(Flags) ->
+        {[committed], H1} = redwall_resolver:resolve([txn(0, [], [1])], 10, redwall_resolver:new(infinity), Flags),
+        {Results, _} = redwall_resolver:resolve([txn(5, [1.0], []), txn(5, [1], []), txn(5, [], [{0.5, 2}], [], [])], 11, H1, Flags),
+        Results
+    end,
+    ?assertEqual([conflict, conflict, conflict], Run(#{})),
+    ?assertEqual([committed, conflict, conflict], Run(#{equal_keys => false})).
 
 %% The Resolver removes the versions below the oldest version. A removed
 %% version becomes 0, and a bound with the version 0 after a bound with

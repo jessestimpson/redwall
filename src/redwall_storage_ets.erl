@@ -115,14 +115,26 @@ load(#store{data = Data}, Rows) ->
 %% @doc Every version of every key: a map from the key to the list of
 %% `{Version, Change}' with the highest version first. `Change' is
 %% `{set, Value}' or `clear'. The function reads every row.
+%%
+%% The key of the map is the key of the row of the table of the data,
+%% which is the key of the last write. A row of the table of the older
+%% versions has the key of the write that moved the version to that
+%% table. That key can be equal to the key of the map and not identical.
+%% The function compares the two keys with `=='.
 -spec versions(#store{}) -> #{term() => [{non_neg_integer(), {set, term()} | clear}]}.
 versions(#store{data = Data, history = History}) ->
-    Older = lists:foldr(
-        fun({{Key, Negative}, Change}, Acc) -> maps:update_with(Key, fun(List) -> [{-Negative, Change} | List] end, [{-Negative, Change}], Acc) end,
-        #{},
-        ets:tab2list(History)
-    ),
-    maps:from_list([{Key, [{Version, Change} | maps:get(Key, Older, [])]} || {Key, Version, Change} <- ets:tab2list(Data)]).
+    %% The two lists are in the order of the keys. The older versions of
+    %% one key are in the order of their versions, the highest first.
+    maps:from_list(with_older(lists:sort(ets:tab2list(Data)), lists:sort(ets:tab2list(History)))).
+
+with_older([{Key, Version, Change} | Rows], Older0) ->
+    %% An older version of a key without a row in the table of the data
+    %% is not in the result.
+    Older1 = lists:dropwhile(fun({{Other, _Negative}, _Change}) -> Other < Key end, Older0),
+    {Mine, Older} = lists:splitwith(fun({{Other, _Negative}, _Change}) -> Other == Key end, Older1),
+    [{Key, [{Version, Change} | [{-Negative, Earlier} || {{_Other, Negative}, Earlier} <- Mine]]} | with_older(Rows, Older)];
+with_older([], _Older) ->
+    [].
 
 %% Applies the mutations of one transaction, in their order.
 write_entry(Entry, LSN, State = #store{data = Data}) when is_list(Entry) ->

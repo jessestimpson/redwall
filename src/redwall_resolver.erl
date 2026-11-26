@@ -152,7 +152,8 @@
     check => boolean(),
     check_ranges => boolean(),
     check_batch => boolean(),
-    check_write_ranges => boolean()
+    check_write_ranges => boolean(),
+    equal_keys => boolean()
 }.
 
 -type key_range() :: {Begin :: term(), End :: term()}.
@@ -180,7 +181,9 @@
     last_commit := ets:table(),
     versions := ets:table(),
     oldest := integer(),
-    window := pos_integer() | infinity
+    window := pos_integer() | infinity,
+    %% The flag `equal_keys' of `resolve/4'. The default is `true'.
+    equal_keys => boolean()
 }.
 
 %% ---------------------------------------------------------------------------
@@ -209,6 +212,7 @@ check(Transaction, Version, History) ->
 %% admitted transaction.
 check(Transaction = #{read_version := ReadVersion}, Version, History, Record) ->
     #{last_commit := LastCommit, versions := Versions, oldest := Oldest0, window := Window} = History,
+    Equal = maps:get(equal_keys, History, true),
     Reads = intervals(reads, read_ranges, Transaction),
     Writes = intervals(writes, write_ranges, Transaction),
     NewOldest = new_oldest(Version, Window, Oldest0),
@@ -226,7 +230,7 @@ check(Transaction = #{read_version := ReadVersion}, Version, History, Record) ->
             true ->
                 too_old;
             false ->
-                case lists:any(fun({Begin, End}) -> max_version(Begin, End, LastCommit) > ReadVersion end, Reads) of
+                case lists:any(fun({Begin, End}) -> max_version(Begin, End, LastCommit, Equal) > ReadVersion end, Reads) of
                     true -> conflict;
                     false -> committed
                 end
@@ -234,7 +238,7 @@ check(Transaction = #{read_version := ReadVersion}, Version, History, Record) ->
     ok =
         case Result of
             committed when Record ->
-                lists:foreach(fun({Begin, End}) -> set_version(Begin, End, Version, LastCommit, Versions) end, Writes);
+                lists:foreach(fun({Begin, End}) -> set_version(Begin, End, Version, LastCommit, Versions, Equal) end, Writes);
             _ ->
                 ok
         end,
@@ -256,14 +260,17 @@ intervals(Keys, Ranges, Transaction) ->
 
 %% The commit version at the bound `Bound': the version of the last bound
 %% at or below `Bound', or 0.
-version_at(Bound, LastCommit) ->
+%%
+%% With `Equal' false, the function has the planted defect
+%% `equal_keys => false' of `resolve/4'.
+version_at(Bound, LastCommit, Equal) ->
     %% The table compares two bounds with `==', so the bound of the row
     %% can be another term than `Bound': an integer and a float with the
     %% same value are one key.
     case ets:lookup(LastCommit, Bound) of
-        [{_Stored, Version}] ->
+        [{Stored, Version}] when Equal orelse Stored =:= Bound ->
             Version;
-        [] ->
+        _NoRowOrPlantedDefect ->
             case ets:prev(LastCommit, Bound) of
                 '$end_of_table' -> 0;
                 Below -> ets:lookup_element(LastCommit, Below, 2)
@@ -272,8 +279,8 @@ version_at(Bound, LastCommit) ->
 
 %% The highest commit version in the interval from `Begin' to `End'. The
 %% function reads the bounds of the interval only.
-max_version(Begin, End, LastCommit) ->
-    max_until(ets:next(LastCommit, Begin), End, LastCommit, version_at(Begin, LastCommit)).
+max_version(Begin, End, LastCommit, Equal) ->
+    max_until(ets:next(LastCommit, Begin), End, LastCommit, version_at(Begin, LastCommit, Equal)).
 
 max_until(Bound, End, LastCommit, Max) when Bound =/= '$end_of_table', Bound < End ->
     max_until(ets:next(LastCommit, Bound), End, LastCommit, max(Max, ets:lookup_element(LastCommit, Bound, 2)));
@@ -282,8 +289,8 @@ max_until(_NoBoundInTheInterval, _End, _LastCommit, Max) ->
 
 %% Sets the commit version of the interval from `Begin' to `End'. The
 %% version from `End' on does not change.
-set_version(Begin, End, Version, LastCommit, Versions) ->
-    AtEnd = version_at(End, LastCommit),
+set_version(Begin, End, Version, LastCommit, Versions, Equal) ->
+    AtEnd = version_at(End, LastCommit, Equal),
     ok = delete_until(ets:next(LastCommit, Begin), End, LastCommit, Versions),
     ok = put_bound(Begin, Version, LastCommit, Versions),
     put_bound(End, AtEnd, LastCommit, Versions).
@@ -366,9 +373,23 @@ new_oldest(Version, Window, Oldest) -> max(Oldest, Version - Window).
 %%   earlier transactions of its batch.</li>
 %% <li>`check_write_ranges => false': the write ranges are not
 %%   recorded.</li>
+%% <li>`equal_keys => false': the Resolver uses the row of a bound only
+%%   if the bound of the row and the bound are identical (`=:='). The
+%%   table of `lastCommit' has one row for two bounds that are equal and
+%%   not identical, for example the bounds of the keys `1' and `1.0'.
+%%   With the flag, the Resolver reads the version of the bound below
+%%   such a row in the place of the version of the row. A read of the
+%%   key `1.0' then has no conflict with a write of the key `1'.</li>
 %% </ul>
 -spec resolve([transaction()], version(), history(), flags()) -> {[result()], history()}.
-resolve(Transactions0, Version, History, Flags) ->
+resolve(Transactions0, Version, History0, Flags) ->
+    History =
+        case maps:get(equal_keys, Flags, true) of
+            true -> History0;
+            %% The planted defect: `check/4' reads the flag from the
+            %% history.
+            false -> History0#{equal_keys => false}
+        end,
     Check = maps:get(check, Flags, true),
     CheckRanges = maps:get(check_ranges, Flags, true),
     CheckBatch = maps:get(check_batch, Flags, true),

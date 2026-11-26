@@ -139,6 +139,8 @@ checks at the end of each of these runs:
 | `stale_leader` | No other process is a leader |
 | `epoch` | The leader has the current epoch of the coordinated state, and the Sequencer and the Proxy of the epoch run |
 | `worker_db_info` | Each worker that runs has the information of the leader about the database |
+| `watch_fires` | At the end of a run without a time limit of a watch, the future of a watch is ready if the key has changed. A run with clears of the keys of the watches compares the value of the watch with the value in the StorageServers. See `H3`, `H5` and `H6` in [VERIFIED.md](../VERIFIED.md) |
+| `late_commit` | In a run with late watches, each of the 6 late clients has a committed transaction at the end of the run |
 
 The harness checks these invariants after every step:
 
@@ -221,6 +223,31 @@ Results of the 5 tests with watches in a run of `make dst` on
 
 The tests without the name `watch_` have no watch, and their operations
 are the operations of the runs before 2026-11-24.
+
+Results of the 14 tests that were added on 2026-11-25, in a run of
+`make dst` on that day. The 66 tests of that run pass in 332 s. The
+operations of the 52 earlier tests are unchanged:
+
+| Test | Runs | Result |
+|---|---|---|
+| Mixed keys, no faults | 40 seeds in 1 test | No violation. 1,513 acknowledged transactions. 655 transactions read the number key in the form `1` and 672 in the form `1.0`. 397 and 383 acknowledged transactions set the two forms. 309 rows of a range read had a key in another form than the form of the client |
+| Mixed keys, faults | 70 seeds in 1 test | No violation. 392 acknowledged transactions, 28 kills of a StorageServer, 118 rollbacks of a StorageServer |
+| Watches with clears, no faults, no time limit of a watch | 50 seeds in 1 test | No violation, and `watch_fires` holds at the end of each run. 883 committed watches. 265, 219 and 178 ready futures of the clients that set, read and cleared the key. The value of a key changed back 58 times |
+| Watches with clears, faults | 70 seeds in 1 test | No violation. 555 committed watches. 93, 85 and 76 ready futures of the three kinds of clients. The value of a key changed back 43 times. 2,632 answers `timed_out` of a StorageServer |
+| Late watches, ClusterControllers, faults | 50 seeds in 1 test | No violation. 200 late watches and 100 late changes, each change above the version of its watches. 200 late watches became ready. 131 kills of a worker node |
+| Late watches, ClusterControllers, the pop, faults | 50 seeds in 1 test | No violation. 200 late watches, 100 late changes, 200 late watches became ready. 330 LogServers with discarded records |
+| The same seed gives the same trace, the trace replays, and the audit of eta reports nothing | 12 seeds with mixed keys and 8 seeds with clears and late watches, 3 runs each | Pass |
+| Planted defect `no_equal_keys`: the Resolver compares the bounds of its rows with `=:=` | Seeds from 1, mixed keys | Found at seed 1, `no_conflict`. Not found with the packed keys in 300 seeds with faults and 100 seeds without faults |
+| Planted defect `no_push_order`: a LogServer stores a record whose previous record has not arrived | Seeds from 1, runs with faults | Found at seed 48, `chain`. Also found at seed 48 when every Proxy has a `batch_depth` of 1 |
+| Planted defect `no_copy_rows`: a StorageServer stores no row of a copy | Seeds from 1, runs with faults | Found at seed 15, `read_value` |
+| Planted defect `watch_no_trigger` with clears | Seeds from 1, runs without faults | Found at seed 1, `watch_fires` |
+| Planted defect `watch_no_verify` with clears | Seeds from 1, runs with faults | Found at seed 1, `watch_change` |
+| Planted defect `watch_no_trigger` with late watches | Seeds from 1, with and without the pop | Found at seed 1 in both kinds of run, `watch_fires` of a late watch |
+
+The mixed keys found one defect in a function that only the harness and
+the unit tests call. `redwall_storage_ets:versions/1` lost the older
+versions of a key that were stored under another form of the key. Seed 2
+of the runs with mixed keys showed it as a violation of `replicas_agree`.
 
 A run of `make dst` on 2026-11-23, with the invariants
 `mapped_range_agrees` and `own_writes`: the 32 tests pass in 130 s

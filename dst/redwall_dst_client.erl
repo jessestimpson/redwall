@@ -8,9 +8,9 @@
 
 -include("redwall_eta.hrl").
 
--export([recover/4, transaction/5, watch/3, join/2, start_log/3]).
+-export([recover/4, transaction/5, watch/3, late_watch/3, late_change/4, watch_key/1, join/2, start_log/3]).
 -export([worker/5, force_recovery/1, worker_node/1, register_storage/4]).
--export([sequencer_node/1, log_node/1, storage_node/1, keys/0]).
+-export([sequencer_node/1, log_node/1, storage_node/1, keys/0, canon/1]).
 -export([coordinators/1, coordinator_ids/0, coordinator_node/1, coordinator/3, form_cluster/2]).
 
 %% Starts the process of a new epoch and waits for the end of its
@@ -129,6 +129,7 @@ start_role(Tab, Node, Mode, Role, Options0) ->
     Options =
         case {Role, Mode} of
             {log, no_copy} -> Options0#{records := []};
+            {log, no_push_order} -> Options0#{order => false};
             {proxy, _} -> maps:merge(Options0, proxy_options(Count, Mode));
             _ -> Options0
         end,
@@ -207,6 +208,7 @@ proxy_options(Count, Mode) ->
         check_ranges => Mode =/= no_range_check,
         check_batch => Mode =/= no_batch_check,
         check_write_ranges => Mode =/= no_write_range,
+        equal_keys => Mode =/= no_equal_keys,
         batch_ms => lists:nth(Count rem 3 + 1, [0, 5, 50]),
         batch_idle => Count rem 2 =:= 0,
         read_version_share => Count div 2 rem 2 =:= 0,
@@ -230,7 +232,7 @@ join(Tab, _Mode) ->
 %% function on the node of the LogServer.
 start_log(Tab, Log = #{id := Id}, Mode) ->
     ok = join(Tab, Mode),
-    case redwall_log:start(Log) of
+    case redwall_log:start(Log#{order => Mode =/= no_push_order}) of
         {ok, Pid} ->
             true = ets:insert(Tab, {{log, Id}, Pid}),
             {ok, Pid};
@@ -276,8 +278,16 @@ start_log(Tab, Log = #{id := Id}, Mode) ->
 %% The table of the run has a counter, `stamp'. The client takes a stamp
 %% before it asks for the read version, and with the answer to the commit.
 %% The harness compares the stamps of two clients in `read_version_order'.
+%%
+%% In a run with the config `keys => mixed', the 4 keys are terms of 4
+%% types, and `R' selects the form of the number key and the form of the
+%% tuple key of the client. See `keys/2' and "Runs with mixed keys" in
+%% `redwall_dst'. The client calls the client library with its forms of
+%% the keys. Every key that the client records in the table of the run is
+%% the canonical form of the key (`canon/1'), so the harness compares two
+%% keys that are equal and not identical as one key.
 transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
-    Keys = keys(),
+    Space = {_Kind, Keys, _Bound} = key_space(Tab, R),
     Reads = [Key || {I, Key} <- lists:enumerate(0, Keys), (R bsr I) band 1 =:= 1],
     Writes0 = [Key || {I, Key} <- lists:enumerate(4, Keys), (R bsr I) band 1 =:= 1],
     Writes =
@@ -287,7 +297,7 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
         end,
     Ranges =
         case R rem 7 < 2 of
-            true -> [range(R div 7)];
+            true -> [range(R div 7, Space)];
             false -> []
         end,
     %% The transaction of the client library. Its Proxy is the Proxy that
@@ -312,10 +322,11 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
             ok = redwall:set_read_version(Tx, ReadVersion),
             Read = #{read_version => ReadVersion, reader_epoch => ReaderEpoch, start => Start},
             true = ets:insert(Tab, {{read, C}, Read}),
-            case read_keys(Tab, Db, Tx, Reads, Ranges) of
+            case read_keys(Tab, Db, Tx, Reads, Ranges, Space) of
                 {ok, Values, Generation, Down} ->
                     true = ets:insert(Tab, {{read, C}, Read#{values => Values, ranges => Ranges, storage => Generation, down => Down, direct => Direct, local => node() =/= clients}}),
-                    commit(Tab, C, Tx, Read, {Reads, Ranges}, Writes, Chosen, R);
+                    ok = count_forms(Tab, read, Reads, Space),
+                    commit(Tab, C, Tx, Read, {Reads, Ranges}, Writes, Chosen, R, Space);
                 {error, transaction_too_old} ->
                     %% The read version is below the MVCC window of the
                     %% StorageServer.
@@ -332,54 +343,43 @@ transaction(Tab, C, {Reader, ReaderEpoch}, Chosen, R) ->
 %% "Runs with watches" in `redwall_dst'.
 %%
 %% <ul>
-%% <li>2 clients in 3 set the key to `{watch, C}' and create the watch in
-%%   the same transaction. The other clients read the key and create the
-%%   watch, in a transaction without a mutation.</li>
+%% <li>In a run without the config `watch_clears', 2 clients in 3 set the
+%%   key to `{watch, C}' and create the watch in the same transaction. The
+%%   other clients read the key and create the watch, in a transaction
+%%   without a mutation.</li>
+%% <li>In a run with the config `watch_clears', 1 client in 3 sets the
+%%   key to `{watch, C}', 1 client in 3 reads the key, and 1 client in 3
+%%   clears the key. Each client creates the watch in the same
+%%   transaction. The value of the watch of a client that clears the key
+%%   is `not_found'.</li>
 %% <li>The Proxy of the database is the Proxy of the highest epoch that
 %%   runs, at the time of each request. The StorageServers are the
 %%   StorageServers of the table of the run at that time.</li>
 %% <li>After a commit, the client records the row `{watch, C}' with the
-%%   key, the value and the version of the watch. When the future is
-%%   ready, it records the row `{watch_fired, C}', and reads the key in
-%%   a new transaction. The value of the watch is then a violation of
-%%   `watch_change'.</li>
+%%   key, the value, the version and the kind of the watch. When the
+%%   future is ready, the client records the row `{watch_fired, C}', and
+%%   reads the key in a new transaction.</li>
+%% <li>In a run without the config `watch_clears', the value of the watch
+%%   as the result of that read is a violation of `watch_change'. The
+%%   client records the violation.</li>
+%% <li>In a run with the config `watch_clears', the client records the
+%%   value and the read version of that read in the row
+%%   `{watch_reread, C}'. The harness decides `watch_change' from the row
+%%   and from the records of the LogServers.</li>
 %% <li>After a failed commit, the future must have the error of the
 %%   commit (`watch_error').</li>
 %% </ul>
 watch(Tab, C, R) ->
     [{watches, Kind}] = ets:lookup(Tab, watches),
-    [{mode, Mode}] = ets:lookup(Tab, mode),
     Key = watch_key(R rem 2 + 1),
-    Db = redwall:open(#{
-        proxy => fun() ->
-            case latest_proxy(Tab, none) of
-                {Proxy, _Epoch} -> Proxy;
-                none -> undefined
-            end
-        end,
-        storage => fun() -> storages(Tab) end,
-        direct => R rem 5 =/= 0,
-        watch_call_timeout_ms =>
-            case Kind of
-                live -> infinity;
-                true -> 1000
-            end,
-        watch_verify => Mode =/= watch_no_verify
-    }),
+    Db = watch_db(Tab, R rem 5 =/= 0, Kind),
     Tx = redwall:create_transaction(Db),
-    Sets = R rem 3 =/= 0,
+    Act = watch_kind(Tab, R),
     try
-        Seen =
-            case Sets of
-                true ->
-                    ok = redwall:set(Tx, Key, {watch, C}),
-                    {watch, C};
-                false ->
-                    redwall:get(Tx, Key)
-            end,
-        {Seen, redwall:watch(Tx, Key)}
+        watch_create(Tx, Key, C, Act)
     of
         {Value, Future} ->
+            true = watcher(Tab, C, Future),
             try redwall:commit(Tx) of
                 ok ->
                     Version =
@@ -387,7 +387,7 @@ watch(Tab, C, R) ->
                             -1 -> redwall:get_read_version(Tx);
                             LSN -> LSN
                         end,
-                    true = ets:insert(Tab, {{watch, C}, #{key => Key, value => Value, version => Version, set => Sets}}),
+                    true = ets:insert(Tab, {{watch, C}, watch_row(Tab, Key, Value, Version, Act)}),
                     watch_wait(Tab, C, Db, Key, Value, Future, Kind)
             catch
                 error:{erlfdb_error, Code} ->
@@ -409,6 +409,73 @@ watch(Tab, C, R) ->
             ets:insert(Tab, {{watch_no_read, C}, Code})
     end.
 
+%% The database of a client with a watch. `Kind' is `true' or `live'.
+%% With `live', a request of a watch has no time limit. With the planted
+%% defect `watch_no_verify', the client does not read the key after the
+%% answer of a StorageServer.
+watch_db(Tab, Direct, Kind) ->
+    [{mode, Mode}] = ets:lookup(Tab, mode),
+    redwall:open(#{
+        proxy => fun() ->
+            case latest_proxy(Tab, none) of
+                {Proxy, _Epoch} -> Proxy;
+                none -> undefined
+            end
+        end,
+        storage => fun() -> storages(Tab) end,
+        direct => Direct,
+        watch_call_timeout_ms =>
+            case Kind of
+                live -> infinity;
+                true -> 1000
+            end,
+        watch_verify => Mode =/= watch_no_verify
+    }).
+
+%% Records the process of the watch of a future in the table of the run.
+%% The process is not linked to the client. The harness stops it at the
+%% end of the run.
+watcher(Tab, C, {redwall_future, _Reference, {Pid, _Status, _Count}}) ->
+    Count = ets:update_counter(Tab, watchers, 1, {watchers, 0}),
+    ets:insert(Tab, {{watcher, C, Count}, Pid}).
+
+%% The row `{watch, C}' of a committed watch: the key, the value and the
+%% version of the watch, and whether the transaction set the key. In a
+%% run with the config `watch_clears', the row also has the kind of the
+%% transaction.
+watch_row(Tab, Key, Value, Version, Act) ->
+    Row = #{key => Key, value => Value, version => Version, set => Act =:= set},
+    case ets:member(Tab, watch_clears) of
+        true -> Row#{kind => Act};
+        false -> Row
+    end.
+
+%% The kind of the transaction of a watch: `set', `read' or `clear'. A
+%% run without the config `watch_clears' has no kind `clear'.
+watch_kind(Tab, R) ->
+    case {ets:member(Tab, watch_clears), R rem 3} of
+        {_, 0} -> read;
+        {true, 2} -> clear;
+        {_, _} -> set
+    end.
+
+%% Sets, reads or clears the key, and creates the watch in the same
+%% transaction. The result has the value of the watch and the future. The
+%% value is `not_found' for a key without a value.
+watch_create(Tx, Key, C, Act) ->
+    Seen =
+        case Act of
+            set ->
+                ok = redwall:set(Tx, Key, {watch, C}),
+                {watch, C};
+            read ->
+                redwall:get(Tx, Key);
+            clear ->
+                ok = redwall:clear(Tx, Key),
+                not_found
+        end,
+    {Seen, redwall:watch(Tx, Key)}.
+
 watch_wait(Tab, C, Db, Key, Value, Future, Kind) ->
     Timeout =
         case Kind of
@@ -418,10 +485,16 @@ watch_wait(Tab, C, Db, Key, Value, Future, Kind) ->
     try redwall:wait(Future, [{timeout, Timeout}]) of
         ok ->
             true = ets:insert(Tab, {{watch_fired, C}, true}),
-            case watch_reread(Db, Key, 10) of
-                {ok, Value} -> ets:insert(Tab, {{watch_violation, C}, #{property => watch_change, client => C, key => Key, value => Value}});
-                {ok, _Other} -> ets:insert(Tab, {{watch_checked, C}, true});
-                error -> true
+            case {watch_reread(Db, Key, 10), ets:member(Tab, watch_clears)} of
+                {{ok, Seen, ReadVersion}, true} ->
+                    %% The harness decides `watch_change'.
+                    ets:insert(Tab, {{watch_reread, C}, #{value => Seen, read_version => ReadVersion}});
+                {{ok, Value, _ReadVersion}, false} ->
+                    ets:insert(Tab, {{watch_violation, C}, #{property => watch_change, client => C, key => Key, value => Value}});
+                {{ok, _Other, _ReadVersion}, false} ->
+                    ets:insert(Tab, {{watch_checked, C}, true});
+                {error, _Clears} ->
+                    true
             end
     catch
         error:{timeout, _} ->
@@ -431,13 +504,16 @@ watch_wait(Tab, C, Db, Key, Value, Future, Kind) ->
             ets:insert(Tab, {{watch_violation, C}, #{property => watch_error, client => C, commit => ok, future => Code}})
     end.
 
-%% Reads the key in a new transaction, for at most `Tries' attempts.
+%% Reads the key in a new transaction, for at most `Tries' attempts. The
+%% result has the value, or `not_found', and the read version of the
+%% read.
 watch_reread(_Db, _Key, 0) ->
     error;
 watch_reread(Db, Key, Tries) ->
     Tx = {redwall_transaction, Table} = redwall:create_transaction(Db),
     try
-        {ok, redwall:get(redwall:snapshot(Tx), Key)}
+        Seen = redwall:get(redwall:snapshot(Tx), Key),
+        {ok, Seen, redwall:get_read_version(Tx)}
     catch
         error:{erlfdb_error, _Code} ->
             ok = timer:sleep(50),
@@ -446,8 +522,125 @@ watch_reread(Db, Key, Tries) ->
         ets:delete(Table)
     end.
 
-%% The keys of the watches. They are not keys of the transactions of the
-%% workload, and no read range of the workload contains them.
+%% Creates one late watch, and waits for its future. The harness starts
+%% this client after the last operation of a run with the config
+%% `late_watches', when it has stopped the faults. See "Runs with late
+%% watches" in `redwall_dst'. `C' is the number of the client, and `R'
+%% selects the key and the kind of the transaction, as for `watch/3'.
+%%
+%% <ul>
+%% <li>The client has no time limit: a request of a watch has no time
+%%   limit, and the client waits for its future without a limit.</li>
+%% <li>The client runs its transaction again after an error, until the
+%%   commit succeeds. Before each new attempt it waits for 50 ms. After
+%%   every third failed attempt in a row with another error than a
+%%   conflict, the client asks the ClusterControllers for a recovery,
+%%   because an epoch with a lost message to a LogServer commits no
+%%   transaction.</li>
+%% <li>After the commit, the client records the row `{watch, C}' with
+%%   `late => true'. When the future is ready, it records the rows
+%%   `{watch_fired, C}' and `{watch_reread, C}', as `watch/3' does.</li>
+%% </ul>
+late_watch(Tab, C, R) ->
+    Key = watch_key(R rem 2 + 1),
+    Db = watch_db(Tab, R rem 5 =/= 0, live),
+    Act = watch_kind(Tab, R),
+    Create = fun(Tx) ->
+        Created = {_Value, Future} = watch_create(Tx, Key, C, Act),
+        true = watcher(Tab, C, Future),
+        Created
+    end,
+    {Value, Version, Future} = late_commit(Tab, C, Db, 0, Create),
+    true = ets:insert(Tab, {{watch, C}, (watch_row(Tab, Key, Value, Version, Act))#{late => true}}),
+    watch_wait(Tab, C, Db, Key, Value, Future, live).
+
+%% Changes the key of the late watches with the number `I': sets the key
+%% to `{watch, C}'. The client first waits until `Watchers' late watches
+%% have a committed transaction. It runs its transaction again after an
+%% error, as `late_watch/3' does. After the commit it records the row
+%% `{late_change, C}' with the key and the commit version.
+late_change(Tab, C, I, Watchers) ->
+    ok = late_await(Tab, Watchers),
+    Key = watch_key(I),
+    Db = watch_db(Tab, true, live),
+    {ok, Version, none} = late_commit(Tab, C, Db, 0, fun(Tx) -> {redwall:set(Tx, Key, {watch, C}), none} end),
+    true = ets:insert(Tab, {{late_change, C}, #{key => Key, version => Version}}),
+    ok.
+
+%% Waits until the table of the run has `Watchers' late watches.
+late_await(Tab, Watchers) ->
+    case length([C || [C, #{late := true}] <- ets:match(Tab, {{watch, '$1'}, '$2'})]) >= Watchers of
+        true ->
+            ok;
+        false ->
+            ok = timer:sleep(20),
+            late_await(Tab, Watchers)
+    end.
+
+%% Runs `Fun' in a new transaction and commits, until the commit
+%% succeeds. `Fun' returns a result and the future of a watch, or `none'.
+%% The result of this function has the result of `Fun', the version of
+%% the watch and the future. The version is the commit version, or the
+%% read version for a transaction without a mutation. `Failed' is the
+%% number of failed attempts in a row with another error than a conflict.
+%% `C' is the number of the client.
+late_commit(Tab, C, Db, Failed, Fun) ->
+    Tx = {redwall_transaction, Table} = redwall:create_transaction(Db),
+    try
+        {Result, Future} = Fun(Tx),
+        try
+            ok = redwall:commit(Tx),
+            Version =
+                case redwall:get_committed_version(Tx) of
+                    -1 -> redwall:get_read_version(Tx);
+                    LSN -> LSN
+                end,
+            {done, {Result, Version, Future}}
+        catch
+            error:{erlfdb_error, Code} ->
+                %% The future of the watch has the error of the commit.
+                _ = Future =/= none andalso redwall:cancel(Future, [{flush, true}]),
+                {error, Code}
+        end
+    of
+        {done, Done} ->
+            Done;
+        {error, CommitCode} ->
+            late_again(Tab, C, Db, Failed, CommitCode, Fun)
+    catch
+        error:{erlfdb_error, ReadCode} ->
+            late_again(Tab, C, Db, Failed, ReadCode, Fun)
+    after
+        ets:delete(Table)
+    end.
+
+%% Records the failed attempt of the client `C' in the row
+%% `{late_failed, C}', with the number of failed attempts and the last
+%% error code, and starts the next attempt.
+late_again(Tab, C, Db, Failed0, Code, Fun) ->
+    _ = ets:update_counter(Tab, late_retries, 1, {late_retries, 0}),
+    Attempts =
+        case ets:lookup(Tab, {late_failed, C}) of
+            [{_, #{attempts := Before}}] -> Before;
+            [] -> 0
+        end,
+    true = ets:insert(Tab, {{late_failed, C}, #{attempts => Attempts + 1, code => Code}}),
+    Failed =
+        case Code of
+            %% A conflict with another transaction.
+            1020 -> 0;
+            _ -> Failed0 + 1
+        end,
+    _ = Failed rem 3 =:= 0 andalso Failed > 0 andalso begin
+        _ = ets:update_counter(Tab, late_recoveries, 1, {late_recoveries, 0}),
+        force_recovery(Tab)
+    end,
+    ok = timer:sleep(50),
+    late_commit(Tab, C, Db, Failed, Fun).
+
+%% The 2 keys of the watches. They are not keys of the transactions of
+%% the workload, and no read range and no cleared range of the workload
+%% contains them.
 watch_key(I) -> redwall_tuple:pack({<<"w">>, I}).
 
 %% Reads the keys and the ranges through the client library, which reads
@@ -456,14 +649,24 @@ watch_key(I) -> redwall_tuple:pack({<<"w">>, I}).
 %% each key of the workload in each range. The client library does not
 %% return the LSN of the record that wrote a value. The harness finds that
 %% LSN in the records of the LogServers.
-read_keys(Tab, Db, Tx, Keys, Ranges) ->
+%%
+%% Each key of the result is the canonical form of the key. In a run with
+%% mixed keys, a read of a range can return a key in another form than
+%% the form of the client, because a StorageServer returns the key of the
+%% last write that it applied. The function counts these rows in the
+%% counter `other_form_rows' of the table of the run.
+%%
+%% In a run with mixed keys, the function reads every range with
+%% `get_range/3', and reads no range with `get_mapped_range/4', because a
+%% mapper needs packed keys.
+read_keys(Tab, Db, Tx, Keys, Ranges, Space = {Kind, _Keys, _Bound}) ->
     %% `Generation' is the number of StorageServers that the harness
     %% started after a kill. `Down' is the number of StorageServers that
     %% are not alive, and the number of StorageServers.
     Generation = lists:sum([G || [G] <- ets:match(Tab, {{storage, '_'}, '_', '$1', '_'})]),
     Down = {length([x || Storage <- storages(Tab), not is_process_alive(Storage)]), length(storages(Tab))},
     try
-        Single = [{Key, found(redwall:wait(redwall:get(Tx, Key)))} || Key <- Keys],
+        Single = [{canon(Key), found(redwall:wait(redwall:get(Tx, Key)))} || Key <- Keys],
         InRanges = lists:append([
             begin
                 %% 1 range in 4 is read with `get_mapped_range/4' only,
@@ -472,7 +675,7 @@ read_keys(Tab, Db, Tx, Keys, Ranges) ->
                 %% mapped range read and no other for the range, and the
                 %% invariant `no_conflict' checks them.
                 Found =
-                    case ets:update_counter(Tab, range_number, 1, {range_number, 0}) rem 4 of
+                    case Kind =:= packed andalso ets:update_counter(Tab, range_number, 1, {range_number, 0}) rem 4 of
                         0 ->
                             _ = ets:update_counter(Tab, own_mapped_reads, 1, {own_mapped_reads, 0}),
                             Mapped = redwall:get_mapped_range(Tx, Begin, End, {<<"k">>, <<"{K[1]}">>}),
@@ -484,13 +687,17 @@ read_keys(Tab, Db, Tx, Keys, Ranges) ->
                             ok = select(Tab, Tx, Range, Rows),
                             Rows
                     end,
-                ok = mapped_range(Tab, Db, redwall:get_read_version(Tx), Range, Found),
-                ok = range_options(Tab, Db, redwall:get_read_version(Tx), Range, Found),
+                ok = mapped_range(Tab, Db, redwall:get_read_version(Tx), Range, Found, Kind),
+                ok = range_options(Tab, Db, redwall:get_read_version(Tx), Range, Found, Kind),
                 %% The read returns no key outside the range, and the keys
                 %% are in their order.
-                [] = [Key || {Key, _Value} <- Found, not lists:member(Key, keys_in(Range))],
+                InRange = keys_in(Range, Space),
+                Canonical = canon(Found),
+                [] = [Key || {Key, _Value} <- Canonical, not lists:member(Key, canon(InRange))],
                 Found = lists:ukeysort(1, Found),
-                [{Key, found(proplists:get_value(Key, Found, not_found))} || Key <- keys_in(Range)]
+                Other = length([Key || {Key, _Value} <- Found, not lists:member(Key, InRange)]),
+                _ = Other > 0 andalso ets:update_counter(Tab, other_form_rows, Other, {other_form_rows, 0}),
+                [{canon(Key), found(proplists:get_value(canon(Key), Canonical, not_found))} || Key <- InRange]
             end
          || Range = {Begin, End} <- Ranges
         ]),
@@ -505,7 +712,9 @@ read_keys(Tab, Db, Tx, Keys, Ranges) ->
 %% the second one the keys of the rows of a client with an even number.
 %% The results must be the results of `ets:match_spec_run/2' on `Found',
 %% the result of `get_range/3'. The function records a difference in the
-%% table of the run, for the invariant `select_agrees'.
+%% table of the run, for the invariant `select_agrees'. The function
+%% compares the canonical forms of the results, because two reads at one
+%% read version can return one key in two forms.
 select(Tab, Tx, {Begin, End}, Found) ->
     Specs = [
         [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}],
@@ -517,9 +726,10 @@ select(Tab, Tx, {Begin, End}, Found) ->
             N = ets:update_counter(Tab, selects, 1, {selects, 0}),
             Limit = N rem 3 + 1,
             First = lists:sublist(Expected, Limit),
-            case {redwall:select(Tx, Begin, End, Spec), redwall:select(Tx, Begin, End, Spec, [{limit, Limit}])} of
-                {Expected, First} -> ok;
-                Other -> true = ets:insert(Tab, {{select_differs, N}, #{range => {Begin, End}, expected => Expected, limit => Limit, selected => Other}})
+            Selected = {redwall:select(Tx, Begin, End, Spec), redwall:select(Tx, Begin, End, Spec, [{limit, Limit}])},
+            case canon(Selected) =:= canon({Expected, First}) of
+                true -> ok;
+                false -> true = ets:insert(Tab, {{select_differs, N}, #{range => {Begin, End}, expected => Expected, limit => Limit, selected => Selected}})
             end
         end,
         Specs
@@ -541,7 +751,12 @@ select(Tab, Tx, {Begin, End}, Found) ->
 %% of the client gets no read conflict range from them. The function
 %% records a difference in the table of the run, for the invariant
 %% `mapped_range_agrees'.
-mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found) ->
+%%
+%% In a run with mixed keys, the function reads nothing, because a mapper
+%% needs packed keys.
+mapped_range(_Tab, _Db, _ReadVersion, _Range, _Found, mixed) ->
+    ok;
+mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found, packed) ->
     Tx = {redwall_transaction, Table} = redwall:create_transaction(Db),
     try
         ok = redwall:set_read_version(Tx, ReadVersion),
@@ -574,7 +789,31 @@ mapped_range(Tab, Db, ReadVersion, {Begin, End}, Found) ->
 %% transaction with the same read version, in a database with the kind
 %% `binary', which has key selectors. The function records a difference
 %% in the table of the run, for the invariant `range_options_agree'.
-range_options(Tab, {redwall_database, Servers}, ReadVersion, {Begin, End}, Found) ->
+%%
+%% In a run with mixed keys, the database of the second transaction has
+%% the kind `any', because the kind `binary' accepts binary keys only.
+%% The function then reads the range with the options, and resolves no
+%% key selector, because a database of the kind `any' has no key
+%% selectors. The function compares the canonical forms of the results.
+range_options(Tab, {redwall_database, Servers}, ReadVersion, {Begin, End}, Found, mixed) ->
+    Tx = {redwall_transaction, Table} = redwall:create_transaction({redwall_database, Servers}),
+    try
+        ok = redwall:set_read_version(Tx, ReadVersion),
+        N = ets:update_counter(Tab, range_option_reads, 1, {range_option_reads, 0}),
+        Limit = N rem 3 + 1,
+        Backward = lists:reverse(Found),
+        Expected = {Backward, lists:sublist(Found, Limit), lists:sublist(Backward, Limit)},
+        Read = {
+            redwall:get_range(Tx, Begin, End, [{reverse, true}]),
+            redwall:get_range(Tx, Begin, End, [{limit, Limit}]),
+            redwall:get_range(Tx, Begin, End, [{limit, Limit}, {reverse, true}])
+        },
+        _ = canon(Read) =:= canon(Expected) orelse ets:insert(Tab, {{range_options_differ, N}, #{range => {Begin, End}, limit => Limit, expected => Expected, read => Read}}),
+        ok
+    after
+        ets:delete(Table)
+    end;
+range_options(Tab, {redwall_database, Servers}, ReadVersion, {Begin, End}, Found, packed) ->
     Tx = {redwall_transaction, Table} = redwall:create_transaction({redwall_database, Servers#{keys => binary}}),
     try
         ok = redwall:set_read_version(Tx, ReadVersion),
@@ -697,17 +936,18 @@ storages(Tab) ->
 found(not_found) -> not_found;
 found(Value) -> {Value, unknown}.
 
-%% The keys of the workload in a range.
-keys_in({Begin, End}) ->
-    [Key || Key <- keys(), Key >= Begin, Key < End].
+%% The keys of the client in a range, in the forms of the client.
+keys_in({Begin, End}, {_Kind, Keys, _Bound}) ->
+    [Key || Key <- Keys, Key >= Begin, Key < End].
 
-%% One of the 10 ranges whose bounds are the 4 keys and the key 5.
-range(R) ->
-    Bounds = keys() ++ [key(5)],
+%% One of the 10 ranges whose bounds are the 4 keys of the client and the
+%% upper bound of the keys.
+range(R, {_Kind, Keys, Bound}) ->
+    Bounds = Keys ++ [Bound],
     Pairs = [{Begin, End} || Begin <- Bounds, End <- Bounds, Begin < End],
     lists:nth(R rem length(Pairs) + 1, Pairs).
 
-commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, {Reads, Ranges}, Writes, Chosen, R) ->
+commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, start := Start}, {Reads, Ranges}, Writes, Chosen, R, Space) ->
     {Proxy, Epoch} =
         case R rem 3 of
             0 ->
@@ -719,14 +959,14 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
     true = ets:insert(Tab, [{{invoked, C}, Epoch}, {{commit_proxy, C}, Proxy}]),
     Cleared =
         case R rem 11 < 2 of
-            true -> [range(R div 11)];
+            true -> [range(R div 11, Space)];
             false -> []
         end,
-    Clears = lists:append([keys_in(Range) || Range <- Cleared]) -- Writes,
-    true = ets:insert(Tab, {{attempt, C}, Clears}),
+    Clears = lists:append([keys_in(Range, Space) || Range <- Cleared]) -- Writes,
+    true = ets:insert(Tab, {{attempt, C}, canon(Clears)}),
     lists:foreach(fun({Begin, End}) -> ok = redwall:clear_range(Tx, Begin, End) end, Cleared),
     lists:foreach(fun(Key) -> ok = redwall:set(Tx, Key, {client, C}) end, Writes),
-    ok = own_writes(Tab, C, Tx, ReadVersion, Writes, Clears),
+    ok = own_writes(Tab, C, Tx, ReadVersion, Writes, Clears, Space),
     try redwall:wait(redwall:commit(Tx)) of
         ok ->
             LSN = redwall:get_committed_version(Tx),
@@ -736,10 +976,10 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
                 read_version => ReadVersion,
                 reader_epoch => ReaderEpoch,
                 %% The read keys and the keys of the read ranges.
-                reads => lists:usort(Reads ++ lists:append([keys_in(Range) || Range <- Ranges])),
-                writes => Writes,
+                reads => lists:usort(canon(Reads ++ lists:append([keys_in(Range, Space) || Range <- Ranges]))),
+                writes => canon(Writes),
                 %% The keys that the transaction cleared and did not write.
-                clears => Clears,
+                clears => canon(Clears),
                 cleared => Cleared,
                 ranges => Ranges,
                 %% The position of the transaction in its batch.
@@ -747,6 +987,7 @@ commit(Tab, C, Tx, #{read_version := ReadVersion, reader_epoch := ReaderEpoch, s
                 start => Start,
                 'end' => End
             }}),
+            ok = count_forms(Tab, write, Writes, Space),
             true = ets:insert(Tab, {{ack, C}, Epoch, LSN})
     catch
         %% The error codes of FoundationDB. See `redwall'.
@@ -792,40 +1033,67 @@ after_error(Tab, Tx = {redwall_transaction, Table}, Code) ->
 %% conflict range from them. The function records a difference in the
 %% table of the run, for the invariant `own_writes'. It checks nothing
 %% when a read fails with an error code.
-own_writes(Tab, C, Tx, ReadVersion, Writes, Clears) ->
+%%
+%% The function compares the canonical forms of the results. In a run
+%% with mixed keys:
+%%
+%% <ul>
+%% <li>The function does not call `get_mapped_range/4', because a mapper
+%%   needs packed keys.</li>
+%% <li>`get/2' also returns the value of the transaction for the other
+%%   form of a key that the transaction set, and `not_found' for the
+%%   other form of a key that it cleared (`other_form/1').</li>
+%% </ul>
+own_writes(Tab, C, Tx, ReadVersion, Writes, Clears, {Kind, Keys, Bound}) ->
     [{db, Servers}] = ets:lookup(element(2, Tx), db),
     Plain = {redwall_transaction, Table} = redwall:create_transaction({redwall_database, Servers}),
     Snapshot = redwall:snapshot(Tx),
-    {Begin, End} = {key(1), key(5)},
+    {Begin, End} = {hd(Keys), Bound},
     try
         ok = redwall:set_read_version(Plain, ReadVersion),
         Stored = redwall:get_range(redwall:snapshot(Plain), Begin, End),
-        Expected = lists:ukeymerge(1, [{Key, {client, C}} || Key <- lists:sort(Writes)], [Row || Row = {Key, _} <- Stored, not lists:member(Key, Clears)]),
+        Expected = lists:ukeymerge(1, [{Key, {client, C}} || Key <- lists:sort(Writes)], [Row || Row = {Key, _} <- Stored, not lists:member(canon(Key), canon(Clears))]),
         All = [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}],
         Mapped =
-            try redwall:get_mapped_range(Tx, Begin, End, {<<"k">>, <<"{K[1]}">>}) of
-                Rows -> {ok, Rows}
-            catch
-                error:{erlfdb_error, 2039} -> reads_your_writes
+            case Kind of
+                packed ->
+                    try redwall:get_mapped_range(Tx, Begin, End, {<<"k">>, <<"{K[1]}">>}) of
+                        Rows -> {ok, Rows}
+                    catch
+                        error:{erlfdb_error, 2039} -> reads_your_writes
+                    end;
+                mixed ->
+                    not_read
             end,
-        Got = #{
+        Got0 = #{
             sets => [redwall:get(Snapshot, Key) || Key <- Writes],
             clears => [redwall:get(Snapshot, Key) || Key <- Clears],
             range => redwall:get_range(Snapshot, Begin, End),
             select => redwall:select(Snapshot, Begin, End, All),
-            limit => redwall:select(Snapshot, Begin, End, All, [{limit, 2}]),
-            mapped => Mapped
+            limit => redwall:select(Snapshot, Begin, End, All, [{limit, 2}])
         },
-        Want = #{
+        Want0 = #{
             sets => [{client, C} || _ <- Writes],
             clears => [not_found || _ <- Clears],
             range => Expected,
             select => Expected,
-            limit => lists:sublist(Expected, 2),
-            mapped => reads_your_writes
+            limit => lists:sublist(Expected, 2)
         },
+        {Got, Want} =
+            case Kind of
+                packed ->
+                    {Got0#{mapped => Mapped}, Want0#{mapped => reads_your_writes}};
+                mixed ->
+                    {
+                        Got0#{
+                            other_sets => [redwall:get(Snapshot, other_form(Key)) || Key <- Writes],
+                            other_clears => [redwall:get(Snapshot, other_form(Key)) || Key <- Clears]
+                        },
+                        Want0#{other_sets => maps:get(sets, Want0), other_clears => maps:get(clears, Want0)}
+                    }
+            end,
         _ = ets:update_counter(Tab, own_write_checks, 1, {own_write_checks, 0}),
-        _ = Got =:= Want orelse ets:insert(Tab, {{own_writes_differ, C}, #{got => Got, expected => Want, writes => Writes, clears => Clears}}),
+        _ = canon(Got) =:= canon(Want) orelse ets:insert(Tab, {{own_writes_differ, C}, #{got => Got, expected => Want, writes => Writes, clears => Clears}}),
         ok
     catch
         error:{erlfdb_error, _Code} -> ok
@@ -844,12 +1112,97 @@ latest_proxy(Tab, Default) ->
             {Proxy, Epoch}
     end.
 
-%% The keys of the workload. A small number of keys gives many conflicts.
-%% The keys are packed tuples, so that the mapper of
-%% `redwall:get_mapped_range/4' can read them.
+%% The keys of the workload in a run without the config `keys => mixed'.
+%% A small number of keys gives many conflicts. The keys are packed
+%% tuples, so that the mapper of `redwall:get_mapped_range/4' can read
+%% them.
 keys() -> [key(I) || I <- [1, 2, 3, 4]].
 
 key(I) -> redwall_tuple:pack({<<"k">>, I}).
+
+%% The keys of one client: `{Kind, Keys, Bound}'. `Kind' is `packed', or
+%% `mixed' in a run with the config `keys => mixed', which has the row
+%% `{keys, mixed}' in the table of the run. `Keys' are the 4 keys in the
+%% order of Erlang terms, and `Bound' is a key above the 4 keys, for the
+%% end of a range. `R' is the random number of the client.
+key_space(Tab, R) ->
+    case ets:lookup(Tab, keys) of
+        [] -> {packed, keys(), key(5)};
+        [{keys, mixed}] -> {mixed, keys(mixed, R div 256 rem 4), <<"k5">>}
+    end.
+
+%% The 4 keys of a client in a run with mixed keys: a number, an atom, a
+%% tuple and a binary. The order of Erlang terms has a number before an
+%% atom, an atom before a tuple, and a tuple before a binary. `Forms' is
+%% a number from 0 to 3:
+%%
+%% <ul>
+%% <li>With an odd number, the number key is the float `1.0'. Otherwise
+%%   it is the integer `1'.</li>
+%% <li>With 2 or 3, the tuple key is `{k, 3.0}'. Otherwise it is
+%%   `{k, 3}'.</li>
+%% </ul>
+%%
+%% The two forms of a key are equal (`==') and not identical (`=:=').
+%% redwall treats them as one key.
+keys(mixed, Forms) ->
+    Number =
+        case Forms band 1 of
+            0 -> 1;
+            1 -> 1.0
+        end,
+    Tuple =
+        case Forms band 2 of
+            0 -> {k, 3};
+            2 -> {k, 3.0}
+        end,
+    [Number, k, Tuple, <<"k4">>].
+
+%% The other form of a key with two forms, and the key itself for a key
+%% with one form.
+other_form(1) -> 1.0;
+other_form(1.0) -> 1;
+other_form({k, 3}) -> {k, 3.0};
+other_form({k, 3.0}) -> {k, 3};
+other_form(Key) -> Key.
+
+%% The canonical form of a term: each float with the value of an integer
+%% is replaced by that integer, also inside a tuple, a list and a map.
+%% Two keys of the workload that are equal have one canonical form. The
+%% harness and the client compare the canonical forms of keys, and use
+%% them as the keys of maps and of rows. The canonical form of a packed
+%% key is the key itself.
+canon(Float) when is_float(Float), trunc(Float) == Float -> trunc(Float);
+canon(Tuple) when is_tuple(Tuple) -> list_to_tuple(canon(tuple_to_list(Tuple)));
+canon([Head | Tail]) -> [canon(Head) | canon(Tail)];
+canon(Map) when is_map(Map) -> maps:from_list(canon(maps:to_list(Map)));
+canon(Term) -> Term.
+
+%% Counts the forms of the number key in a run with mixed keys, in the
+%% table of the run. `Kind' is `read' or `write', and `Used' are the keys
+%% that the client read with `get/2', or the keys that its acknowledged
+%% transaction set. The counters are `integer_key_reads',
+%% `float_key_reads', `integer_key_writes' and `float_key_writes'.
+count_forms(_Tab, _Kind, _Used, {packed, _Keys, _Bound}) ->
+    ok;
+count_forms(Tab, Kind, Used, {mixed, _Keys, _Bound}) ->
+    lists:foreach(
+        fun
+            (Key) when Key == 1 ->
+                Counter =
+                    case {is_float(Key), Kind} of
+                        {false, read} -> integer_key_reads;
+                        {true, read} -> float_key_reads;
+                        {false, write} -> integer_key_writes;
+                        {true, write} -> float_key_writes
+                    end,
+                _ = ets:update_counter(Tab, Counter, 1, {Counter, 0}),
+                ok;
+            (_Key) ->
+                ok
+        end,
+        Used
+    ).
 
 %% The simulated nodes. `N' is the number of the `recover' operation.
 sequencer_node(N) -> list_to_atom("sequencer_" ++ integer_to_list(N)).

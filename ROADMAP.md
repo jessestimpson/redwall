@@ -393,10 +393,10 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
 - [x] Model the Resolver, in the separate model `formal/Resolver.tla`.
 - [x] Model the watch, in the separate model `formal/Watch.tla`, with
       the liveness property `Fires`.
-- [ ] Add watches to the simulation runs with ClusterControllers and to
+- [x] Add watches to the simulation runs with ClusterControllers and to
       the runs with the pop, and check `watch_fires` in a run with
       faults after the harness has stopped the faults.
-- [ ] Add clears of the keys of the watches to the simulation. The
+- [x] Add clears of the keys of the watches to the simulation. The
       value of a key then changes back, and `watch_change` needs another
       statement.
 - [ ] Add keys and values to the model of the StorageServer, so that the
@@ -412,15 +412,23 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
       under "When to run TLC".
 - [ ] Validate traces of the implementation against the model, as peace
       does.
-- [ ] Use keys of several types in the simulation, also keys that are
+- [x] Use keys of several types in the simulation, also keys that are
       equal and not identical. The keys of the simulation are packed
       tuples, and the simulation did not find the defect of such keys in
       the Resolver.
-- [ ] Add unit tests for `redwall_status` in redwall. Its tests are in
+- [x] Add unit tests for `redwall_status` in redwall. Its tests are in
       etx.
-- [ ] Add a planted defect for `batch_depth` above 1, and one for the
-      copy of a StorageServer in the simulation of redwall.
-- [ ] Stop the temporary processes of a worker and of a
-      ClusterController at the end of a simulation run. They run until
-      the tables of eta are deleted, and two runs of the suite differed
-      by 1 in two counters of the statistics.
+- [x] Add a planted defect for `batch_depth` above 1, and one for the
+      copy of a StorageServer in the simulation of redwall. The defects
+      are `no_push_order` and `no_copy_rows`. `no_push_order` is not
+      specific to `batch_depth` above 1: the simulation finds it at the
+      same seed with a `batch_depth` of 1, because a Proxy also closes a
+      batch at the end of the time of the batch.
+- [x] Make the statistics of two runs of the suite equal. Two runs
+      differed by 1 in a few counters. The harness kills the temporary
+      processes of a worker, of a ClusterController and of a
+      StorageServer at the end of a run. The cause of the difference was
+      another one: eta releases the processes of a run before it calls
+      `terminate/1`, and the harness read the statistics in
+      `terminate/1`. The harness now records them in `check_final/2`.
+      Two runs of the 66 tests gave the same 29 statistics files.
