@@ -60,8 +60,9 @@
 %% comparison lets two epochs acknowledge the same version.
 %%
 %% Each value can be proposed again after a timeout. A value that is
-%% applied a second time for the same owner gives the same reply and does
-%% not change the state.
+%% applied a second time for the same owner gives the same reply. The
+%% second application does not change the state, with one exception: the
+%% value `reset' raises `generation' again and changes nothing else.
 -module(redwall_cstate).
 
 -behaviour(peace_machine).

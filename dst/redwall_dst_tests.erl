@@ -6,7 +6,8 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--export([opts/2, calm/1, run/1]).
+-export([opts/2, calm/1, run/1, peace/1]).
+-export([mixed_controller/1, mixed_pop/1, mixed_peace/1]).
 -export([watch_clear_live/2, watch_clear_faults/2, watch_late/2, watch_late_pop/2]).
 
 %% The limit for one test, in seconds.
@@ -653,6 +654,70 @@ mixed_faults_test_() ->
 
 mixed(Seed, Mode) ->
     opts(Seed, #{keys => mixed, mode => Mode}).
+
+%% The options for a run with mixed keys, ClusterControllers and faults.
+mixed_controller(Seed) ->
+    (opts(Seed, #{keys => mixed, controller => true, last_op => 80}))#{settle_steps => 20000}.
+
+%% The options for a run with mixed keys, the pop and kills of
+%% StorageServers.
+mixed_pop(Seed) ->
+    (opts(Seed, #{keys => mixed, faults => storage, controller => true, pop => true, last_op => 80}))#{net => true, settle_steps => 20000}.
+
+%% The options for a run with mixed keys, a peace cluster and faults.
+mixed_peace(Seed) ->
+    peace(opts(Seed, #{keys => mixed})).
+
+%% Mixed keys in runs with ClusterControllers and faults. 40 seeds.
+mixed_controller_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 40), fun mixed_controller/1),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("mixed controller faults: ~p", [Stats]),
+        ok = write_stats({mixed_controller_faults, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 80, Stats),
+        ?assert(maps:get(kills_worker, Stats, 0) > 40, Stats),
+        ?assert(maps:get(leaders, Stats, 0) > 40, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 20, Stats),
+        ?assert(maps:get(integer_key_writes, Stats, 0) > 20, Stats),
+        ?assert(maps:get(float_key_writes, Stats, 0) > 20, Stats),
+        ?assert(maps:get(other_form_rows, Stats, 0) > 20, Stats)
+    end}.
+
+%% Mixed keys in runs with the pop and kills of StorageServers. 30 seeds.
+mixed_pop_storage_kills_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 30), fun mixed_pop/1),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("mixed pop storage kills: ~p", [Stats]),
+        ok = write_stats({mixed_pop_storage_kills, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 400, Stats),
+        ?assert(maps:get(popped_logs, Stats, 0) > 100, Stats),
+        ?assert(maps:get(kills_storage, Stats, 0) > 40, Stats),
+        %% A StorageServer copied rows with mixed keys from a peer.
+        ?assert(maps:get(storage_copies, Stats, 0) > 30, Stats),
+        ?assert(maps:get(storage_popped, Stats, 0) > 3, Stats),
+        ?assert(maps:get(integer_key_writes, Stats, 0) > 100, Stats),
+        ?assert(maps:get(float_key_writes, Stats, 0) > 100, Stats),
+        ?assert(maps:get(other_form_rows, Stats, 0) > 100, Stats)
+    end}.
+
+%% Mixed keys in runs with a peace cluster and faults. 30 seeds.
+mixed_peace_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        sweep(lists:seq(1, 30), fun mixed_peace/1),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("mixed peace faults: ~p", [Stats]),
+        ok = write_stats({mixed_peace_faults, 1}, Stats),
+        ?assert(maps:get(acks, Stats, 0) > 70, Stats),
+        ?assert(maps:get(kills_coordinator, Stats, 0) > 10, Stats),
+        ?assert(maps:get(integer_key_writes, Stats, 0) > 15, Stats),
+        ?assert(maps:get(float_key_writes, Stats, 0) > 15, Stats),
+        ?assert(maps:get(other_form_rows, Stats, 0) > 20, Stats)
+    end}.
 
 %% The same seed gives the same trace, the trace replays, and the audit
 %% of eta reports nothing, for the two kinds of runs with mixed keys. 6

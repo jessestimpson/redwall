@@ -232,6 +232,9 @@ operations of the 52 earlier tests are unchanged:
 |---|---|---|
 | Mixed keys, no faults | 40 seeds in 1 test | No violation. 1,513 acknowledged transactions. 655 transactions read the number key in the form `1` and 672 in the form `1.0`. 397 and 383 acknowledged transactions set the two forms. 309 rows of a range read had a key in another form than the form of the client |
 | Mixed keys, faults | 70 seeds in 1 test | No violation. 392 acknowledged transactions, 28 kills of a StorageServer, 118 rollbacks of a StorageServer |
+| Mixed keys, ClusterControllers, faults (added on 2026-11-26) | 40 seeds in 1 test | No violation. 154 acknowledged transactions, 87 kills of a worker node, 59 elected leaders |
+| Mixed keys, the pop, kills of StorageServers (added on 2026-11-26) | 30 seeds in 1 test | No violation. 763 acknowledged transactions, 83 kills of a StorageServer, 68 copies from another StorageServer, 279 pops of a LogServer |
+| Mixed keys, a peace cluster, faults (added on 2026-11-26) | 30 seeds in 1 test | No violation. 145 acknowledged transactions, 26 kills of a coordinator |
 | Watches with clears, no faults, no time limit of a watch | 50 seeds in 1 test | No violation, and `watch_fires` holds at the end of each run. 883 committed watches. 265, 219 and 178 ready futures of the clients that set, read and cleared the key. The value of a key changed back 58 times |
 | Watches with clears, faults | 70 seeds in 1 test | No violation. 555 committed watches. 93, 85 and 76 ready futures of the three kinds of clients. The value of a key changed back 43 times. 2,632 answers `timed_out` of a StorageServer |
 | Late watches, ClusterControllers, faults | 50 seeds in 1 test | No violation. 200 late watches and 100 late changes, each change above the version of its watches. 200 late watches became ready. 131 kills of a worker node |
@@ -384,7 +387,8 @@ One operation of the model is one transaction. The state is the value of
 each of the 4 keys. A transaction of the client `C` sets a key to the
 value `{client, C}`, so each value is written at most once.
 
-Results of 2026-11-26, 14 tests in 2 min 36 s:
+Results of 2026-11-26. 17 tests pass in 6 min 26 s at the same time as
+`make dst`. 14 of them passed in 2 min 36 s alone.
 
 | Runs | Seeds | Operations | Verdict |
 |---|---|---|---|
@@ -393,6 +397,9 @@ Results of 2026-11-26, 14 tests in 2 min 36 s:
 | ClusterControllers and faults | 40 | 966 | ok |
 | The pop and kills of StorageServers | 30 | 1,769 | ok |
 | Mixed keys and faults | 40 | 1,197 | ok |
+| A peace cluster and faults | 40 | 967 | ok |
+| Watches and faults | 40 | 740 | ok |
+| Mixed keys, the pop and kills of StorageServers | 30 | 1,765 | ok |
 
 | Planted defect | First seed that Porcupine rejects | Invariants of the simulation at that seed |
 |---|---|---|
@@ -417,7 +424,7 @@ Limitations of this check:
   why this loses nothing. With every such transaction in the model, the
   check of one history with 23 of them did not end in 17 minutes of
   processor time.
-- No history of a run with a peace cluster or with watches was checked.
+- The transactions of the watches are in no history.
 
 `make dst` runs each test in an Erlang node of its own, with several
 nodes at the same time ([dst/run.sh](../dst/run.sh)). The runs without faults

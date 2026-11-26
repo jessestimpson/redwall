@@ -68,6 +68,34 @@ values_are_idempotent_test() ->
     {S2, ok} = apply_all([{lock, 0, a}, {write, 1, a, logs(1), undefined}, {lock, 1, b}, {write, 2, b, logs(2), 7}]),
     ?assertEqual({S2, ok}, redwall_cstate:apply(?META, {write, 2, b, logs(2), 7}, S2)).
 
+%% The second application of every value, in a state with a log system, a
+%% ClusterController and a StorageServer. The values `lock', `write',
+%% `elect', `storage' and `forget_storage' give the same reply and do not
+%% change the state. The value `reset' gives the same reply and raises the
+%% generation again, and changes nothing else.
+second_application_test() ->
+    Controller = self(),
+    Values = [
+        {lock, 0, a},
+        {write, 1, a, logs(1), undefined},
+        {elect, 0, Controller},
+        {storage, node(), Controller},
+        {lock, 1, b},
+        {write, 2, b, logs(2), 7}
+    ],
+    lists:foldl(
+        fun(Value, State0) ->
+            {State, Reply} = redwall_cstate:apply(?META, Value, State0),
+            ?assertEqual({State, Reply}, redwall_cstate:apply(?META, Value, State), Value),
+            State
+        end,
+        redwall_cstate:init([]),
+        Values ++ [{forget_storage, node()}]
+    ),
+    {S, ok} = apply_all(Values),
+    {S1 = #{generation := 1, current := undefined, old := []}, ok} = redwall_cstate:apply(?META, {reset, 2, b}, S),
+    ?assertEqual({S1#{generation := 2}, ok}, redwall_cstate:apply(?META, {reset, 2, b}, S1)).
+
 %% A write must carry its own epoch, and the end version of a previous epoch
 %% if there is one.
 bad_writes_test() ->

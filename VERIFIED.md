@@ -168,8 +168,8 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `X2` | `read_version_order`. A read version is at or above the commit version of every transaction that was acknowledged before the client asked for it, in any epoch. | `SIM` | Every run. |
 | `X3` | `read_value`. A read of a key at a read version returns the write of the acknowledged transaction with the highest commit version at or below the read version, or a later write at or below the read version whose client received no answer. | `SIM` | Every run. |
 | `X4` | `own_writes`. Before the commit, the reads of a transaction return its sets and its clears. After a failed commit, `on_error/2` leaves a transaction without a read version and without a mutation. | `SIM` | Every run. |
-| `X5` | `X1` to `X4`, `G1`, `G2`, `C1` and the options `reverse` and `limit` of `C2` hold with keys of 4 types: a number, an atom, a tuple and a binary. They hold when two clients use two forms of one key that are equal and not identical: `1` and `1.0`, and `{k, 3}` and `{k, 3.0}`. | `SIM` | 110 runs with mixed keys: 40 without faults and 70 with faults. These runs have no mapped range read, no `redwall:get_key/2` and no watch. No run has mixed keys with ClusterControllers, the pop or a peace cluster. No key is a list or a map. |
-| `X6` | The client history of a run is strictly serializable: the transactions have an order in which each transaction reads the values of the transactions before it, and a transaction that ended before another one started is before it. The check uses only what the clients observed, and not the commit versions. | `PORC` | 250 runs in 5 tests of [dst/redwall_dst_porcupine_tests.erl](dst/redwall_dst_porcupine_tests.erl), with 9,366 operations: 40 seeds without faults, 100 with faults, 40 with ClusterControllers and faults, 30 with the pop and kills of StorageServers, and 40 with mixed keys and faults. The history has the transactions on the 4 keys of the workload. A transaction without a known result is in the order only if a client read its value or if it cleared a key. |
+| `X5` | `X1` to `X4`, `G1`, `G2`, `C1` and the options `reverse` and `limit` of `C2` hold with keys of 4 types: a number, an atom, a tuple and a binary. They hold when two clients use two forms of one key that are equal and not identical: `1` and `1.0`, and `{k, 3}` and `{k, 3.0}`. | `SIM` | 210 runs with mixed keys: 40 without faults, 70 with faults, 40 with ClusterControllers and faults, 30 with the pop and kills of StorageServers, and 30 with a peace cluster and faults. These runs have no mapped range read, no `redwall:get_key/2` and no watch. No key is a list or a map. |
+| `X6` | The client history of a run is strictly serializable: the transactions have an order in which each transaction reads the values of the transactions before it, and a transaction that ended before another one started is before it. The check uses only what the clients observed, and not the commit versions. | `PORC` | 360 runs in 8 tests of [dst/redwall_dst_porcupine_tests.erl](dst/redwall_dst_porcupine_tests.erl), with 12,838 operations: 40 seeds without faults, 100 with faults, 40 with ClusterControllers and faults, 30 with the pop and kills of StorageServers, 40 with mixed keys and faults, 40 with a peace cluster and faults, 40 with watches and faults, and 30 with mixed keys and the pop. The history has the transactions on the 4 keys of the workload. A transaction without a known result is in the order only if a client read its value or if it cleared a key. |
 
 ### StorageServers: the code
 
@@ -229,11 +229,12 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `U2` | One LogServer keeps the order of the LSNs, the Known Committed Version, repeated records and the lock. | `UNIT` | |
 | `U3` | The Proxy handles commits in sequence, 50 commits at the same time, a recovery after commits, a LogServer down and the Sequencer down. | `UNIT` | |
 | `U4` | `redwall_status:status/1` reports the epoch, the ClusterController, the storage engine, the counts of coordinators, LogServers, workers and StorageServers, and these problems: no coordinated state, a coordinator down, no epoch, no ClusterController, too few workers, a StorageServer down and a LogServer down. With 2 nodes, the fault tolerance in nodes follows from the replication degree, the StorageServers and `min_workers`. | `UNIT` | Two tests in `test/redwall_status_tests.erl`: one Erlang node, and two Erlang nodes on one computer. No test has the problems `epoch_not_recruited`, `storage_copying` or `storage_behind`, and no test has more than 2 nodes. The test `engine` of `test/redwall_storage_tests.erl` has the problem `storage_engines_differ`. |
+| `U5` | The second application of a value of the coordinated state gives the same reply. It does not change the state for the values `lock`, `write`, `elect`, `storage` and `forget_storage`. For the value `reset`, it raises the generation again and changes nothing else. | `UNIT` | `values_are_idempotent_test`, `elect_is_compare_and_set_test` and `second_application_test` in `test/redwall_cstate_tests.erl`, on the function `redwall_cstate:apply/3`. |
 
 ## Simulation runs
 
 The entries with the method `SIM` and the bound "every run" refer to the
-36 tests of [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) without
+39 tests of [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) without
 a planted defect.
 
 | Runs | Seeds |
@@ -246,6 +247,7 @@ a planted defect.
 | Watches with clears: no faults, and faults | 50 and 70 |
 | Late watches with ClusterControllers and faults: without the pop, and with the pop | 50 and 50 |
 | Mixed keys: no faults, and faults | 40 and 70 |
+| Mixed keys: ClusterControllers with faults, the pop with kills of StorageServers, and a peace cluster with faults | 40, 30 and 30 |
 | A peace cluster: no faults, faults, and ClusterControllers | 50, 200 and 200 |
 | Determinism | 94 |
 
@@ -280,8 +282,7 @@ Entries without a planted defect that is specific to them:
 
 ## Not verified
 
-- **Strict serializability outside the bounds of `X6`.** No history of a
-  run with a peace cluster or with watches was checked, and the
+- **Strict serializability outside the bounds of `X6`.** The
   transactions of the watches are in no history. Porcupine rejected no
   history with the planted defect `no_rollback` in 300 seeds, and none
   with `no_copy` or `ack_replicas` in 120 seeds. The invariants of the
@@ -312,9 +313,10 @@ Entries without a planted defect that is specific to them:
   no check covers an engine that keeps data after a stop.
 - **The replacement of a coordinator whose data is lost, and a change of
   the coordinators.** redwall has no function for them.
-- **A value of the coordinated state that is applied twice.** The module
-  documentation of `redwall_cstate` states that the second application
-  does not change the state. No check plants it.
+- **A value of the coordinated state that is applied twice, in the
+  simulation or on a peace cluster.** `U5` covers the function
+  `redwall_cstate:apply/3`. No simulation run and no test with a peace
+  cluster proposes a value twice on purpose.
 - **`redwall:transactional/2` in the simulation.** Unit tests cover it.
 - **The errors of a mapper in the simulation.** Unit tests cover them.
 - **A watch that becomes ready while faults occur.** `H3` and `H5` have
@@ -326,8 +328,8 @@ Entries without a planted defect that is specific to them:
   The harness can accept such a record for an ended epoch with an end
   version of 0, when the recovery lost its write of the coordinated
   state. No run was constructed for this case.
-- **Mixed keys with ClusterControllers, the pop, a peace cluster or
-  watches, and keys that are lists or maps.** See `X5`.
+- **Mixed keys with watches, and keys that are lists or maps.** See
+  `X5`.
 - **The original form of the Resolver defect with equal keys.** The
   defect of commit `7b1ee91` stopped the process of an epoch. The planted
   defect `no_equal_keys` misses a conflict and does not stop the process.
@@ -361,7 +363,7 @@ Entries without a planted defect that is specific to them:
   ordered set of bounds of the code with one version for each key.
 - In the simulation, a read that returns no value is accepted when a
   transaction without a known result cleared the key at any version.
-- 57 of the 66 simulation tests replace the peace cluster with one
+- 59 of the 69 simulation tests replace the peace cluster with one
   process.
 - In the runs with a peace cluster, a recovery waits until the first read
   of the cluster has succeeded. This wait is in the harness.
@@ -372,7 +374,7 @@ Entries without a planted defect that is specific to them:
 |---|---|---|---|---|
 | `UNIT` | `make test` | 40 seconds | Yes, on each push | |
 | `SIM` | `make dst` | about 6 minutes | Yes, on each push | |
-| `PORC` | `make porcupine`. The command needs Go. | about 3 minutes | No | 2026-11-26: 14 tests passed in 2 min 36 s. |
+| `PORC` | `make porcupine`. The command needs Go. | 3 to 7 minutes | No | 2026-11-26: 17 tests passed in 6 min 26 s, at the same time as `make dst`. 14 of them passed in 2 min 36 s alone on the same day. |
 | `TLC`, quick configs | `make tlc` | about 6 minutes | Yes, on each change in `formal/` | 2026-11-22 for Recovery and Resolver, 2026-11-24 for Watch |
 | `TLC`, Recovery with 3 epochs | `make tlc-long` | about 4 hours | On a manual start | Commit `1b56582` of 2026-11-22. `Recovery.tla` has changed only in comments since that commit. |
 

@@ -426,8 +426,10 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
       specific to `batch_depth` above 1: the simulation finds it at the
       same seed with a `batch_depth` of 1, because a Proxy also closes a
       batch at the end of the time of the batch.
+- [x] Run mixed keys with ClusterControllers, with the pop and with a
+      peace cluster in the simulation: 100 seeds in 3 tests.
 - [x] Check the client histories of simulation runs for strict
-      serializability with Porcupine, an external checker: 250 runs, and
+      serializability with Porcupine, an external checker: 360 runs, and
       9 planted defects that Porcupine rejects.
 - [x] Make the statistics of two runs of the suite equal. Two runs
       differed by 1 in a few counters. The harness kills the temporary

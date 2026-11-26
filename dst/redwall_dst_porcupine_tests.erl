@@ -99,6 +99,26 @@ pop_storage_kills_test_() ->
 mixed_faults_test_() ->
     {timeout, ?TIMEOUT, fun() -> exercised(sweep("mixed-faults", lists:seq(1, 40), fun(Seed) -> opts(Seed, #{keys => mixed}) end)) end}.
 
+%% A peace cluster holds the coordinated state, with faults and kills of
+%% coordinators.
+peace_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        exercised(sweep("peace-faults", lists:seq(1, 40), fun(Seed) -> redwall_dst_tests:peace(opts(Seed, #{})) end))
+    end}.
+
+%% The workload has watches, with faults. The history has the
+%% transactions on the 4 keys of the workload, and not the transactions
+%% of the watches.
+watch_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        exercised(sweep("watch-faults", lists:seq(1, 40), fun(Seed) -> opts(Seed, #{watches => true}) end))
+    end}.
+
+%% Mixed keys with the pop and kills of StorageServers. A StorageServer
+%% copies rows with mixed keys from a peer.
+mixed_pop_test_() ->
+    {timeout, ?TIMEOUT, fun() -> exercised(sweep("mixed-pop", lists:seq(1, 30), fun redwall_dst_tests:mixed_pop/1)) end}.
+
 %% The following tests show that Porcupine can reject a history. Each test
 %% plants a defect and searches for a seed whose history Porcupine rejects.
 

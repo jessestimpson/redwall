@@ -165,9 +165,9 @@ Each module also has its design in its module documentation.
 
 | Level | What it checks | Command | Time |
 |---|---|---|---|
-| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 134 tests | `make test` | 40 seconds |
-| Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 66 tests with about 2,250 seeds and 27 planted defects | `make dst` | about 6 minutes |
-| Strict serializability | The client histories of 250 simulation runs, with [Porcupine](https://github.com/anishathalye/porcupine), a checker that shares no code with redwall. 14 tests with 9 planted defects | `make porcupine` | about 3 minutes |
+| Unit tests | Each module, and clusters on one node and on two Erlang nodes. 135 tests | `make test` | 40 seconds |
+| Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 69 tests with about 2,350 seeds and 27 planted defects | `make dst` | about 6 minutes |
+| Strict serializability | The client histories of 360 simulation runs, with [Porcupine](https://github.com/anishathalye/porcupine), a checker that shares no code with redwall. 17 tests with 9 planted defects | `make porcupine` | 3 to 7 minutes |
 | Model checking | Three TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer; the Resolver; and the watch. 13 planted bugs | `make tlc` | about 6 minutes |
 | Model checking | The recovery with 3 epochs | `make tlc-long` | about 4 hours |
 
