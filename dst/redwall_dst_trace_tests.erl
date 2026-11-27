@@ -113,6 +113,12 @@ no_push_order_is_rejected_test_() ->
 no_confirm_is_rejected_test_() ->
     {timeout, ?TIMEOUT, fun() -> rejected("no-confirm", no_confirm, "\"ReadDone\"") end}.
 
+%% A recovery copies no record to the new LogServers. The model copies
+%% the records between the previous epoch's end version and the Recovery
+%% Version.
+no_copy_is_rejected_test_() ->
+    {timeout, ?TIMEOUT, fun() -> rejected("no-copy", no_copy, "\"data\"") end}.
+
 %% A StorageServer keeps the writes above the end version of an epoch. The
 %% StorageServer of the model removes them.
 no_rollback_is_rejected_test_() ->

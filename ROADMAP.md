@@ -418,9 +418,10 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
 - [x] Extend trace validation to the requests for a read version and to
       the StorageServer of `Recovery.tla`. 2 more planted defects that
       TLC rejects: `no_confirm` and `no_rollback`.
-- [ ] Extend trace validation to the bodies of the records that a
-      recovery copies, to the LogServer that answers a confirmation, and
-      to a StorageServer after a copy from a peer.
+- [x] Compare, in trace validation, the records that a recovery copies
+      to the new LogServers. TLC rejects the planted defect `no_copy`.
+- [ ] Extend trace validation to the LogServer that answers a
+      confirmation, and to a StorageServer after a copy from a peer.
 - [x] Use keys of several types in the simulation, also keys that are
       equal and not identical. The keys of the simulation are packed
       tuples, and the simulation did not find the defect of such keys in

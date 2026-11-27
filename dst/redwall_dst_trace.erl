@@ -107,8 +107,9 @@
 %%   Version and the previous epoch's end version of the code. The trace
 %%   does not show which answers the Sequencer had received.</li>
 %% <li>The model copies each kept record to every new LogServer. The
-%%   bodies of the copied records on the new LogServers are not
-%%   compared.</li>
+%%   trace compares, for each new LogServer, which of these records the
+%%   LogServer has with a body. It does not compare the content of a
+%%   body.</li>
 %% <li>The position of an `Ack' among the `Assign' actions of one step is
 %%   chosen from the Known Committed Version that the LogServers have
 %%   after the records. See `step_epoch/4'.</li>
@@ -341,6 +342,12 @@ actions(States) ->
                 skipped => #{},
                 ss => #{},
                 cur => 1,
+                %% For each epoch that has written the coordinated state:
+                %% the epoch that it ended, with the previous epoch's end
+                %% version and the Recovery Version. The new LogServers
+                %% whose copied records the trace has compared.
+                ended => #{},
+                copies => #{},
                 %% The confirmations that the process of an epoch started
                 %% in the change that `step_epoch/4' handles.
                 pending => none,
@@ -451,7 +458,7 @@ write_cstate(N, #{ends := Ends}, S0 = #{locked := Locked, m := M, rv := RVs, pev
                     S2 = add(#{act => "Recruit", e => E, chk => Recruit}, S1),
                     S3 = add(#{act => "WriteCState", e => E, chk => [{"csCur", [], E}, {"csEnd", [me(Old, S0)], maps:get(RV, M)}]}, S2),
                     Stopped = maps:get(stopped, S3),
-                    S3#{rv := RVs#{N => RV}, stopped := maps:merge(Stopped, #{{Old, L} => true || L <- Replied})}
+                    S3#{rv := RVs#{N => RV}, stopped := maps:merge(Stopped, #{{Old, L} => true || L <- Replied}), ended := (maps:get(ended, S3))#{N => {Old, PEV, RV}}}
             end;
         _ ->
             add(#{act => "Invalid", what => "end of the previous epoch"}, S0)
@@ -689,7 +696,7 @@ step_log(Id = {Epoch, L}, Prev0, #{dv := DV, kcv := KCV, stopped_by := Stopped, 
             #{m := M} = S1,
             S2 =
                 case M of
-                    #{DV := MD, KCV := MK} -> check([{"dv", [me(Epoch, S1), L], MD}, {"kcv", [me(Epoch, S1), L], MK}], S1);
+                    #{DV := MD, KCV := MK} -> copied(Id, Records, check([{"dv", [me(Epoch, S1), L], MD}, {"kcv", [me(Epoch, S1), L], MK}], S1));
                     _ -> add(#{act => "Invalid", what => "a LogServer has an unknown LSN"}, S1)
                 end,
             %% A Sequencer has stopped the LogServer. The `LockLog' action
@@ -701,6 +708,28 @@ step_log(Id = {Epoch, L}, Prev0, #{dv := DV, kcv := KCV, stopped_by := Stopped, 
         _ ->
             add(#{act => "Invalid", what => "a LogServer of an epoch that has not written the coordinated state"}, S0)
     end.
+
+%% The records that the recovery copied to a new LogServer. The model
+%% copies each record of the previous epoch above the previous epoch's
+%% end version, up to the Recovery Version, whose body a LogServer that
+%% answered the recovery has. The new LogServer of the code must have the
+%% body of the same records. The check is made once for each LogServer,
+%% when the trace has the first state of the LogServer after the write of
+%% the coordinated state.
+copied(Id, _Records, S = #{copies := Copies}) when is_map_key(Id, Copies) ->
+    S;
+copied(Id = {Epoch, L}, Records, S = #{copies := Copies, ended := Ended, recs := Recs, m := M}) ->
+    Checks =
+        case Ended of
+            #{Epoch := {Old, PEV, RV}} when is_integer(PEV) ->
+                [
+                    {"data", [me(Epoch, S), L, maps:get(LSN, M)], case Records of #{LSN := {_Prev, Body}} -> Body; _ -> false end}
+                 || LSN <- lists:sort(maps:keys(maps:get(Old, Recs, #{}))), LSN > PEV, LSN =< RV, is_map_key(LSN, M)
+                ];
+            _ ->
+                []
+        end,
+    check(Checks, S#{copies := Copies#{Id => true}}).
 
 persist(Epoch, L, RV, {LSN, Prev, Body}, S0 = #{m := M0, first := Firsts, gap := Gap}) ->
     E = me(Epoch, S0),

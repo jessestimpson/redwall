@@ -156,7 +156,7 @@ other steps of the trace are a behaviour of `Recovery.tla`.
 `AllStorageSafe` and `AllStorageComplete` are `StorageSafe` and
 `StorageComplete` for each StorageServer.
 
-TLC takes 0.3 to 2 seconds for one run. `make trace` also runs 6 planted
+TLC takes 0.3 to 2 seconds for one run. `make trace` also runs 7 planted
 defects, which TLC must reject:
 
 | Planted defect | First seed that TLC rejects | Rejected action |
@@ -165,6 +165,7 @@ defects, which TLC must reject:
 | `no_cas` | 1 | A write of the coordinated state by an epoch that is not the recovery count |
 | `no_report` | 1 | `Ack`: the read version of the code is not the read version of the model |
 | `no_push_order` | 48 | `Persist`: the previous LSN is not the Durable Version of the LogServer |
+| `no_copy` | 1 | The first `Persist` of a new LogServer: the LogServer does not have a record that the model copied |
 | `no_confirm` | 1 | `ReadDone`: fewer than `Confirms` LogServers have confirmed the epoch |
 | `no_rollback` | 3 | `SSApply`: the store has a write whose record the StorageServer of the model has removed |
 
@@ -194,10 +195,9 @@ Limitations:
 - A `LockLog` action is placed directly before `Recruit`, for a set of
   stopped LogServers whose versions give the Recovery Version and the
   previous epoch's end version of the code.
-- The model copies each kept record to every new LogServer. The bodies of
-  the copied records are not compared. TLC accepted the traces of 6 seeds
-  with the planted defect `no_copy`, in a run before the read versions
-  and the StorageServer were in the trace.
+- The model copies each kept record to every new LogServer. The trace
+  compares, for each new LogServer, which of these records the LogServer
+  has with a body. It does not compare the content of a body.
 - The process of an epoch can assign an LSN and stop before the harness
   reads its state. The record of a LogServer then gives the `Assign`
   action.

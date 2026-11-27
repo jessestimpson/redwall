@@ -165,7 +165,7 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 
 | Id | Property | Method | Bound |
 |---|---|---|---|
-| `V1` | A simulated run is a behaviour of `Recovery.tla` for these actions: `LockCState`, `LockLog`, `Recruit`, `WriteCState`, `RecoveryTxn`, `Accept`, `Assign`, `Persist` and `Ack`. After each change, the model has the recovery count, the current epoch and the end versions of the coordinated state, the Durable Version and the Known Committed Version of the LogServer, and the last LSN, the read version and the Known Committed Version of the process of the epoch. | `TRACE` | 220 runs in 4 tests of [dst/redwall_dst_trace_tests.erl](dst/redwall_dst_trace_tests.erl), with 85,639 actions of the model: 40 seeds without faults, 100 with faults, 40 with ClusterControllers and faults, and 40 with a peace cluster and faults. Each action of `V1`, `V2` and `V3` occurs at least 230 times in each test. The trace spec has `LimitInFlight = FALSE`. An LSN of the code has a number of the model that keeps the order of the LSNs. |
+| `V1` | A simulated run is a behaviour of `Recovery.tla` for these actions: `LockCState`, `LockLog`, `Recruit`, `WriteCState`, `RecoveryTxn`, `Accept`, `Assign`, `Persist` and `Ack`. After each change, the model has the recovery count, the current epoch and the end versions of the coordinated state, the Durable Version and the Known Committed Version of the LogServer, and the last LSN, the read version and the Known Committed Version of the process of the epoch. Each new LogServer has, with a body, the records that the model copies from the previous epoch: the records above the previous epoch's end version, up to the Recovery Version. | `TRACE` | 220 runs in 4 tests of [dst/redwall_dst_trace_tests.erl](dst/redwall_dst_trace_tests.erl), with 85,639 actions of the model: 40 seeds without faults, 100 with faults, 40 with ClusterControllers and faults, and 40 with a peace cluster and faults. Each action of `V1`, `V2` and `V3` occurs at least 230 times in each test. The trace spec has `LimitInFlight = FALSE`. An LSN of the code has a number of the model that keeps the order of the LSNs. |
 | `V2` | In the same runs, the confirmations of the process of an epoch are a behaviour of `Recovery.tla` for the actions `ReadStart`, `ReadConfirm`, `ReadSeq` and `ReadDone`, with `Confirms = 2`. One confirmation is one request of the model. The model has the read version that the process takes for the confirmation and the read version of its answer. `ReadVersionOrder` holds: the read version is at or above every LSN that the trace acknowledged, in any epoch, before the start of the confirmation. | `TRACE` | The runs of `V1`: 8,416 confirmations, of which 7,436 have an answer. A `ReadConfirm` action is placed at the start of the confirmation, for a LogServer that no `LockLog` action had stopped. The process counts the answers and does not keep the names of the LogServers. |
 | `V3` | In the same runs, each StorageServer that the trace follows is a behaviour of the StorageServer of `Recovery.tla` for the actions `SSApply` and `SSFollow`. After each change, the model has the epoch and the version of the StorageServer, and the StorageServer of the model has applied, and has not removed, the record of each write of the store between the version before and the version after. `StorageSafe` and `StorageComplete` hold for each StorageServer. | `TRACE` | The runs of `V1`: 521 StorageServers from their start, 9,692 `SSApply` actions and 2,839 `SSFollow` actions. The trace does not follow a StorageServer after a copy from a peer: 50 StorageServers. The keys and values of a write are not compared. |
 
@@ -278,7 +278,7 @@ Every run has:
 | `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. `watch_no_trigger` and `watch_no_verify` are also found in the runs with clears, and `watch_no_trigger` in the runs of `H6`. | 27 |
 | `SIM` | Defects that were planted in the source on 2026-11-23 and are not in the repository | 6 |
 | `PORC` | Planted defects of the simulation whose history Porcupine rejects: `no_check`, `no_range_check`, `no_batch_check`, `no_write_range`, `no_equal_keys`, `no_confirm`, `no_report`, `no_clear` and `no_copy_rows`. For each one, Porcupine accepts the history of the same seed without the defect. Porcupine rejects `no_copy_rows` at seed 10, where no invariant of the simulation is violated. | 9 |
-| `TRACE` | Planted defects of the simulation whose trace TLC rejects: `ack_replicas`, `no_cas`, `no_report`, `no_push_order`, `no_confirm` and `no_rollback`. For each one, TLC accepts the trace of the same seed without the defect. TLC rejects `ack_replicas` and `no_confirm` at seed 1, where no invariant of the simulation is violated. | 6 |
+| `TRACE` | Planted defects of the simulation whose trace TLC rejects: `ack_replicas`, `no_cas`, `no_report`, `no_push_order`, `no_copy`, `no_confirm` and `no_rollback`. For each one, TLC accepts the trace of the same seed without the defect. TLC rejects `ack_replicas` and `no_confirm` at seed 1, where no invariant of the simulation is violated. | 7 |
 
 Entries without a planted defect that is specific to them:
 
@@ -301,10 +301,9 @@ Entries without a planted defect that is specific to them:
 - **The code against the models, outside the bounds of `V1`, `V2` and
   `V3`.** Trace validation covers `Recovery.tla`. It does not cover
   `Resolver.tla` or `Watch.tla`. Within `Recovery.tla`:
-  - It does not compare the bodies of the records that a recovery copies
-    to the new LogServers. TLC accepted the traces of 6 seeds with the
-    planted defect `no_copy`, in a run of the trace spec before `V2` and
-    `V3`.
+  - It does not compare the content of the body of a record, on the
+    LogServers of its epoch or on the new LogServers after a recovery.
+    It compares which LogServers have a body.
   - It does not validate the values of the LSNs or the limit on the
     versions in flight.
   - A `LockLog` action is placed at the write of the Sequencer, and not
@@ -400,8 +399,8 @@ Entries without a planted defect that is specific to them:
 |---|---|---|---|---|
 | `UNIT` | `make test` | 40 seconds | Yes, on each push | |
 | `SIM` | `make dst` | about 6 minutes | Yes, on each push | |
-| `TRACE` | `make trace`. The command needs Java. | 5 to 8 minutes | No | 2026-11-26: 10 tests passed, as 3 commands at the same time: 4 sweeps in 225 s and 107 s, and 6 planted defects in 84 s. |
-| `PORC` | `make porcupine`. The command needs Go. | 3 to 7 minutes | No | 2026-11-26: 17 tests passed in 6 min 26 s, at the same time as `make dst`. 14 of them passed in 2 min 36 s alone on the same day. |
+| `TRACE` | `make trace`. The command needs Java. | 6 minutes | No | 2026-11-26: 11 tests passed in 5 min 57 s. |
+| `PORC` | `make porcupine`. The command needs Go. | 3 to 7 minutes | No | 2026-11-26: 17 tests passed in 6 min 26 s, at the same time as `make dst`. 14 of them passed in 2 min 36 s alone on the same day. 17 tests passed in 3 min 35 s after the change of the published state of `redwall_epoch` and `redwall_storage`. |
 | `TLC`, quick configs | `make tlc` | about 6 minutes | Yes, on each change in `formal/` | 2026-11-22 for Recovery and Resolver, 2026-11-24 for Watch |
 | `TLC`, Recovery with 3 epochs | `make tlc-long` | about 4 hours | On a manual start | Commit `1b56582` of 2026-11-22. `Recovery.tla` has changed only in comments since that commit. |
 
