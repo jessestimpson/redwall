@@ -583,6 +583,11 @@
 %% <li>`no_copy_rows' - a StorageServer that copies from another
 %%   StorageServer stores no row of the copy. It then has the version of
 %%   the copy without its data.</li>
+%% <li>`row_before_history' - the storage engine `ets' changes the row of
+%%   a key before it stores the older version of the key. A direct read
+%%   between the two writes does not find the older version. A run finds
+%%   the defect only with the option `preempt' of eta. See "Runs with
+%%   preemption points" in `redwall_dst_tests'.</li>
 %% <li>`watch_no_trigger' and `watch_no_verify' - see "Runs with
 %%   watches", "Runs with clears of the keys of the watches" and "Runs
 %%   with late watches".</li>
@@ -809,6 +814,7 @@ start_storage(Tab, CState, {Mode, Window}, {Slot, N}, Generation) ->
         clear => Mode =/= no_clear andalso not (Mode =:= one_no_clear andalso Slot =:= 2),
         wait => Mode =/= no_wait,
         copy_rows => Mode =/= no_copy_rows,
+        history_first => Mode =/= row_before_history,
         watch_trigger => Mode =/= watch_no_trigger,
         %% The time limit of a watch. See "Runs with watches" and "Runs
         %% with late watches".
@@ -2175,6 +2181,22 @@ changers(Key, After, UpTo, Txns) ->
 %% The coordinated state has the end version of each ended epoch. The
 %% first version of the next epoch is the end version plus the gap.
 storage_rollback(Tab, Storages, CState) ->
+    %% In a run with the option `preempt' of eta, a step can end between
+    %% two ETS calls of one callback of a StorageServer. The tables then
+    %% have a part of a record, of a rollback or of a rise of the oldest
+    %% version, and the published state is the state before the callback.
+    %% The checks compare the tables with the published state, so the
+    %% harness does not perform them while a StorageServer waits at a
+    %% preemption point. It performs them at a later check.
+    case lists:any(fun eta_sched:preempted/1, Storages) of
+        true ->
+            bump(storage_checks_skipped),
+            ok;
+        false ->
+            storage_rollback_now(Tab, Storages, CState)
+    end.
+
+storage_rollback_now(Tab, Storages, CState) ->
     %% The checks read every write of each StorageServer, so the harness
     %% performs them only when a StorageServer or the coordinated state
     %% has changed.
@@ -2190,6 +2212,7 @@ storage_rollback(Tab, Storages, CState) ->
                     [fun() -> replicas_agree(A, B, Old) end || {I, A} <- lists:enumerate(Observed), {J, B} <- lists:enumerate(Observed), I < J],
             case first_violation(Checks) of
                 ok ->
+                    bump(storage_checks),
                     true = ets:insert(Tab, {storage_checked, Key}),
                     ok;
                 Violation ->

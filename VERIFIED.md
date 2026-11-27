@@ -32,7 +32,7 @@ It follows the [verified_md](https://github.com/jessestimpson/verified_md) conve
 | Method | Check | What a pass shows | What a pass does not show |
 |---|---|---|---|
 | `TLC` | TLC visits every reachable state of a TLA+ model. For the temporal property `Fires`, TLC checks every behaviour under the fairness conditions of the model. | The property holds in the model, for the constants of the config. | Anything about other constants, or about the code. `TRACE` connects the code to `Recovery.tla` for the checked runs. |
-| `SIM` | The processes of redwall run under [eta](https://github.com/jessestimpson/eta) with a seeded scheduler, a virtual clock and a simulated network. The harness kills nodes, cuts connections, and loses and delays messages. The harness checks invariants after every step, and further statements at the end of a run. | The invariant held at every step of every run. | Anything about a schedule that no seed produced. |
+| `SIM` | The processes of redwall run under [eta](https://github.com/jessestimpson/eta) with a seeded scheduler, a virtual clock and a simulated network. The harness kills nodes, cuts connections, and loses and delays messages. The harness checks invariants after every step, and further statements at the end of a run. | The invariant held at every step of every run. | Anything about a schedule that no seed produced. A step of a run is the code of one process between two `receive` expressions. No run has a state between two calls of one step, except the runs of `G4`. |
 | `UNIT` | EUnit tests in [test/](test/). | The named case behaves as stated. | Anything about other cases. |
 | `PORC` | The clients of a simulated run record what they observe: the values that a transaction read, the keys that it set and cleared, and whether its commit returned. [Porcupine](https://github.com/anishathalye/porcupine), a checker that shares no code with redwall, searches for an order of the transactions that explains every read and that agrees with the order of the transactions in time. See [dst/porcupine/main.go](dst/porcupine/main.go). | The client history of each checked run is strictly serializable. | Anything about other runs. A read of a record that a recovery discards later is accepted, unless a later read shows that the value is gone. |
 | `TRACE` | Trace validation. The harness records the state of the coordinated state, of each LogServer, of the process of each epoch and of each StorageServer after every step of a simulated run. [dst/redwall_dst_trace.erl](dst/redwall_dst_trace.erl) derives the actions of [formal/Recovery.tla](formal/Recovery.tla) from the changes, without a statement of the code about its action. TLC checks that the actions, in their order, are a behaviour of the model, and that the model has the state of the code after each change. | Each checked run is a behaviour of the model for its 15 actions, and the invariants `Durable`, `NoLoss`, `UniqueVersions`, `KcvSound`, `ReadVersionOrder`, `StorageSafe` and `StorageComplete` hold in it. | Anything about other runs. The values of the LSNs, the limit on the versions in flight, the LogServer that answers a confirmation, and the keys and values of a StorageServer are not validated. |
@@ -93,6 +93,10 @@ Comparison of the use with the bounds of the entries relied on:
 - redwall has no function that replaces a coordinator or changes the
   coordinators. The entries of peace about membership change and member
   identity are not relied on.
+- peace states that its assumption about stored state does not hold for
+  a loss of power on macOS: Erlang/OTP 25 and later sync a file there
+  with a call that does not wait for the disk. The coordinated state of
+  redwall on a peace cluster has the same limit on macOS.
 - No check supports the statement that the entries relied on provide
   assumption `A1`. The 9 `SIM` tests with a peace cluster test redwall and
   peace together. See `P1` to `P3`.
@@ -187,6 +191,7 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `G1` | `storage_rollback`. When a StorageServer has a version of an epoch, it has no write between the end version of an earlier epoch and the first version of the epoch after that one. | `SIM` | Every run. |
 | `G2` | `replicas_agree`. Two StorageServers have the same writes for each key, for the versions that both have applied and that are above the oldest version of both. | `SIM` | Every run with 2 or 3 StorageServers. |
 | `G3` | `X1` to `X4` hold when a StorageServer is killed and a new StorageServer without data copies from a peer or reads the log. | `SIM` | The runs with faults and the runs with the pop. |
+| `G4` | `X1` to `X4` and `C1` to `C3` hold when a process can yield before each call of `ets` in `redwall_storage_ets` and before each call of `atomics` in `redwall_storage`. Another process then runs between two ETS calls of a StorageServer, and between two ETS calls of a client that reads the tables of a StorageServer. `G1` and `G2` hold at each check at which no StorageServer waits at such a call. | `SIM` | 160 runs with the option `preempt => 0.3` of eta: 80 with ClusterControllers and faults, and 80 with the pop and kills of StorageServers. 512,360 such calls, and a yield at 153,730 of them. 2,362 transactions with reads of the tables in the process of the client. The harness performed the checks of `G1` and `G2` 7,963 times and skipped them 73,305 times. |
 
 ### Reads of the client: the code
 
@@ -243,7 +248,7 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 ## Simulation runs
 
 The entries with the method `SIM` and the bound "every run" refer to the
-39 tests of [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) without
+42 tests of [dst/redwall_dst_tests.erl](dst/redwall_dst_tests.erl) without
 a planted defect.
 
 | Runs | Seeds |
@@ -258,7 +263,8 @@ a planted defect.
 | Mixed keys: no faults, and faults | 40 and 70 |
 | Mixed keys: ClusterControllers with faults, the pop with kills of StorageServers, and a peace cluster with faults | 40, 30 and 30 |
 | A peace cluster: no faults, faults, and ClusterControllers | 50, 200 and 200 |
-| Determinism | 94 |
+| Preemption points (`G4`): ClusterControllers with faults, and the pop with kills of StorageServers | 80 and 80 |
+| Determinism | 97 |
 
 Every run has:
 
@@ -275,7 +281,7 @@ Every run has:
 |---|---|---|
 | `TLC` | Configs with a planted bug. Each config produces a counterexample. | 13: 7 of Recovery, 3 of Resolver, 3 of Watch |
 | `TLC` | Reachability configs. Each config reaches a state that the properties depend on. | 16 |
-| `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. `watch_no_trigger` and `watch_no_verify` are also found in the runs with clears, and `watch_no_trigger` in the runs of `H6`. | 27 |
+| `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. `watch_no_trigger` and `watch_no_verify` are also found in the runs with clears, and `watch_no_trigger` in the runs of `H6`. `row_before_history` is found only in a run with preemption points: at seed 8 of the runs with the pop of `G4`, and in none of the 60 runs of seeds 1 to 60 without the option. | 28 |
 | `SIM` | Defects that were planted in the source on 2026-11-23 and are not in the repository | 6 |
 | `PORC` | Planted defects of the simulation whose history Porcupine rejects: `no_check`, `no_range_check`, `no_batch_check`, `no_write_range`, `no_equal_keys`, `no_confirm`, `no_report`, `no_clear` and `no_copy_rows`. For each one, Porcupine accepts the history of the same seed without the defect. Porcupine rejects `no_copy_rows` at seed 10, where no invariant of the simulation is violated. | 9 |
 | `TRACE` | Planted defects of the simulation whose trace TLC rejects: `ack_replicas`, `no_cas`, `no_report`, `no_push_order`, `no_copy`, `no_confirm` and `no_rollback`. For each one, TLC accepts the trace of the same seed without the defect. TLC rejects `ack_replicas` and `no_confirm` at seed 1, where no invariant of the simulation is violated. | 7 |
@@ -292,6 +298,30 @@ Entries without a planted defect that is specific to them:
 
 ## Not verified
 
+- **The rules of a direct read outside the bounds of `G4`.** "Direct
+  reads" in `redwall_storage` states the order of the writes of a
+  StorageServer and of the reads of a client. `G4` and the planted defect
+  `row_before_history` support one rule: a write adds the row of the
+  older version before it changes the row of the key. No check supports
+  these rules:
+  - The StorageServer writes the rows of a record before it publishes the
+    version. A defect that was planted in the source on 2026-11-27 and
+    is not in the repository published the version first. No invariant
+    failed in 520 runs with preemption points. A client asks the
+    StorageServer for its handle with a message in each transaction, and
+    the answer comes after the callback that applies a record.
+  - A read reads the row of a key again after the table of the older
+    versions. A defect that removed the second read was planted in the
+    same way. No invariant failed in 120 runs with preemption points.
+  - The StorageServer publishes a new oldest version before it removes
+    the versions below it, and a reset changes its count before the data
+    is removed. No defect was planted for these two.
+- **A yield at a call that is not a preemption point.** Only the calls of
+  `ets` in `redwall_storage_ets` and of `atomics` in `redwall_storage`
+  are preemption points. The tables of `redwall_log` and
+  `redwall_worker`, the table of a transaction, and the tables of the
+  watches have none. In every run, a step of a process with these tables
+  is atomic.
 - **Strict serializability outside the bounds of `X6`.** The
   transactions of the watches are in no history. Porcupine rejected no
   history with the planted defect `no_rollback` in 300 seeds, and none
@@ -388,8 +418,11 @@ Entries without a planted defect that is specific to them:
   ordered set of bounds of the code with one version for each key.
 - In the simulation, a read that returns no value is accepted when a
   transaction without a known result cleared the key at any version.
-- 59 of the 69 simulation tests replace the peace cluster with one
+- 63 of the 73 simulation tests replace the peace cluster with one
   process.
+- In the runs of `G4`, the harness does not check `G1` and `G2` while a
+  StorageServer waits at a preemption point. The tables then have a part
+  of a record, of a rollback or of a rise of the oldest version.
 - In the runs with a peace cluster, a recovery waits until the first read
   of the cluster has succeeded. This wait is in the harness.
 
@@ -399,8 +432,8 @@ Entries without a planted defect that is specific to them:
 |---|---|---|---|---|
 | `UNIT` | `make test` | 40 seconds | Yes, on each push | |
 | `SIM` | `make dst` | about 6 minutes | Yes, on each push | |
-| `TRACE` | `make trace`. The command needs Java. | 6 minutes | No | 2026-11-26: 11 tests passed in 5 min 57 s. |
-| `PORC` | `make porcupine`. The command needs Go. | 3 to 7 minutes | No | 2026-11-26: 17 tests passed in 6 min 26 s, at the same time as `make dst`. 14 of them passed in 2 min 36 s alone on the same day. 17 tests passed in 3 min 35 s after the change of the published state of `redwall_epoch` and `redwall_storage`. |
+| `TRACE` | `make trace`. The command needs Java. | 6 minutes | No | 2026-11-27: 11 tests passed in 6 min 1 s, with eta at the commit of the preemption points. |
+| `PORC` | `make porcupine`. The command needs Go. | 3 to 7 minutes | No | 2026-11-26: 17 tests passed in 6 min 26 s, at the same time as `make dst`. 14 of them passed in 2 min 36 s alone on the same day. 17 tests passed in 3 min 35 s after the change of the published state of `redwall_epoch` and `redwall_storage`. 2026-11-27: 17 tests passed in 3 min 37 s, with eta at the commit of the preemption points. |
 | `TLC`, quick configs | `make tlc` | about 6 minutes | Yes, on each change in `formal/` | 2026-11-22 for Recovery and Resolver, 2026-11-24 for Watch |
 | `TLC`, Recovery with 3 epochs | `make tlc-long` | about 4 hours | On a manual start | Commit `1b56582` of 2026-11-22. `Recovery.tla` has changed only in comments since that commit. |
 

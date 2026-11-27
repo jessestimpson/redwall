@@ -366,6 +366,9 @@
 %%
 %% == Direct reads ==
 %%
+%% The simulation checks these rules only in its runs with preemption
+%% points. See "Runs with preemption points" in `docs/verification.md'.
+%%
 %% A client can read the store of the storage engine in its own process,
 %% without a message to the StorageServer (`handle/1' and
 %% `read_direct/3'). The rules below are those of the engine `ets'. The
@@ -474,6 +477,11 @@
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
+%% In a simulation with the option `preempt', a process can yield before each
+%% call of `atomics' in this module: the calls that publish the versions of
+%% the StorageServer, and the calls of a direct read that read them. See
+%% `redwall_storage_ets' for the calls of `ets'.
+-eta_preempt([atomics]).
 -eta_observe({state, [version, oldest, engine, view, system, rollbacks, copies, resets, popped, watching, watches_fired, watches_timed_out]}).
 
 -export([start/1, start_link/1, stop/1]).
@@ -503,6 +511,9 @@
 %% has not applied. `copy_rows => false' plants a fifth defect: the
 %% StorageServer does not store the rows of a copy from another
 %% StorageServer, and has the version of the copy without its data.
+%% `history_first => false' plants a sixth defect, in the storage engine
+%% `ets': a write changes the row of a key before it stores the older
+%% version of the key. See `redwall_storage_ets'.
 -type options() :: #{
     coordinators := redwall_cstate:servers(),
     poll_ms => pos_integer(),
@@ -513,6 +524,7 @@
     clear => boolean(),
     wait => boolean(),
     copy_rows => boolean(),
+    history_first => boolean(),
     %% The time after which the StorageServer answers `timed_out' to a
     %% watch, and the highest number of watches. See "Watches" in the
     %% module documentation. `watch_trigger => false' plants a defect.

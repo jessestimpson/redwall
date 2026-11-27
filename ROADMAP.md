@@ -439,6 +439,16 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
 - [x] Check the client histories of simulation runs for strict
       serializability with Porcupine, an external checker: 360 runs, and
       9 planted defects that Porcupine rejects.
+- [x] Run the storage engine `ets` with preemption points of eta, so
+      that a direct read of a client runs between two ETS calls of a
+      StorageServer: 160 runs, and 1 planted defect that only these runs
+      find.
+- [ ] Find the two planted defects of the direct read that the runs with
+      preemption points do not find: the version that is published
+      before the rows, and the read without the second read of the row.
+      See "Runs with preemption points" in `docs/verification.md`.
+- [ ] Declare preemption points for the tables of `redwall_log` and
+      `redwall_worker` and for the table of a transaction.
 - [x] Make the statistics of two runs of the suite equal. Two runs
       differed by 1 in a few counters. The harness kills the temporary
       processes of a worker, of a ClusterController and of a

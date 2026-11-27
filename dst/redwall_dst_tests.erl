@@ -9,6 +9,7 @@
 -export([opts/2, calm/1, run/1, peace/1]).
 -export([mixed_controller/1, mixed_pop/1, mixed_peace/1]).
 -export([watch_clear_live/2, watch_clear_faults/2, watch_late/2, watch_late_pop/2]).
+-export([preempt_controller/2, preempt_pop/2]).
 
 %% The limit for one test, in seconds.
 -define(TIMEOUT, 600).
@@ -1135,6 +1136,112 @@ no_cas_is_found_test_() ->
         ?assert(lists:member(maps:get(property, Violation), [durable, unique_versions, read_version_order, kcv_below_dv, body_available]), Violation),
         ?assertEqual(ok, maps:get(outcome, run(opts(Seed, #{}))), {seed, Seed})
     end}.
+
+%% Runs with preemption points.
+%%
+%% A step of eta runs a process until the process waits in a `receive'.
+%% A callback of a StorageServer and a direct read of a client are
+%% therefore one step each. On the BEAM, a direct read can run between two
+%% ETS calls of the StorageServer, and the StorageServer between two ETS
+%% calls of a direct read.
+%%
+%% `redwall_storage_ets' declares its calls of `ets' as preemption points,
+%% and `redwall_storage' its calls of `atomics' (`-eta_preempt'). With the
+%% option `preempt' of `eta_run', the seed decides at each of these calls
+%% whether the process yields. These runs use the probability 0.3.
+%%
+%% The harness reads the tables of a StorageServer between steps
+%% (`storage_rollback' and `replicas_agree'). It does not perform these
+%% two checks while a StorageServer waits at a preemption point, because
+%% the tables then have a part of a change. See `storage_rollback/3' of
+%% `redwall_dst'.
+preempt_controller(Seed, Mode) ->
+    (opts(Seed, #{controller => true, last_op => 80, mode => Mode}))#{settle_steps => 20000, preempt => 0.3}.
+
+preempt_pop(Seed, Mode) ->
+    (opts(Seed, #{faults => storage, controller => true, pop => true, last_op => 80, mode => Mode}))#{net => true, settle_steps => 20000, preempt => 0.3}.
+
+%% The runs of `controller_faults' with preemption points. 80 seeds.
+preempt_controller_faults_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        {Points, Preemptions} = preempt_sweep(lists:seq(1, 80), fun(Seed) -> preempt_controller(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("preempt controller faults: ~p points, ~p preemptions, ~p", [Points, Preemptions, Stats]),
+        ok = write_stats({preempt_controller_faults, 1}, Stats#{preempt_points => Points, preemptions => Preemptions}),
+        ?assert(Preemptions > 20000, {Points, Preemptions}),
+        %% Clients read the tables of a StorageServer in their own process.
+        ?assert(maps:get(reads_on_storage_node, Stats, 0) > 300, Stats),
+        ?assert(maps:get(rollbacks, Stats, 0) > 5, Stats),
+        %% The harness performed the checks of the tables, and skipped them
+        %% while a StorageServer waited at a preemption point.
+        ?assert(maps:get(storage_checks, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(storage_checks_skipped, Stats, 0) > 1000, Stats)
+    end}.
+
+%% The runs of `pop_storage_kills' with preemption points: a StorageServer
+%% removes old versions, and a StorageServer copies from another one. 80
+%% seeds.
+preempt_pop_storage_kills_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        ok = redwall_dst:reset_stats(),
+        {Points, Preemptions} = preempt_sweep(lists:seq(1, 80), fun(Seed) -> preempt_pop(Seed, correct) end),
+        Stats = redwall_dst:stats(),
+        ?debugFmt("preempt pop storage kills: ~p points, ~p preemptions, ~p", [Points, Preemptions, Stats]),
+        ok = write_stats({preempt_pop_storage_kills, 1}, Stats#{preempt_points => Points, preemptions => Preemptions}),
+        ?assert(Preemptions > 50000, {Points, Preemptions}),
+        ?assert(maps:get(reads_on_storage_node, Stats, 0) > 500, Stats),
+        ?assert(maps:get(storage_copies, Stats, 0) > 20, Stats),
+        ?assert(maps:get(storage_checks, Stats, 0) > 1000, Stats),
+        ?assert(maps:get(storage_checks_skipped, Stats, 0) > 1000, Stats)
+    end}.
+
+%% A seed determines a run with preemption points, and the trace replays.
+preempt_determinism_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        lists:foreach(
+            fun(Seed) ->
+                Opts = preempt_controller(Seed, correct),
+                [First | _] = Results = [run(Opts) || _ <- lists:seq(1, 3)],
+                ?assertEqual(1, length(lists:usort([maps:get(trace, R) || R <- Results])), {seed, Seed, [eta_run:summary(R) || R <- Results]}),
+                ?assertEqual(ok, eta_run:audit(First), {seed, Seed, eta_run:summary(First)}),
+                ?assert(maps:get(preemptions, maps:get(sched, First)) > 0, {seed, Seed}),
+                Replayed = eta_run:replay(redwall_dst, maps:get(trace, First), Opts),
+                ?assertEqual({maps:get(outcome, First), 0}, {maps:get(outcome, Replayed), maps:get(skipped, Replayed)}, {seed, Seed})
+            end,
+            [1, 2, 3]
+        )
+    end}.
+
+%% A planted defect: the storage engine changes the row of a key before it
+%% stores the older version of the key. A direct read at a lower version
+%% between the two writes misses the older version. The run without the
+%% option `preempt' for the seed that finds the defect passes, because a
+%% write of the StorageServer is then one step.
+row_before_history_is_found_test_() ->
+    {timeout, ?TIMEOUT, fun() ->
+        {Seed, Violation} = first_violation(lists:seq(1, 300), fun(Seed) -> preempt_pop(Seed, row_before_history) end),
+        ?debugFmt("row_before_history: seed ~p, ~p", [Seed, Violation]),
+        ?assert(lists:member(maps:get(property, Violation), [read_value, own_writes, select_agrees, range_options_agree, mapped_range_agrees]), Violation),
+        Without = run(maps:remove(preempt, preempt_pop(Seed, row_before_history))),
+        ?assertEqual(ok, maps:get(outcome, Without), {seed, Seed, eta_run:summary(Without)}),
+        %% Without the option, no run of the first 60 seeds finds the defect.
+        sweep(lists:seq(1, 60), fun(S) -> maps:remove(preempt, preempt_pop(S, row_before_history)) end)
+    end}.
+
+%% Runs each seed, asserts the outcome and the audit, and returns the
+%% number of preemption points and of preemptions of the runs.
+preempt_sweep(Seeds, OptsFun) ->
+    lists:foldl(
+        fun(Seed, {Points, Preemptions}) ->
+            Result = #{sched := Sched} = run(OptsFun(Seed)),
+            ?assertEqual(ok, maps:get(outcome, Result), {seed, Seed, eta_run:summary(Result)}),
+            ?assertEqual(ok, eta_run:audit(Result), {seed, Seed, eta_run:summary(Result)}),
+            {Points + maps:get(preempt_points, Sched), Preemptions + maps:get(preemptions, Sched)}
+        end,
+        {0, 0},
+        Seeds
+    ).
 
 sweep(Seeds, OptsFun) ->
     lists:foreach(

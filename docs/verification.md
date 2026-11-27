@@ -281,6 +281,53 @@ of the repository. Each one was found at seed 1 of the runs with faults:
 | `select/5` returns a stored row of a key range that the transaction cleared | `own_writes` |
 | `select/5` sends the limit to the StorageServer when the transaction has written a key of the range | `own_writes` |
 
+### Runs with preemption points
+
+A step of eta runs a process until the process waits in a `receive`. A
+callback of a StorageServer is therefore one step, and a direct read of a
+client is one step. On the BEAM, a direct read can run between two ETS
+calls of the StorageServer.
+
+- `redwall_storage_ets` declares its calls of `ets` as preemption points,
+  and `redwall_storage` its calls of `atomics`, with the attribute
+  `-eta_preempt`.
+- With the option `preempt` of `eta_run`, the seed decides at each of
+  these calls whether the process yields. The option is 0.0 in every
+  other run, and the attribute then has no effect.
+- The harness reads the tables of a StorageServer between steps for
+  `storage_rollback` and `replicas_agree`. It skips these two checks
+  while a StorageServer waits at a preemption point
+  (`eta_sched:preempted/1`), and performs them at a later check.
+
+Results of 2026-11-27, with `preempt => 0.3`:
+
+| Runs | Seeds | Preemption points | Yields | Transactions with direct reads | Checks of the tables: performed and skipped |
+|---|---|---|---|---|---|
+| ClusterControllers and faults | 80 | 140,039 | 41,884 | 705 | 3,389 and 16,973 |
+| The pop and kills of StorageServers | 80 | 372,321 | 111,846 | 1,657 | 4,574 and 56,332 |
+
+A third test runs 3 seeds 3 times each and replays the trace of each.
+
+The planted defect `row_before_history` (`history_first => false` of the
+StorageServer) changes the row of a key before it stores the older
+version of the key. A direct read at a lower version between the two
+writes does not find the older version.
+
+| Runs with the planted defect | Result |
+|---|---|
+| The pop and kills of StorageServers, with `preempt => 0.3` | Found at seed 8, by `own_writes` |
+| The same seed without the option | No violation |
+| Seeds 1 to 60 without the option | No violation |
+| ClusterControllers and faults, with `preempt => 0.3`, seeds 1 to 300 | No violation |
+
+Two further defects were planted in the source and are not in the
+repository. No invariant failed:
+
+| Planted defect | Runs with `preempt` | Probable reason |
+|---|---|---|
+| The StorageServer publishes the version of a record before it writes the rows | 520 | A client asks the StorageServer for its handle with a message in each transaction. The answer comes after the callback that applies the record. |
+| A read does not read the row of a key again after the table of the older versions | 120 | The read must be between the two writes of a rollback of the same key. |
+
 ### Runs with a peace cluster
 
 In the runs above, the coordinated state is one `redwall_cstate_local`

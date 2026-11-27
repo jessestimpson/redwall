@@ -179,8 +179,9 @@ many_versions(Ids) ->
     ),
     ?assertEqual(302, Last),
     ok = await_version(Storage, 302),
-    %% The store of the engine `ets' is a record with its three tables.
-    Info = #{engine := redwall_storage_ets, durability := memory, store := {store, Data, History, _Changes}} = redwall_storage:info(Storage),
+    %% The store of the engine `ets' is a record with its three tables and
+    %% the flag of the planted defect `history_first'.
+    Info = #{engine := redwall_storage_ets, durability := memory, store := {store, Data, History, _Changes, true}} = redwall_storage:info(Storage),
     ?assertEqual([{a, 2, {set, first}}, {x, 302, {set, 302}}], ets:tab2list(Data)),
     ?assertEqual(299, ets:info(History, size)),
     ?assertEqual([{V, case V rem 10 of 0 -> clear; _ -> {set, V} end} || V <- lists:seq(302, 3, -1)], maps:get(x, redwall_storage:versions(Info))),

@@ -43,6 +43,13 @@
 
 -include("redwall_eta.hrl").
 
+%% In a simulation with the option `preempt', a process can yield before each
+%% call of `ets' in this module. Another process reads the tables `data' and
+%% `history' while the StorageServer writes them, so the order of the calls
+%% of one function is part of the behaviour. See "Preemption points" in
+%% `eta_transform'. The attribute has no effect in another build.
+-eta_preempt([ets]).
+
 -export([durability/0, features/0, new/1, view/1, clear/1, write/3, rollback/2, advance/2, read/3, page/4, load/2, versions/1]).
 
 %% The number of rows that a select reads before it runs the match spec
@@ -55,7 +62,10 @@
     data :: ets:tid(),
     history :: ets:tid(),
     %% `undefined' in a view. See `view/1'.
-    changes :: ets:tid() | undefined
+    changes :: ets:tid() | undefined,
+    %% `false' with the planted defect `history_first => false'. See
+    %% `put_version/5'.
+    history_first = true :: boolean()
 }).
 
 -spec durability() -> memory.
@@ -65,11 +75,12 @@ durability() -> memory.
 features() -> [select, mapped_range, scan].
 
 -spec new(map()) -> #store{}.
-new(_Options) ->
+new(Options) ->
     #store{
         data = ets:new(redwall_storage_data, [ordered_set, protected, {read_concurrency, true}]),
         history = ets:new(redwall_storage_history, [ordered_set, protected, {read_concurrency, true}]),
-        changes = ets:new(redwall_storage_changes, [ordered_set, private])
+        changes = ets:new(redwall_storage_changes, [ordered_set, private]),
+        history_first = maps:get(history_first, Options, true)
     }.
 
 %% @doc The store without the table of the versions above the oldest
@@ -161,12 +172,26 @@ write_entry(_NoTransaction, _LSN, _State) ->
 %% Otherwise the version of the row moves to the table of the older
 %% versions. That table gets its row first, so a direct read finds the
 %% version in one of the two tables.
-put_version(Key, LSN, Change, Row, #store{data = Data, history = History, changes = Changes}) ->
-    case Row of
-        [{_Stored, Version, Earlier}] when Version < LSN -> true = ets:insert(History, {{Key, -Version}, Earlier});
-        _SameRecordOrNoRow -> true
+%%
+%% With the planted defect `history_first => false' the row of the key
+%% changes first. A direct read at a version below `LSN' between the two
+%% writes finds the new version in the row of the key and no older version
+%% in the other table. Only a simulation with the option `preempt' of eta
+%% has a read between the two writes.
+put_version(Key, LSN, Change, Row, #store{data = Data, history = History, changes = Changes, history_first = HistoryFirst}) ->
+    Older =
+        case Row of
+            [{_Stored, Version, Earlier}] when Version < LSN -> [{{Key, -Version}, Earlier}];
+            _SameRecordOrNoRow -> []
+        end,
+    case HistoryFirst of
+        true ->
+            true = ets:insert(History, Older),
+            true = ets:insert(Data, {Key, LSN, Change});
+        false ->
+            true = ets:insert(Data, {Key, LSN, Change}),
+            true = ets:insert(History, Older)
     end,
-    true = ets:insert(Data, {Key, LSN, Change}),
     true = ets:insert(Changes, {{LSN, Key}}),
     ok.
 
