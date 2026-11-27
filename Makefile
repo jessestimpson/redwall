@@ -1,4 +1,4 @@
-.PHONY: all compile test dst dst-serial porcupine bench tlc tlc-long
+.PHONY: all compile test dst dst-serial porcupine trace bench tlc tlc-long
 
 all: compile
 
@@ -25,6 +25,12 @@ dst-serial:
 # dst/redwall_dst_porcupine_tests.erl. This target needs eta and Go.
 porcupine:
 	ERL_FLAGS="+S 1" rebar3 as dst eunit --module=redwall_dst_porcupine_tests
+
+# Trace validation: TLC checks that each simulated run is a behaviour of
+# formal/Recovery.tla. See dst/redwall_dst_trace.erl. This target needs eta
+# and Java.
+trace:
+	ERL_FLAGS="+S 1" rebar3 as dst eunit --module=redwall_dst_trace_tests
 
 # The benchmark of a cluster of 8 Erlang nodes on this computer. See
 # bench/redwall_bench.erl.

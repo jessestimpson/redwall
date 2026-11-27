@@ -31,13 +31,14 @@ It follows the [verified_md](https://github.com/jessestimpson/verified_md) conve
 
 | Method | Check | What a pass shows | What a pass does not show |
 |---|---|---|---|
-| `TLC` | TLC visits every reachable state of a TLA+ model. For the temporal property `Fires`, TLC checks every behaviour under the fairness conditions of the model. | The property holds in the model, for the constants of the config. | Anything about other constants, or about the code. No check connects the code to a model. |
+| `TLC` | TLC visits every reachable state of a TLA+ model. For the temporal property `Fires`, TLC checks every behaviour under the fairness conditions of the model. | The property holds in the model, for the constants of the config. | Anything about other constants, or about the code. `TRACE` connects the code to `Recovery.tla` for the checked runs. |
 | `SIM` | The processes of redwall run under [eta](https://github.com/jessestimpson/eta) with a seeded scheduler, a virtual clock and a simulated network. The harness kills nodes, cuts connections, and loses and delays messages. The harness checks invariants after every step, and further statements at the end of a run. | The invariant held at every step of every run. | Anything about a schedule that no seed produced. |
 | `UNIT` | EUnit tests in [test/](test/). | The named case behaves as stated. | Anything about other cases. |
 | `PORC` | The clients of a simulated run record what they observe: the values that a transaction read, the keys that it set and cleared, and whether its commit returned. [Porcupine](https://github.com/anishathalye/porcupine), a checker that shares no code with redwall, searches for an order of the transactions that explains every read and that agrees with the order of the transactions in time. See [dst/porcupine/main.go](dst/porcupine/main.go). | The client history of each checked run is strictly serializable. | Anything about other runs. A read of a record that a recovery discards later is accepted, unless a later read shows that the value is gone. |
+| `TRACE` | Trace validation. The harness records the state of the coordinated state, of each LogServer and of the process of each epoch after every step of a simulated run. [dst/redwall_dst_trace.erl](dst/redwall_dst_trace.erl) derives the actions of [formal/Recovery.tla](formal/Recovery.tla) from the changes, without a statement of the code about its action. TLC checks that the actions, in their order, are a behaviour of the model, and that the model has the state of the code after each change. | Each checked run is a behaviour of the model for the 9 actions of the logging protocol and the recovery, and the invariants `Durable`, `NoLoss`, `UniqueVersions` and `KcvSound` hold in it. | Anything about other runs. The requests for a read version, the StorageServer, the values of the LSNs and the limit on the versions in flight are not validated. |
 
-`TLC` is exhaustive within its bounds. `SIM`, `PORC` and `UNIT` are tests:
-each one checks a finite set of runs.
+`TLC` is exhaustive within its bounds. `SIM`, `PORC`, `TRACE` and `UNIT`
+are tests: each one checks a finite set of runs.
 
 The three models are [formal/Recovery.tla](formal/Recovery.tla),
 [formal/Resolver.tla](formal/Resolver.tla) and
@@ -160,6 +161,12 @@ The model is `Watch.tla`. The config has 1 key, 1 watch, 1 StorageServer,
 | `K8` | `popped_stored`. A StorageServer that runs has a version at or above the popped version of every LogServer that runs. | `SIM` | Every run. LogServers discard records in the 190 runs with the pop. |
 | `K9` | The recovery handles the first epoch, a second epoch with records to copy, 1 and 2 LogServers down, and two recoveries at the same time. | `UNIT` | On a peace cluster of 3 servers on one node. |
 
+### The code against the model of the recovery
+
+| Id | Property | Method | Bound |
+|---|---|---|---|
+| `V1` | A simulated run is a behaviour of `Recovery.tla` for these actions: `LockCState`, `LockLog`, `Recruit`, `WriteCState`, `RecoveryTxn`, `Accept`, `Assign`, `Persist` and `Ack`. After each change, the model has the recovery count, the current epoch and the end versions of the coordinated state, the Durable Version and the Known Committed Version of the LogServer, and the last LSN, the read version and the Known Committed Version of the process of the epoch. | `TRACE` | 220 runs in 4 tests of [dst/redwall_dst_trace_tests.erl](dst/redwall_dst_trace_tests.erl), with 33,766 actions: 40 seeds without faults, 100 with faults, 40 with ClusterControllers and faults, and 40 with a peace cluster and faults. Each of the 9 actions occurs at least 230 times in each test. The trace spec has `Reads = {}`, `Storage = FALSE` and `LimitInFlight = FALSE`. An LSN of the code has a number of the model that keeps the order of the LSNs. |
+
 ### Transactions: the code
 
 | Id | Property | Method | Bound |
@@ -269,6 +276,7 @@ Every run has:
 | `SIM` | Planted defects in the code or in the harness. Each one is found by an invariant or by a check at the end of a run. `watch_no_trigger` and `watch_no_verify` are also found in the runs with clears, and `watch_no_trigger` in the runs of `H6`. | 27 |
 | `SIM` | Defects that were planted in the source on 2026-11-23 and are not in the repository | 6 |
 | `PORC` | Planted defects of the simulation whose history Porcupine rejects: `no_check`, `no_range_check`, `no_batch_check`, `no_write_range`, `no_equal_keys`, `no_confirm`, `no_report`, `no_clear` and `no_copy_rows`. For each one, Porcupine accepts the history of the same seed without the defect. Porcupine rejects `no_copy_rows` at seed 10, where no invariant of the simulation is violated. | 9 |
+| `TRACE` | Planted defects of the simulation whose trace TLC rejects: `ack_replicas`, `no_cas`, `no_report` and `no_push_order`. For each one, TLC accepts the trace of the same seed without the defect. TLC rejects `ack_replicas` at seed 1, where no invariant of the simulation is violated. | 4 |
 
 Entries without a planted defect that is specific to them:
 
@@ -288,8 +296,15 @@ Entries without a planted defect that is specific to them:
   with `no_copy` or `ack_replicas` in 120 seeds. The invariants of the
   simulation find these three defects. No check examines a history of
   real nodes.
-- **The code against the models.** redwall has no trace validation. A
-  property of a model is not a property of the code.
+- **The code against the models, outside the bounds of `V1`.** Trace
+  validation covers the logging protocol and the recovery of
+  `Recovery.tla`. It does not cover the requests for a read version, the
+  StorageServer, `Resolver.tla` or `Watch.tla`. It does not compare the
+  bodies of the records that a recovery copies to the new LogServers: TLC
+  accepted the traces of 6 seeds with the planted defect `no_copy`. It
+  does not validate the values of the LSNs or the limit on the versions
+  in flight. A `LockLog` action is placed at the write of the Sequencer,
+  and not at the step in which the LogServer was stopped.
 - **The composition of the models.** Resolver assumes that a recovery
   keeps every record. Recovery treats every transaction as admitted. Watch
   assumes `R7` and `R8`.
@@ -374,6 +389,7 @@ Entries without a planted defect that is specific to them:
 |---|---|---|---|---|
 | `UNIT` | `make test` | 40 seconds | Yes, on each push | |
 | `SIM` | `make dst` | about 6 minutes | Yes, on each push | |
+| `TRACE` | `make trace`. The command needs Java. | 5 to 8 minutes | No | 2026-11-26: 8 tests passed in 7 min 39 s, at the same time as `make dst`. |
 | `PORC` | `make porcupine`. The command needs Go. | 3 to 7 minutes | No | 2026-11-26: 17 tests passed in 6 min 26 s, at the same time as `make dst`. 14 of them passed in 2 min 36 s alone on the same day. |
 | `TLC`, quick configs | `make tlc` | about 6 minutes | Yes, on each change in `formal/` | 2026-11-22 for Recovery and Resolver, 2026-11-24 for Watch |
 | `TLC`, Recovery with 3 epochs | `make tlc-long` | about 4 hours | On a manual start | Commit `1b56582` of 2026-11-22. `Recovery.tla` has changed only in comments since that commit. |

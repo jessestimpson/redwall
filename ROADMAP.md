@@ -412,8 +412,12 @@ node of the cluster. See [etx](https://github.com/jessestimpson/etx).
 - [ ] Reduce the time of the Recovery configs with 3 epochs, which is
       about 4 hours. Until then, run them as `formal/README.md` states
       under "When to run TLC".
-- [ ] Validate traces of the implementation against the model, as peace
-      does.
+- [x] Validate traces of the implementation against the model, as peace
+      does: `make trace`, for the logging protocol and the recovery of
+      `Recovery.tla`. 220 runs, and 4 planted defects that TLC rejects.
+- [ ] Extend trace validation to the requests for a read version and to
+      the StorageServer of `Recovery.tla`, and to the bodies of the
+      records that a recovery copies.
 - [x] Use keys of several types in the simulation, also keys that are
       equal and not identical. The keys of the simulation are packed
       tuples, and the simulation did not find the defect of such keys in

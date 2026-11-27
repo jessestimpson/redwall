@@ -168,6 +168,7 @@ Each module also has its design in its module documentation.
 | Unit tests | Each module, and clusters on one node and on two Erlang nodes. 135 tests | `make test` | 40 seconds |
 | Simulation | The whole system under the scheduler and the simulated network of [eta](https://github.com/jessestimpson/eta), with kills, partitions, and lost and delayed messages. 69 tests with about 2,350 seeds and 27 planted defects | `make dst` | about 6 minutes |
 | Strict serializability | The client histories of 360 simulation runs, with [Porcupine](https://github.com/anishathalye/porcupine), a checker that shares no code with redwall. 17 tests with 9 planted defects | `make porcupine` | 3 to 7 minutes |
+| Trace validation | 220 simulation runs are behaviours of the TLA+ model of the logging protocol and the recovery, checked with TLC. 8 tests with 4 planted defects | `make trace` | 5 to 8 minutes |
 | Model checking | Three TLA+ models with TLC: the logging protocol, the recovery, the read versions and the StorageServer; the Resolver; and the watch. 13 planted bugs | `make tlc` | about 6 minutes |
 | Model checking | The recovery with 3 epochs | `make tlc-long` | about 4 hours |
 
@@ -247,6 +248,7 @@ The most important limitations are:
 | `make dst` | Run the simulation suite, each test in an Erlang node of its own |
 | `make dst-serial` | Run the simulation suite in one node |
 | `make porcupine` | Check the client histories of simulation runs with Porcupine |
+| `make trace` | Validate simulation runs against `formal/Recovery.tla` with TLC |
 | `make bench` | Run the benchmark |
 | `make tlc` | Run the quick TLC configs |
 | `make tlc-long` | Run the 2 TLC configs with three epochs |
@@ -263,6 +265,7 @@ The most important limitations are:
   dependencies of a profile. For local development, link a checkout at
   `_checkouts/eta`.
 - Go, for `make porcupine` only.
+- Java, for `make trace`, `make tlc` and `make tlc-long`.
 - A checkout in `_checkouts` replaces the recorded commit.
 - Java 11 or later for the TLC targets. The TLC jar is in `formal/vendor`.
 

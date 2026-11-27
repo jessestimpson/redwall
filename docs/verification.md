@@ -369,6 +369,13 @@ Limitations of the simulation:
   after the end of a run, until the tables of eta are deleted. They
   write an error report.
 
+### Trace validation
+
+`make trace` checks with TLC that each of 220 simulation runs is a
+behaviour of `formal/Recovery.tla`, for the logging protocol and the
+recovery. [formal/README.md](../formal/README.md), "Trace validation",
+has the method, the results and the limitations.
+
 ### Strict serializability with Porcupine
 
 `make porcupine` checks the client histories of simulation runs with

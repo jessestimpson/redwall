@@ -117,6 +117,65 @@ are: a record is acknowledged unless a recovery discards it, and the
 StorageServer and the client take their steps. `Timeout` has no fairness
 condition, so `Fires` does not depend on the time limit of a request.
 
+## Trace validation
+
+Trace validation checks that a run of the code is a behaviour of
+`Recovery.tla`.
+
+1. The simulation records the state of the coordinated state, of each
+   LogServer and of the process of each epoch after every step.
+2. [`dst/redwall_dst_trace.erl`](../dst/redwall_dst_trace.erl) converts
+   the changes into a sequence of model actions with their arguments, and
+   writes the sequence to `TraceData.tla`. The header of that module
+   describes the derivation.
+3. `TraceRecovery.tla` has one behaviour, which takes the actions in
+   order. After a change of the code, the variables of the model must
+   equal the state of the code.
+4. `check_trace.sh <dir>` runs TLC. If TLC cannot take every action, the
+   script prints the first action that the model did not permit.
+
+`make trace` validates 220 runs. Results of 2026-11-26:
+
+| Runs | Seeds | Actions |
+|---|---|---|
+| No faults | 40 | 11,714 |
+| Faults | 100 | 13,020 |
+| ClusterControllers and faults | 40 | 4,143 |
+| A peace cluster and faults | 40 | 4,889 |
+
+TLC takes about 0.3 seconds for one run. `make trace` also runs 4 planted
+defects, which TLC must reject:
+
+| Planted defect | First seed that TLC rejects | Rejected action |
+|---|---|---|
+| `ack_replicas` | 1 | `Ack`: not every LogServer of the epoch has persisted the LSN |
+| `no_cas` | 1 | A write of the coordinated state by an epoch that is not the recovery count |
+| `no_report` | 1 | `Ack`: the read version of the code is not the read version of the model |
+| `no_push_order` | 48 | `Persist`: the previous LSN is not the Durable Version of the LogServer |
+
+Because trace validation checks the code against the model, the long TLC
+configs do not need a new run when only the code changes.
+
+Limitations:
+
+- The trace spec has `Reads = {}` and `Storage = FALSE`. The requests for
+  a read version and the StorageServer are not validated.
+- In the model, an LSN is the previous LSN plus 1. Each LSN of the code
+  gets a number of the model that keeps the order of the LSNs. The values
+  of the LSNs and the limit on the versions in flight
+  (`LimitInFlight = FALSE`) are not validated.
+- A `LockLog` action is placed directly before `Recruit`, for a set of
+  stopped LogServers whose versions give the Recovery Version and the
+  previous epoch's end version of the code.
+- The model copies each kept record to every new LogServer. The bodies of
+  the copied records are not compared. TLC accepted the traces of 6 seeds
+  with the planted defect `no_copy`.
+- The process of an epoch can assign an LSN and stop before the harness
+  reads its state. The record of a LogServer then gives the `Assign`
+  action.
+- Only `Recovery.tla` is covered. `Resolver.tla` and `Watch.tla` have no
+  trace validation.
+
 ## Invariants and properties
 
 | Model | Invariant | Meaning |

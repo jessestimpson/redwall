@@ -642,6 +642,8 @@
 
 -export([init/2, processes/1, generate/2, execute/2, check/1, check_final/2, settle_done/1, terminate/1]).
 -export([stats/0, reset_stats/0]).
+%% For `redwall_dst_trace'.
+-export([cstate/1, logs/1]).
 
 -define(STATS, redwall_dst_stats).
 
@@ -694,6 +696,9 @@ init(Seed, Config) ->
     Keys = maps:get(keys, Config, packed),
     true = Keys =:= packed orelse (Keys =:= mixed andalso Watches =:= false),
     _ = Keys =:= mixed andalso ets:insert(Tab, {keys, mixed}),
+    %% An ETS table of the caller for trace validation, of the kind
+    %% `ordered_set'. See `redwall_dst_trace'.
+    _ = [ets:insert(Tab, {trace, Table}) || Table <- [maps:get(trace, Config, undefined)], Table =/= undefined],
     Cas = #{cas => Mode =/= no_cas, elect_cas => Mode =/= no_elect_cas},
     %% The topology is declared before any process creates a monitor.
     CState =
@@ -1168,6 +1173,8 @@ execute(heal, _N, S) ->
     S.
 
 check(#{tab := Tab, cstate := CState}) ->
+    %% Trace validation. See `redwall_dst_trace'.
+    _ = [redwall_dst_trace:record(Table, Tab, CState) || {trace, Table} <- ets:lookup(Tab, trace)],
     Storages = storages(Tab),
     Acks = [{C, Epoch, LSN} || [C, Epoch, LSN] <- ets:match(Tab, {{ack, '$1'}, '$2', '$3'})],
     Logs = logs(Tab),

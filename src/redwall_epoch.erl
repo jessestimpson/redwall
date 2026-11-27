@@ -280,6 +280,10 @@
 -type mutation() :: {set, term(), term()} | {clear, term()} | {clear_range, term(), term()} | {set_versionstamp, term()}.
 
 %% A batch that the Proxy has closed and has not finished.
+%% The simulation reads these fields of the state for trace validation.
+%% See `dst/redwall_dst_trace.erl'.
+-eta_observe({state, [epoch, last, live, kcv, commits]}).
+
 -record(commit, {
     %% The clients that the Proxy has not answered, each with the index of
     %% its transaction in the batch.
