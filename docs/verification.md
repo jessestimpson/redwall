@@ -372,8 +372,8 @@ Limitations of the simulation:
 ### Trace validation
 
 `make trace` checks with TLC that each of 220 simulation runs is a
-behaviour of `formal/Recovery.tla`, for the logging protocol and the
-recovery. [formal/README.md](../formal/README.md), "Trace validation",
+behaviour of `formal/Recovery.tla`, for the logging protocol, the
+recovery, the read versions and the StorageServer. [formal/README.md](../formal/README.md), "Trace validation",
 has the method, the results and the limitations.
 
 ### Strict serializability with Porcupine

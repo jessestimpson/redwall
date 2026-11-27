@@ -123,7 +123,8 @@ Trace validation checks that a run of the code is a behaviour of
 `Recovery.tla`.
 
 1. The simulation records the state of the coordinated state, of each
-   LogServer and of the process of each epoch after every step.
+   LogServer, of the process of each epoch and of each StorageServer
+   after every step.
 2. [`dst/redwall_dst_trace.erl`](../dst/redwall_dst_trace.erl) converts
    the changes into a sequence of model actions with their arguments, and
    writes the sequence to `TraceData.tla`. The header of that module
@@ -136,14 +137,26 @@ Trace validation checks that a run of the code is a behaviour of
 
 `make trace` validates 220 runs. Results of 2026-11-26:
 
-| Runs | Seeds | Actions |
-|---|---|---|
-| No faults | 40 | 11,714 |
-| Faults | 100 | 13,020 |
-| ClusterControllers and faults | 40 | 4,143 |
-| A peace cluster and faults | 40 | 4,889 |
+| Runs | Seeds | Actions of the model | Confirmations | StorageServers followed | `SSApply` | `SSFollow` |
+|---|---|---|---|---|---|---|
+| No faults | 40 | 29,830 | 2,812 | 80 | 4,103 | 462 |
+| Faults | 100 | 32,901 | 3,275 | 243 | 3,407 | 1,443 |
+| ClusterControllers and faults | 40 | 10,891 | 1,163 | 104 | 935 | 427 |
+| A peace cluster and faults | 40 | 12,017 | 1,166 | 94 | 1,247 | 507 |
 
-TLC takes about 0.3 seconds for one run. `make trace` also runs 4 planted
+The traces also have 6,290 `Switch` steps, which are not actions of the
+model.
+
+`Recovery.tla` has one StorageServer. A run has 1 to 3 StorageServers,
+and more after a kill. `TraceRecovery.tla` keeps the variables of each
+StorageServer of the run, and a `Switch` step exchanges them with the
+variables of the model. No action outside the StorageServer reads or
+changes these variables, so the steps of one StorageServer with the
+other steps of the trace are a behaviour of `Recovery.tla`.
+`AllStorageSafe` and `AllStorageComplete` are `StorageSafe` and
+`StorageComplete` for each StorageServer.
+
+TLC takes 0.3 to 2 seconds for one run. `make trace` also runs 6 planted
 defects, which TLC must reject:
 
 | Planted defect | First seed that TLC rejects | Rejected action |
@@ -152,14 +165,28 @@ defects, which TLC must reject:
 | `no_cas` | 1 | A write of the coordinated state by an epoch that is not the recovery count |
 | `no_report` | 1 | `Ack`: the read version of the code is not the read version of the model |
 | `no_push_order` | 48 | `Persist`: the previous LSN is not the Durable Version of the LogServer |
+| `no_confirm` | 1 | `ReadDone`: fewer than `Confirms` LogServers have confirmed the epoch |
+| `no_rollback` | 3 | `SSApply`: the store has a write whose record the StorageServer of the model has removed |
 
 Because trace validation checks the code against the model, the long TLC
 configs do not need a new run when only the code changes.
 
 Limitations:
 
-- The trace spec has `Reads = {}` and `Storage = FALSE`. The requests for
-  a read version and the StorageServer are not validated.
+- One confirmation of the process of an epoch is one request of the
+  model. The trace does not have the time at which a client sent its
+  request.
+- The process of an epoch counts the answers of the LogServers to a
+  confirmation and does not keep their names. A `ReadConfirm` action is
+  placed at the start of the confirmation, for a LogServer that no
+  `LockLog` action had stopped. The trace does not validate that the
+  LogServer that answered was not stopped.
+- The trace follows a StorageServer from its start without data. It does
+  not follow a StorageServer after a copy from a peer: 50 StorageServers
+  in the 220 runs. The model has no copy and no pop.
+- The trace compares the LSNs of the writes of a store with the records
+  that the StorageServer of the model has applied. It does not compare
+  keys and values.
 - In the model, an LSN is the previous LSN plus 1. Each LSN of the code
   gets a number of the model that keeps the order of the LSNs. The values
   of the LSNs and the limit on the versions in flight
@@ -169,7 +196,8 @@ Limitations:
   previous epoch's end version of the code.
 - The model copies each kept record to every new LogServer. The bodies of
   the copied records are not compared. TLC accepted the traces of 6 seeds
-  with the planted defect `no_copy`.
+  with the planted defect `no_copy`, in a run before the read versions
+  and the StorageServer were in the trace.
 - The process of an epoch can assign an LSN and stop before the harness
   reads its state. The record of a LogServer then gives the `Assign`
   action.

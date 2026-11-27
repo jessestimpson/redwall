@@ -474,7 +474,7 @@
 -behaviour(gen_server).
 
 -include("redwall_eta.hrl").
--eta_observe({state, [version, oldest, engine, view, rollbacks, copies, resets, popped, watching, watches_fired, watches_timed_out]}).
+-eta_observe({state, [version, oldest, engine, view, system, rollbacks, copies, resets, popped, watching, watches_fired, watches_timed_out]}).
 
 -export([start/1, start_link/1, stop/1]).
 -export([read/3, read/4, read_with_version/4, info/1, stored/2]).

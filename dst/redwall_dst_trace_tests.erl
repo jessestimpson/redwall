@@ -108,6 +108,16 @@ no_report_is_rejected_test_() ->
 no_push_order_is_rejected_test_() ->
     {timeout, ?TIMEOUT, fun() -> rejected("no-push-order", no_push_order, "") end}.
 
+%% A Proxy gives a read version without the confirmation that the epoch is
+%% live. The model requires the confirmation of `Confirms' LogServers.
+no_confirm_is_rejected_test_() ->
+    {timeout, ?TIMEOUT, fun() -> rejected("no-confirm", no_confirm, "\"ReadDone\"") end}.
+
+%% A StorageServer keeps the writes above the end version of an epoch. The
+%% StorageServer of the model removes them.
+no_rollback_is_rejected_test_() ->
+    {timeout, ?TIMEOUT, fun() -> rejected("no-rollback", no_rollback, "\"ssHas\"") end}.
+
 %% TLC rejects a trace with the planted defect `Mode', at an action whose
 %% description contains `Action'. TLC accepts the trace of the same seed
 %% without the defect.
@@ -120,7 +130,23 @@ rejected(Prefix, Mode, Action) ->
 %% Asserts that the sweep contains every action of the trace spec.
 exercised(Counts) ->
     ?debugFmt("actions: ~0p", [Counts]),
-    Actions = ["LockCState", "LockLog", "Recruit", "WriteCState", "RecoveryTxn", "Accept", "Assign", "Persist", "Ack"],
+    Actions = [
+        "LockCState",
+        "LockLog",
+        "Recruit",
+        "WriteCState",
+        "RecoveryTxn",
+        "Accept",
+        "Assign",
+        "Persist",
+        "Ack",
+        "ReadStart",
+        "ReadConfirm",
+        "ReadSeq",
+        "ReadDone",
+        "SSApply",
+        "SSFollow"
+    ],
     ?assertEqual([], [Action || Action <- Actions, maps:get(Action, Counts, 0) < 10], Counts).
 
 verdict(ok) -> ok;

@@ -282,7 +282,7 @@
 %% A batch that the Proxy has closed and has not finished.
 %% The simulation reads these fields of the state for trace validation.
 %% See `dst/redwall_dst_trace.erl'.
--eta_observe({state, [epoch, last, live, kcv, commits]}).
+-eta_observe({state, [epoch, last, live, kcv, commits, reads, next_read]}).
 
 -record(commit, {
     %% The clients that the Proxy has not answered, each with the index of
